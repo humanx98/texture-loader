@@ -22,6 +22,7 @@ set(STB_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/stb" CACHE PATH "Path 
 
 # Build options
 option(BUILD_EXAMPLES "Build example applications" OFF)
+option(BUILD_TESTS "Build unit tests" OFF)
 option(USE_OIIO "Use OpenImageIO for image loading" OFF)
 
 # GPU architectures to compile for
@@ -44,7 +45,10 @@ endif()
 # Library
 set(TEXTURE_LOADER_SOURCES
     src/DemandLoading/DemandTextureLoader.cpp
+    src/DemandLoading/DemandTextureLoaderImpl.cpp
+    src/DemandLoading/Ticket.cpp
     src/DemandLoading/Logging.cpp
+    src/DemandLoading/stb_image_impl.cpp
 )
 
 if(USE_OIIO)
@@ -111,6 +115,22 @@ if(BUILD_EXAMPLES)
         INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    hip_add_executable(
+        TARGET streaming_scene_kernel
+        SOURCES examples/streaming_scene_kernel.hip
+        ARCHITECTURES ${HIP_ARCHITECTURES}
+            OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
+        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
+    hip_add_executable(
+        TARGET path_tracing_kernel
+        SOURCES examples/path_tracing_kernel.hip
+        ARCHITECTURES ${HIP_ARCHITECTURES}
+            OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
+        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Example application (host code only)
     add_executable(texture_loader_example
         examples/simple_render.cpp
@@ -126,6 +146,18 @@ if(BUILD_EXAMPLES)
 
     add_executable(atlas_render_example
         examples/atlas_render.cpp
+    )
+
+    add_executable(async_vs_sync_example
+        examples/async_vs_sync.cpp
+    )
+
+    add_executable(streaming_scene_example
+        examples/streaming_scene.cpp
+    )
+
+    add_executable(path_tracing_example
+        examples/path_tracing.cpp
     )
 
     target_include_directories(texture_loader_example
@@ -147,6 +179,24 @@ if(BUILD_EXAMPLES)
     )
 
     target_include_directories(atlas_render_example
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${STB_INCLUDE_DIR}
+    )
+
+    target_include_directories(async_vs_sync_example
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${STB_INCLUDE_DIR}
+    )
+
+    target_include_directories(streaming_scene_example
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${STB_INCLUDE_DIR}
+    )
+
+    target_include_directories(path_tracing_example
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${STB_INCLUDE_DIR}
@@ -175,6 +225,24 @@ if(BUILD_EXAMPLES)
             hip_demand_texture
     )
     target_compile_definitions(atlas_render_example PRIVATE __HIP_PLATFORM_AMD__)
+
+    target_link_libraries(async_vs_sync_example
+        PRIVATE
+            hip_demand_texture
+    )
+    target_compile_definitions(async_vs_sync_example PRIVATE __HIP_PLATFORM_AMD__)
+
+    target_link_libraries(streaming_scene_example
+        PRIVATE
+            hip_demand_texture
+    )
+    target_compile_definitions(streaming_scene_example PRIVATE __HIP_PLATFORM_AMD__)
+
+    target_link_libraries(path_tracing_example
+        PRIVATE
+            hip_demand_texture
+    )
+    target_compile_definitions(path_tracing_example PRIVATE __HIP_PLATFORM_AMD__)
 
     # Copy kernel code object to output directory
     add_custom_command(TARGET texture_loader_example POST_BUILD
@@ -205,11 +273,70 @@ if(BUILD_EXAMPLES)
         COMMENT "Copying HIP kernel code object"
     )
 
+    add_custom_command(TARGET async_vs_sync_example POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:render_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:async_vs_sync_example>/render_kernel.co
+        COMMENT "Copying HIP kernel code object"
+    )
+
+    add_custom_command(TARGET streaming_scene_example POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:streaming_scene_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:streaming_scene_example>/streaming_scene_kernel.co
+        COMMENT "Copying HIP kernel code object"
+    )
+
+    add_custom_command(TARGET path_tracing_example POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:path_tracing_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:path_tracing_example>/path_tracing_kernel.co
+        COMMENT "Copying HIP kernel code object"
+    )
+
     # Add dependency to ensure kernel is built first
     add_dependencies(texture_loader_example render_kernel)
     add_dependencies(tiled_render_example tiled_render_kernel)
     add_dependencies(mega_texture_example mega_texture_kernel)
     add_dependencies(atlas_render_example atlas_render_kernel)
+    add_dependencies(async_vs_sync_example render_kernel)
+    add_dependencies(streaming_scene_example streaming_scene_kernel)
+    add_dependencies(path_tracing_example path_tracing_kernel)
+    
+    # Benchmark suite
+    hip_add_executable(
+        TARGET benchmark_kernel
+        SOURCES examples/benchmark_kernel.hip
+        ARCHITECTURES ${HIP_ARCHITECTURES}
+            OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
+        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    
+    add_executable(benchmark_suite
+        examples/benchmark_suite.cpp
+    )
+    
+    target_include_directories(benchmark_suite
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    
+    target_link_libraries(benchmark_suite
+        PRIVATE
+            hip_demand_texture
+            hip::host
+    )
+    
+    target_compile_definitions(benchmark_suite PRIVATE __HIP_PLATFORM_AMD__)
+    
+    add_custom_command(TARGET benchmark_suite POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:benchmark_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:benchmark_suite>/benchmark_kernel.co
+        COMMENT "Copying HIP kernel code object"
+    )
+    
+    add_dependencies(benchmark_suite benchmark_kernel)
     
     # OpenImageIO format example (only if OIIO is enabled)
     if(USE_OIIO)
@@ -231,6 +358,59 @@ if(BUILD_EXAMPLES)
         
         message(STATUS "Building OpenImageIO format example")
     endif()
+endif()
+
+# Unit Tests (optional)
+if(BUILD_TESTS)
+    # Fetch GoogleTest
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG v1.14.0
+    )
+    # Prevent overriding the parent project's compiler/linker settings on Windows
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+    
+    enable_testing()
+    
+    # Test executable
+    add_executable(texture_loader_tests
+        tests/main.cpp
+        tests/TextureInfoTests.cpp
+        tests/DemandTextureLoaderTests.cpp
+        tests/ThreadPoolTests.cpp
+        tests/MemoryPoolTests.cpp
+        tests/TicketTests.cpp
+    )
+    
+    target_include_directories(texture_loader_tests
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${STB_INCLUDE_DIR}
+    )
+    
+    target_link_libraries(texture_loader_tests
+        PRIVATE
+            hip_demand_texture
+            GTest::gtest
+            GTest::gtest_main
+    )
+    
+    target_compile_definitions(texture_loader_tests PRIVATE __HIP_PLATFORM_AMD__)
+    
+    # Add OpenImageIO support to tests if enabled
+    if(USE_OIIO)
+        target_compile_definitions(texture_loader_tests PRIVATE USE_OIIO)
+    endif()
+    
+    # Register tests with CTest
+    include(GoogleTest)
+    gtest_discover_tests(texture_loader_tests)
+    
+    message(STATUS "Building unit tests")
 endif()
 
 # Installation
