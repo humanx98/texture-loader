@@ -10,6 +10,10 @@ if(MSVC)
     add_compile_options(/EHsc)
 endif()
 
+if (UNIX)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # Add cmake module path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
