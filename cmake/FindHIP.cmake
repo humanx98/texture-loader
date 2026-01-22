@@ -46,8 +46,9 @@ endif()
 
 # Find required libraries
 find_library(HIP_LIBRARY
-    NAMES amdhip64
-    PATHS "${HIP_LIB_DIR}"
+    names amdhip64
+    PATHS ${HIP_PATH}
+    PATH_SUFFIXES lib
     NO_DEFAULT_PATH
 )
 
@@ -55,22 +56,33 @@ find_library(HIP_LIBRARY
 # Try: amd_comgr_2 (standard), amd_comgr0604 (versioned), amd_comgr (fallback)
 find_library(HIP_COMGR_LIBRARY
     NAMES amd_comgr_2 amd_comgr${HIP_VERSION_STRING} amd_comgr
-    PATHS "${HIP_LIB_DIR}"
+    PATHS ${HIP_PATH}
+    PATH_SUFFIXES lib
     NO_DEFAULT_PATH
 )
 
 # Find compilers
 find_program(HIP_HIPCC_EXECUTABLE
     NAMES hipcc hipcc.bat
-    PATHS "${HIP_BIN_DIR}"
+    PATHS ${HIP_PATH}
+    PATH_SUFFIXES bin
     NO_DEFAULT_PATH
 )
 
 find_program(HIP_CLANG_EXECUTABLE
-    NAMES clang++
-    PATHS "${HIP_BIN_DIR}"
+    NAMES clang++ amdclang
+    PATHS ${HIP_PATH}
+    PATH_SUFFIXES bin llvm/bin
     NO_DEFAULT_PATH
 )
+
+find_path(HIP_DEVICE_LIB_PATH
+    NAME bitcode
+    PATHS ${HIP_PATH}
+    PATH_SUFFIXES llvm amdgcn llvm/amdgcn
+    NO_DEFAULT_PATH
+)
+
 
 # Verify we found everything
 if(NOT HIP_LIBRARY)
@@ -85,10 +97,18 @@ if(NOT HIP_HIPCC_EXECUTABLE)
     message(FATAL_ERROR "hipcc compiler not found in ${HIP_BIN_DIR}")
 endif()
 
+if (HIP_DEVICE_LIB_PATH)
+    set(HIP_DEVICE_LIB_PATH ${HIP_DEVICE_LIB_PATH}/bitcode)
+else()
+    message(FATAL_ERROR "HIP device lib path not found (search for amdgcn/bitcode)")
+endif()
+
+
 message(STATUS "Found HIP: ${HIP_PATH}")
 message(STATUS "Include: ${HIP_INCLUDE_DIR}")
 message(STATUS "Libraries: ${HIP_LIBRARY}, ${HIP_COMGR_LIBRARY}")
-message(STATUS "Compiler:\n  *hipcc: ${HIP_HIPCC_EXECUTABLE}\n  *clang: ${HIP_CLANG_EXECUTABLE}")
+message(STATUS "Compiler:\n  -- hipcc: ${HIP_HIPCC_EXECUTABLE}\n  -- clang: ${HIP_CLANG_EXECUTABLE}")
+message(STATUS "Device libs: ${HIP_DEVICE_LIB_PATH}")
 
 # Create interface targets
 if(NOT TARGET hip::include)
@@ -156,6 +176,11 @@ function(hip_add_executable)
     
     # Output file
     set(OUTPUT_FILE "${CMAKE_CURRENT_BINARY_DIR}/${HIP_TARGET}.co")
+
+    # for theRock project we must pass this explicitly
+    if(UNIX)
+        set(ROCM_DEVICE_LIB_PATH_OPTION "--rocm-device-lib-path=${HIP_DEVICE_LIB_PATH}")
+    endif()
     
     # Build compile command
     add_custom_command(
@@ -166,6 +191,7 @@ function(hip_add_executable)
             ${HIP_OPTIONS}
             ${INCLUDE_FLAGS}
             ${HIP_SOURCES}
+            ${ROCM_DEVICE_LIB_PATH_OPTION}
             -o ${OUTPUT_FILE}
         DEPENDS ${HIP_SOURCES}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

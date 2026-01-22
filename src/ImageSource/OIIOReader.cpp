@@ -1,3 +1,4 @@
+#include <hip/hip_runtime.h>
 #include "ImageSource/OIIOReader.h"
 #include <OpenImageIO/imageio.h>
 #include <algorithm>
@@ -49,20 +50,20 @@ void OIIOReader::open(TextureInfo* info)
     switch (spec.format.basetype)
     {
         case OIIO::TypeDesc::UINT8:
-            info_.format = PixelFormat::UINT8;
+            info_.format = HIP_AD_FORMAT_UNSIGNED_INT8;
             break;
         case OIIO::TypeDesc::UINT16:
-            info_.format = PixelFormat::UINT16;
+            info_.format = HIP_AD_FORMAT_UNSIGNED_INT16;
             break;
         case OIIO::TypeDesc::HALF:
-            info_.format = PixelFormat::FLOAT16;
+            info_.format = HIP_AD_FORMAT_HALF;
             break;
         case OIIO::TypeDesc::FLOAT:
-            info_.format = PixelFormat::FLOAT32;
+            info_.format = HIP_AD_FORMAT_FLOAT;
             break;
         default:
             // Default to UINT8 and let OIIO convert
-            info_.format = PixelFormat::UINT8;
+            info_.format = HIP_AD_FORMAT_UNSIGNED_INT8;
             break;
     }
     
@@ -252,6 +253,13 @@ double OIIOReader::getTotalReadTime() const
 {
     std::lock_guard<std::mutex> lock(mutex_);
     return totalReadTime_;
+}
+
+unsigned long long OIIOReader::getHash(hipStream_t /*stream*/) const
+{
+    // Hash the filename for content-based deduplication
+    // Two ImageSource objects with the same filename should return the same hash
+    return static_cast<unsigned long long>(std::hash<std::string>{}(filename_));
 }
 
 // Factory function implementation

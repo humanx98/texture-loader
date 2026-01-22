@@ -1,5 +1,8 @@
-#include "DemandLoading/DemandTextureLoader.h"
 #include <hip/hip_runtime.h>
+
+#include "DemandLoading/DemandTextureLoader.h"
+#include "DemandLoading/Logging.h"
+#include "hip_check.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -14,7 +17,7 @@
 struct KernelModule {
     hipModule_t module{nullptr};
     hipFunction_t kernel{nullptr};
-    ~KernelModule() { if (module) hipModuleUnload(module); }
+    ~KernelModule() { if (module) HIP_WARN(hipModuleUnload(module)); }
 
     bool load(const char* modulePath, const char* kernelName) {
         hipError_t err = hipModuleLoad(&module, modulePath);
@@ -25,7 +28,7 @@ struct KernelModule {
         err = hipModuleGetFunction(&kernel, module, kernelName);
         if (err != hipSuccess) {
             std::cerr << "Failed to get kernel function: " << hipGetErrorString(err) << "\n";
-            hipModuleUnload(module);
+            HIP_WARN(hipModuleUnload(module));
             module = nullptr;
             return false;
         }
@@ -40,12 +43,30 @@ static void generateMegaTexture(const char* filename, int size, float hueShift) 
         for (int x = 0; x < size; ++x) {
             float fx = static_cast<float>(x) / static_cast<float>(size);
             int idx = (y * size + x) * 4;
-            float swirl = 0.5f + 0.5f * std::sin(6.28318f * (fx * 4.0f + fy * 2.0f + hueShift));
-            float grad = 0.5f + 0.5f * fx;
-            float band = 0.5f + 0.5f * std::cos(6.28318f * (fy * 3.0f + hueShift * 0.5f));
-            data[idx + 0] = static_cast<uint8_t>(255.0f * swirl);
-            data[idx + 1] = static_cast<uint8_t>(255.0f * grad);
-            data[idx + 2] = static_cast<uint8_t>(255.0f * band);
+            // Rotate and phase-shift per texture so A/B/C look different
+            float angle = hueShift * 2.3f;
+            float ca = std::cos(angle);
+            float sa = std::sin(angle);
+            float rx = fx * ca - fy * sa;
+            float ry = fx * sa + fy * ca;
+
+            float swirl = 0.5f + 0.5f * std::sin(6.28318f * (rx * 3.0f + ry * 1.5f) + hueShift * 3.7f);
+            float grad = 0.4f + 0.6f * fx;
+            float band = 0.5f + 0.5f * std::cos(6.28318f * (ry * 2.4f + rx * 1.1f) + hueShift * 5.1f);
+            float radial = std::sqrt((fx - 0.5f) * (fx - 0.5f) + (fy - 0.5f) * (fy - 0.5f));
+            float vignette = 1.0f - std::min(radial * 1.4f, 1.0f);
+
+            float r = 0.55f * swirl + 0.45f * vignette;
+            float g = 0.5f * band + 0.5f * grad;
+            float b = 0.6f * (1.0f - band * 0.5f) + 0.4f * std::sin(6.28318f * (radial * 3.0f + hueShift));
+
+            r = fminf(fmaxf(r, 0.0f), 1.0f);
+            g = fminf(fmaxf(g, 0.0f), 1.0f);
+            b = fminf(fmaxf(b, 0.0f), 1.0f);
+
+            data[idx + 0] = static_cast<uint8_t>(255.0f * r);
+            data[idx + 1] = static_cast<uint8_t>(255.0f * g);
+            data[idx + 2] = static_cast<uint8_t>(255.0f * b);
             data[idx + 3] = 255;
         }
     }
@@ -55,17 +76,22 @@ static void generateMegaTexture(const char* filename, int size, float hueShift) 
 
 int main() {
     namespace fs = std::filesystem;
+
+    // Create output subfolder
+    const std::string outputDir = "mega_texture_output";
+    fs::create_directories(outputDir);
+
     std::cout << "Mega-texture flythrough example\n";
 
     int deviceCount = 0;
-    hipGetDeviceCount(&deviceCount);
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         std::cerr << "No HIP devices found!\n";
         return 1;
     }
 
     hipDeviceProp_t prop{};
-    hipGetDeviceProperties(&prop, 0);
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
     std::cout << "Using device: " << prop.name << "\n";
 
     KernelModule module;
@@ -79,13 +105,14 @@ int main() {
     options.maxRequestsPerLaunch = 1920 * 1080;
     options.enableEviction = true;
 
+    hip_demand::setLogLevel(hip_demand::LogLevel::Debug);
     hip_demand::DemandTextureLoader loader(options);
 
     const int texSize = 8192;
     std::vector<std::string> filenames = {
-        "mega_texture_A.png",
-        "mega_texture_B.png",
-        "mega_texture_C.png"
+        outputDir + "/mega_texture_A.png",
+        outputDir + "/mega_texture_B.png",
+        outputDir + "/mega_texture_C.png"
     };
 
     std::vector<hip_demand::TextureHandle> handles;
@@ -105,7 +132,9 @@ int main() {
             }
         } else {
             std::cout << "Generating mega texture (" << filename << ")...\n";
-            generateMegaTexture(filename, texSize, static_cast<float>(i));
+            // Use non-integer phase offsets so textures A/B/C are visually distinct
+            float hueShift = static_cast<float>(i) * 0.37f;
+            generateMegaTexture(filename, texSize, hueShift);
             handle = loader.createTexture(filename, desc);
         }
 
@@ -120,10 +149,10 @@ int main() {
     const int width = 1920;
     const int height = 1080;
     float4* d_output = nullptr;
-    hipMalloc(&d_output, width * height * sizeof(float4));
+    HIP_CHECK(hipMalloc(&d_output, width * height * sizeof(float4)));
 
     hipStream_t stream;
-    hipStreamCreate(&stream);
+    HIP_CHECK(hipStreamCreate(&stream));
 
     int maxPasses = 12;
     size_t totalLoaded = 0;
@@ -144,26 +173,24 @@ int main() {
         dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
                       (height + blockSize.y - 1) / blockSize.y);
 
-        hipError_t err = hipModuleLaunchKernel(
+        HIP_CHECK(hipModuleLaunchKernel(
             module.kernel,
             gridSize.x, gridSize.y, gridSize.z,
             blockSize.x, blockSize.y, blockSize.z,
             0,
             stream,
             args,
-            nullptr);
-        if (err != hipSuccess) {
-            std::cerr << "Kernel launch failed: " << hipGetErrorString(err) << "\n";
-            break;
-        }
+            nullptr));
 
-        hipStreamSynchronize(stream);
+        HIP_CHECK(hipStreamSynchronize(stream));
 
-        size_t loaded = loader.processRequests(stream);
+        auto ticket = loader.processRequestsAsync(stream, ctx);
+        ticket.wait();
+        size_t loaded = loader.getRequestCount();
         totalLoaded += loaded;
-        std::cout << "Pass " << (pass + 1) << ": " << loaded << " loaded, resident="
-                  << loader.getResidentTextureCount() << " mem="
-                  << (loader.getTotalTextureMemory() / (1024*1024)) << "MB";
+        std::cout << "Pass " << (pass + 1) << ": " << loaded << " requests processed, resident="
+              << loader.getResidentTextureCount() << " mem="
+              << (loader.getTotalTextureMemory() / (1024*1024)) << "MB";
         if (loader.hadRequestOverflow()) std::cout << " (overflow)";
         std::cout << "\n";
 
@@ -173,7 +200,7 @@ int main() {
     }
 
     std::vector<float4> h_output(width * height);
-    hipMemcpy(h_output.data(), d_output, width * height * sizeof(float4), hipMemcpyDeviceToHost);
+    HIP_CHECK(hipMemcpy(h_output.data(), d_output, width * height * sizeof(float4), hipMemcpyDeviceToHost));
 
     std::vector<uint8_t> output_rgb(width * height * 3);
     for (int i = 0; i < width * height; ++i) {
@@ -181,10 +208,11 @@ int main() {
         output_rgb[i*3 + 1] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, h_output[i].y * 255.0f)));
         output_rgb[i*3 + 2] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, h_output[i].z * 255.0f)));
     }
-    stbi_write_png("output_mega.png", width, height, 3, output_rgb.data(), width * 3);
-    std::cout << "Saved output_mega.png\n";
+    std::string outputPath = outputDir + "/output_mega.png";
+    stbi_write_png(outputPath.c_str(), width, height, 3, output_rgb.data(), width * 3);
+    std::cout << "Saved " << outputPath << "\n";
 
-    hipFree(d_output);
-    hipStreamDestroy(stream);
+    HIP_WARN(hipFree(d_output));
+    HIP_WARN(hipStreamDestroy(stream));
     return 0;
 }

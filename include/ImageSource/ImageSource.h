@@ -1,9 +1,9 @@
 #pragma once
 
-/// \file ImageSource.h
-/// Interface for mipmapped image loading with HIP
+/// @file ImageSource.h
+/// @brief Interface for mipmapped image loading.
+/// @note This header requires HIP types. Include <hip/hip_runtime.h> before this header.
 
-#include <hip/hip_runtime.h>
 #include <memory>
 #include <string>
 
@@ -47,6 +47,12 @@ class ImageSource
 
     /// Returns the time in seconds spent reading image data.
     virtual double getTotalReadTime() const = 0;
+
+    /// Returns a hash that uniquely identifies the image source content.
+    /// Used for deduplication - two ImageSource objects with the same hash
+    /// are assumed to produce identical image data.
+    /// Default implementation returns 0 (no deduplication by content).
+    virtual unsigned long long getHash(hipStream_t stream = 0) const { (void)stream; return 0; }
 };
 
 /// Calculate number of mip levels for given dimensions

@@ -1,13 +1,19 @@
 #pragma once
 
+/// @file DemandTextureLoader.h
+/// @brief Demand texture loading API for HIP applications.
+/// @note This header requires HIP types. Include <hip/hip_runtime.h> before this header.
+
 #include "DemandLoading/DeviceContext.h"
-#include <hip/hip_runtime.h>
+#include "DemandLoading/Ticket.h"
 #include <string>
 #include <memory>
 #include <vector>
 #include <cstdint>
 
 namespace hip_demand {
+
+class ImageSource;  // Forward declaration
 
 // Error codes
 enum class LoaderError {
@@ -28,6 +34,14 @@ class TextureRegistry;
 class RequestBuffer;
 class ImageReader;
 
+// Eviction priority for textures
+enum class EvictionPriority {
+    Normal = 0,    // Default - standard LRU eviction
+    Low = 1,       // Evict first (temporary/preview textures)
+    High = 2,      // Evict last (important textures)
+    KeepResident = 3  // Never evict (UI, hero textures)
+};
+
 // Configuration options
 struct LoaderOptions {
     size_t maxTextureMemory = 2ULL * 1024 * 1024 * 1024;  // 2 GB default
@@ -35,6 +49,7 @@ struct LoaderOptions {
     size_t maxRequestsPerLaunch = 1024;
     bool enableEviction = true;
     unsigned int maxThreads = 0;  // 0 = auto
+    unsigned int minResidentFrames = 3;  // Thrashing prevention: don't evict textures younger than this
 };
 
 // Texture descriptor
@@ -46,6 +61,7 @@ struct TextureDesc {
     bool sRGB = false;
     bool generateMipmaps = true;  // Generate mipmaps for better quality
     unsigned int maxMipLevel = 0;  // 0 = auto-generate all levels
+    EvictionPriority evictionPriority = EvictionPriority::Normal;  // Eviction priority hint
 };
 
 inline bool operator==(const TextureDesc& a, const TextureDesc& b) {
@@ -56,7 +72,8 @@ inline bool operator==(const TextureDesc& a, const TextureDesc& b) {
             a.normalizedCoords == b.normalizedCoords &&
             a.sRGB == b.sRGB &&
             a.generateMipmaps == b.generateMipmaps &&
-            a.maxMipLevel == b.maxMipLevel);
+            a.maxMipLevel == b.maxMipLevel &&
+            a.evictionPriority == b.evictionPriority);
 }
 
 // Texture information returned after creation
@@ -81,6 +98,11 @@ public:
     // Create a texture from file (not loaded until requested)
     TextureHandle createTexture(const std::string& filename, 
                                 const TextureDesc& desc = TextureDesc());
+
+    // Create a texture from an ImageSource (not loaded until requested)
+    // The ImageSource is retained for the lifetime of the texture.
+    TextureHandle createTexture(std::shared_ptr<ImageSource> imageSource,
+                                const TextureDesc& desc = TextureDesc());
     
     // Create a texture from memory
     TextureHandle createTextureFromMemory(const void* data, 
@@ -93,9 +115,13 @@ public:
     // Get device context to pass to kernel
     DeviceContext getDeviceContext() const;
 
-    // Process texture requests after kernel launch
+    // Process texture requests after kernel launch using the provided device context
     // Returns number of textures loaded
-    size_t processRequests(hipStream_t stream = 0);
+    size_t processRequests(hipStream_t stream, const DeviceContext& deviceContext);
+
+    // Asynchronously process texture requests on a background thread using the provided device context and stream.
+    // Returns a Ticket that can be waited on.
+    Ticket processRequestsAsync(hipStream_t stream, const DeviceContext& deviceContext);
 
     // Statistics
     size_t getResidentTextureCount() const;
@@ -108,10 +134,22 @@ public:
     void enableEviction(bool enable);
     void setMaxTextureMemory(size_t bytes);
     size_t getMaxTextureMemory() const;
+    
+    /// Update the eviction priority for a texture dynamically.
+    /// Use this to adjust priorities based on camera distance, LOD importance, etc.
+    void updateEvictionPriority(uint32_t textureId, EvictionPriority priority);
 
     // Utility
     void unloadTexture(uint32_t textureId);
     void unloadAll();
+
+    /// Abort all pending operations and halt the loader gracefully.
+    /// After calling abort(), no new requests will be processed.
+    /// Safe to call from any thread. Blocks until all in-flight operations complete.
+    void abort();
+
+    /// Check if the loader has been aborted.
+    bool isAborted() const;
 
 private:
     class Impl;
