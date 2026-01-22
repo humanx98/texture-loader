@@ -13,6 +13,7 @@
 #include <hip/hip_runtime.h>
 
 #include "DemandLoading/DemandTextureLoader.h"
+#include "hip_check.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -44,7 +45,7 @@ struct KernelModule {
     hipFunction_t kernel = nullptr;
 
     ~KernelModule() {
-        if (module) hipModuleUnload(module);
+        if (module) HIP_WARN(hipModuleUnload(module));
     }
 
     bool load(const char* modulePath, const char* kernelName) {
@@ -56,7 +57,7 @@ struct KernelModule {
         err = hipModuleGetFunction(&kernel, module, kernelName);
         if (err != hipSuccess) {
             std::cerr << "Failed to get kernel function: " << hipGetErrorString(err) << "\n";
-            hipModuleUnload(module);
+            HIP_WARN(hipModuleUnload(module));
             module = nullptr;
             return false;
         }
@@ -222,14 +223,14 @@ int main(int argc, char** argv) {
 
     // Initialize HIP
     int deviceCount = 0;
-    hipGetDeviceCount(&deviceCount);
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         std::cerr << "No HIP devices found!\n";
         return 1;
     }
 
     hipDeviceProp_t prop;
-    hipGetDeviceProperties(&prop, 0);
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
     std::cout << "GPU: " << prop.name << "\n\n";
 
     // Load kernel
@@ -298,8 +299,8 @@ int main(int argc, char** argv) {
     // Allocate GPU resources
     float4* d_output = nullptr;
     TileInfo* d_tiles = nullptr;
-    hipMalloc(&d_output, OUTPUT_WIDTH * OUTPUT_HEIGHT * sizeof(float4));
-    hipMalloc(&d_tiles, tiles.size() * sizeof(TileInfo));
+    HIP_CHECK(hipMalloc(&d_output, OUTPUT_WIDTH * OUTPUT_HEIGHT * sizeof(float4)));
+    HIP_CHECK(hipMalloc(&d_tiles, tiles.size() * sizeof(TileInfo)));
 
     std::vector<uint8_t> outputImage(OUTPUT_WIDTH * OUTPUT_HEIGHT * sizeof(float4));
 
@@ -353,7 +354,7 @@ int main(int argc, char** argv) {
         }
 
         // Upload tile info to GPU
-        hipMemcpy(d_tiles, tiles.data(), tiles.size() * sizeof(TileInfo), hipMemcpyHostToDevice);
+        HIP_CHECK(hipMemcpy(d_tiles, tiles.data(), tiles.size() * sizeof(TileInfo), hipMemcpyHostToDevice));
 
         // Prepare for launch and get device context
         loader.launchPrepare();
@@ -378,20 +379,12 @@ int main(int argc, char** argv) {
             &camera
         };
 
-        hipError_t err = hipModuleLaunchKernel(kernelModule.kernel,
+        HIP_CHECK(hipModuleLaunchKernel(kernelModule.kernel,
                               gridSize.x, gridSize.y, 1,
                               blockSize.x, blockSize.y, 1,
-                              0, nullptr, args, nullptr);
-        if (err != hipSuccess) {
-            std::cerr << "Kernel launch failed: " << hipGetErrorString(err) << "\n";
-            return 1;
-        }
+                              0, nullptr, args, nullptr));
 
-        err = hipDeviceSynchronize();
-        if (err != hipSuccess) {
-            std::cerr << "hipDeviceSynchronize failed: " << hipGetErrorString(err) << "\n";
-            return 1;
-        }
+        HIP_CHECK(hipDeviceSynchronize());
 
         // Process texture requests (loads visible textures, may evict old ones)
         loader.processRequests(nullptr, ctx);
@@ -410,13 +403,9 @@ int main(int argc, char** argv) {
 
         // Save frame at specified interval
         if (saveInterval > 0 && frame % saveInterval == 0) {
-            err = hipMemcpy(outputImage.data(), d_output, 
+            HIP_CHECK(hipMemcpy(outputImage.data(), d_output, 
                      OUTPUT_WIDTH * OUTPUT_HEIGHT * sizeof(float4), 
-                     hipMemcpyDeviceToHost);
-            if (err != hipSuccess) {
-                std::cerr << "hipMemcpy failed: " << hipGetErrorString(err) << "\n";
-                return 1;
-            }
+                     hipMemcpyDeviceToHost));
 
             // Convert float4 to RGBA8
             std::vector<uint8_t> rgba(OUTPUT_WIDTH * OUTPUT_HEIGHT * 4);
@@ -456,8 +445,8 @@ int main(int argc, char** argv) {
     std::cout << "  - Green circle: view radius\n";
 
     // Cleanup
-    hipFree(d_output);
-    hipFree(d_tiles);
+    HIP_WARN(hipFree(d_output));
+    HIP_WARN(hipFree(d_tiles));
 
     return 0;
 }

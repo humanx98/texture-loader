@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "HipCheck.h"
 #include <hip/hip_runtime.h>
 
 #include <mutex>
@@ -28,7 +29,7 @@ public:
     ~HipEventPool() {
         std::lock_guard<std::mutex> lock(mutex_);
         for (hipEvent_t event : events_) {
-            hipEventDestroy(event);
+            HIP_CHECK(hipEventDestroy(event));
         }
         events_.clear();
     }

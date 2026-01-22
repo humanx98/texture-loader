@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include "DemandLoading/DemandTextureLoader.h"
 #include "DemandLoading/Logging.h"
+#include "hip_check.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -85,14 +86,14 @@ void benchmark_launch_prepare(DemandTextureLoader& loader, hipStream_t stream, i
     // Warmup
     for (int i = 0; i < 10; ++i) {
         loader.launchPrepare(stream);
-        hipStreamSynchronize(stream);
+        HIP_CHECK(hipStreamSynchronize(stream));
     }
     
     // Measure
     for (int i = 0; i < iterations; ++i) {
         auto start = high_resolution_clock::now();
         loader.launchPrepare(stream);
-        hipStreamSynchronize(stream);
+        HIP_CHECK(hipStreamSynchronize(stream));
         auto end = high_resolution_clock::now();
         
         samples.push_back(duration_cast<nanoseconds>(end - start).count() / 1000.0);
@@ -137,9 +138,9 @@ void benchmark_async_overlap(DemandTextureLoader& loader, hipStream_t stream,
         dim3 blockSize(256);
         dim3 gridSize(64);
         
-        hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
+        HIP_CHECK(hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
                               blockSize.x, blockSize.y, blockSize.z,
-                              0, stream, args, nullptr);
+                              0, stream, args, nullptr));
 
         // No explicit stream sync needed here: processRequestsAsync records an event on
         // the render stream and ensures the copy/processing waits on it.
@@ -163,9 +164,9 @@ void benchmark_async_overlap(DemandTextureLoader& loader, hipStream_t stream,
         dim3 blockSize(256);
         dim3 gridSize(64);
         
-        hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
+        HIP_CHECK(hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
                               blockSize.x, blockSize.y, blockSize.z,
-                              0, stream, args, nullptr);
+                              0, stream, args, nullptr));
 
         // Let the async request pipeline wait on the stream dependency.
         auto ticket = loader.processRequestsAsync(stream, ctx);
@@ -231,7 +232,13 @@ void benchmark_load_throughput(const std::string& kernelPath, int textureCount) 
         }
         
         TextureDesc desc;
+#if defined(__LINUX__)
+        desc.generateMipmaps = false;
+        std::cout << "Mipmaps are not supported on linux.\n";
+#else
         desc.generateMipmaps = true;
+#endif
+
         auto handle = loader.createTextureFromMemory(pixels.data(), texSize, texSize, 4, desc);
         if (handle.valid) {
             textureIds.push_back(handle.id);
@@ -244,26 +251,26 @@ void benchmark_load_throughput(const std::string& kernelPath, int textureCount) 
     
     // Now trigger loading by requesting all textures
     hipStream_t stream;
-    hipStreamCreate(&stream);
+    HIP_CHECK(hipStreamCreate(&stream));
     
     uint32_t* d_textureIds;
-    hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t));
-    hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice);
+    HIP_CHECK(hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t)));
+    HIP_CHECK(hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice));
     
     // Load kernel module
     hipModule_t module;
     hipFunction_t kernel;
     if (hipModuleLoad(&module, kernelPath.c_str()) != hipSuccess) {
         std::cerr << "Failed to load kernel module\n";
-        hipFree(d_textureIds);
-        hipStreamDestroy(stream);
+        HIP_WARN(hipFree(d_textureIds));
+        HIP_WARN(hipStreamDestroy(stream));
         return;
     }
     if (hipModuleGetFunction(&kernel, module, "benchmarkKernelWrapper") != hipSuccess) {
         std::cerr << "Failed to get kernel function\n";
-        hipModuleUnload(module);
-        hipFree(d_textureIds);
-        hipStreamDestroy(stream);
+        HIP_WARN(hipModuleUnload(module));
+        HIP_WARN(hipFree(d_textureIds));
+        HIP_WARN(hipStreamDestroy(stream));
         return;
     }
     
@@ -281,9 +288,9 @@ void benchmark_load_throughput(const std::string& kernelPath, int textureCount) 
     dim3 blockSize(256);
     dim3 gridSize((textureCount + blockSize.x - 1) / blockSize.x);
     
-    hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
+    HIP_CHECK(hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
                           blockSize.x, blockSize.y, blockSize.z,
-                          0, stream, args, nullptr);
+                          0, stream, args, nullptr));
 
     // processRequests() performs the required stream synchronization internally.
     size_t loaded = loader.processRequests(stream, ctx);
@@ -313,9 +320,9 @@ void benchmark_load_throughput(const std::string& kernelPath, int textureCount) 
         std::cout << "  [FAIL] Low throughput. Parallel loading would help significantly.\n";
     }
     
-    hipFree(d_textureIds);
-    hipModuleUnload(module);
-    hipStreamDestroy(stream);
+    HIP_WARN(hipFree(d_textureIds));
+    HIP_WARN(hipModuleUnload(module));
+    HIP_WARN(hipStreamDestroy(stream));
 }
 
 // Benchmark 4: Request processing overhead
@@ -341,9 +348,9 @@ void benchmark_request_processing(DemandTextureLoader& loader, hipStream_t strea
         dim3 blockSize(256);
         dim3 gridSize(64);
         
-        hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
+        HIP_CHECK(hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
                               blockSize.x, blockSize.y, blockSize.z,
-                              0, stream, args, nullptr);
+                              0, stream, args, nullptr));
 
         // processRequests() performs a stream sync internally.
         auto start = high_resolution_clock::now();
@@ -367,9 +374,9 @@ void benchmark_request_processing(DemandTextureLoader& loader, hipStream_t strea
         dim3 blockSize(256);
         dim3 gridSize(64);
         
-        hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
+        HIP_CHECK(hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
                               blockSize.x, blockSize.y, blockSize.z,
-                              0, stream, args, nullptr);
+                              0, stream, args, nullptr));
 
         // processRequestsAsync() establishes stream dependencies via events.
         auto start = high_resolution_clock::now();
@@ -424,14 +431,14 @@ int main(int argc, char** argv) {
     
     // Initialize HIP
     int deviceCount = 0;
-    hipGetDeviceCount(&deviceCount);
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         std::cerr << "No HIP devices found\n";
         return 1;
     }
     
     hipDeviceProp_t prop;
-    hipGetDeviceProperties(&prop, 0);
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
     std::cout << "\nDevice: " << prop.name << "\n";
     std::cout << "Compute units: " << prop.multiProcessorCount << "\n";
     std::cout << "Memory: " << (prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0)) << " GB\n";
@@ -475,26 +482,26 @@ int main(int argc, char** argv) {
     }
     
     hipStream_t stream;
-    hipStreamCreate(&stream);
+    HIP_CHECK(hipStreamCreate(&stream));
     
     uint32_t* d_textureIds;
-    hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t));
-    hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice);
+    HIP_CHECK(hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t)));
+    HIP_CHECK(hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice));
     
     // Load kernel
     hipModule_t module;
     hipFunction_t kernel;
     if (hipModuleLoad(&module, kernelPath.c_str()) != hipSuccess) {
         std::cerr << "Failed to load " << kernelPath << "\n";
-        hipFree(d_textureIds);
-        hipStreamDestroy(stream);
+        HIP_WARN(hipFree(d_textureIds));
+        HIP_WARN(hipStreamDestroy(stream));
         return 1;
     }
     if (hipModuleGetFunction(&kernel, module, "benchmarkKernelWrapper") != hipSuccess) {
         std::cerr << "Failed to get kernel function\n";
-        hipModuleUnload(module);
-        hipFree(d_textureIds);
-        hipStreamDestroy(stream);
+        HIP_WARN(hipModuleUnload(module));
+        HIP_WARN(hipFree(d_textureIds));
+        HIP_WARN(hipStreamDestroy(stream));
         return 1;
     }
     
@@ -507,9 +514,9 @@ int main(int argc, char** argv) {
     void* args[] = { &ctx, &d_textureIds, &k_numTextureIds, &k_numRequesters, &k_iterations };
     dim3 blockSize(256);
     dim3 gridSize(64);
-    hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
+    HIP_CHECK(hipModuleLaunchKernel(kernel, gridSize.x, gridSize.y, gridSize.z,
                           blockSize.x, blockSize.y, blockSize.z,
-                          0, stream, args, nullptr);
+                          0, stream, args, nullptr));
     loader.processRequests(stream, ctx);
     
     // Run benchmarks
@@ -519,9 +526,9 @@ int main(int argc, char** argv) {
     benchmark_load_throughput(kernelPath, 500);
     
     // Cleanup
-    hipFree(d_textureIds);
-    hipModuleUnload(module);
-    hipStreamDestroy(stream);
+    HIP_WARN(hipFree(d_textureIds));
+    HIP_WARN(hipModuleUnload(module));
+    HIP_WARN(hipStreamDestroy(stream));
     
     std::cout << "\n=================================================\n";
     std::cout << "  Benchmark Suite Complete\n";

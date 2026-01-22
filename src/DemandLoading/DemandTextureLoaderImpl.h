@@ -140,6 +140,10 @@ private:
     std::unique_ptr<internal::HipEventPool> hipEventPool_;
 
     LoaderError lastError_ = LoaderError::Success;
+
+    // Mipmap capability detection (requires mutex_)
+    bool mipmapsSupportChecked_ = false;
+    bool mipmapsSupported_ = true;
 };
 
 } // namespace hip_demand

@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include "DemandLoading/DemandTextureLoader.h"
+#include "hip_check.h"
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -19,7 +20,7 @@ struct KernelModule {
 
     ~KernelModule() {
         if (module) {
-            hipModuleUnload(module);
+            HIP_WARN(hipModuleUnload(module));
         }
     }
 
@@ -33,7 +34,7 @@ struct KernelModule {
         err = hipModuleGetFunction(&kernel, module, kernelName);
         if (err != hipSuccess) {
             std::cerr << "Failed to get kernel function: " << hipGetErrorString(err) << "\n";
-            hipModuleUnload(module);
+            HIP_WARN(hipModuleUnload(module));
             module = nullptr;
             return false;
         }
@@ -52,14 +53,14 @@ int main(int argc, char** argv) {
     std::cout << "==================================\n\n";
 
     int deviceCount = 0;
-    hipGetDeviceCount(&deviceCount);
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         std::cerr << "No HIP devices found!\n";
         return 1;
     }
 
     hipDeviceProp_t prop;
-    hipGetDeviceProperties(&prop, 0);
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
     std::cout << "Using device: " << prop.name << "\n\n";
 
     std::cout << "Loading HIP kernel module...\n";
@@ -131,14 +132,14 @@ int main(int argc, char** argv) {
     const int width = 1920;
     const int height = 1080;
     float4* d_output = nullptr;
-    hipMalloc(&d_output, width * height * sizeof(float4));
+    HIP_CHECK(hipMalloc(&d_output, width * height * sizeof(float4)));
 
     uint32_t* d_textureIds = nullptr;
-    hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t));
-    hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice);
+    HIP_CHECK(hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t)));
+    HIP_CHECK(hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice));
 
     hipStream_t stream;
-    hipStreamCreate(&stream);
+    HIP_CHECK(hipStreamCreate(&stream));
 
     int maxPasses = 6;
     int pass = 0;
@@ -167,21 +168,16 @@ int main(int argc, char** argv) {
         dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
                       (height + blockSize.y - 1) / blockSize.y);
 
-        hipError_t err = hipModuleLaunchKernel(
+        HIP_CHECK(hipModuleLaunchKernel(
             kernelModule.kernel,
             gridSize.x, gridSize.y, gridSize.z,
             blockSize.x, blockSize.y, blockSize.z,
             0,
             stream,
             args,
-            nullptr);
+            nullptr));
 
-        if (err != hipSuccess) {
-            std::cerr << "Kernel launch failed: " << hipGetErrorString(err) << "\n";
-            break;
-        }
-
-        hipStreamSynchronize(stream);
+        HIP_CHECK(hipStreamSynchronize(stream));
 
         auto ticket = loader.processRequestsAsync(stream, ctx);
         ticket.wait();
@@ -220,9 +216,9 @@ int main(int argc, char** argv) {
     }
 
     std::vector<float4> h_output(width * height);
-    hipMemcpy(h_output.data(), d_output,
+    HIP_CHECK(hipMemcpy(h_output.data(), d_output,
               width * height * sizeof(float4),
-              hipMemcpyDeviceToHost);
+              hipMemcpyDeviceToHost));
 
     std::cout << "\nSample output pixel (center): ("
               << h_output[height / 2 * width + width / 2].x << ", "
@@ -241,9 +237,9 @@ int main(int argc, char** argv) {
     stbi_write_png(outputPath.c_str(), width, height, 3, output_rgb.data(), width * 3);
     std::cout << "Saved " << outputPath << " (" << width << "x" << height << ")\n";
 
-    hipFree(d_output);
-    hipFree(d_textureIds);
-    hipStreamDestroy(stream);
+    HIP_WARN(hipFree(d_output));
+    HIP_WARN(hipFree(d_textureIds));
+    HIP_WARN(hipStreamDestroy(stream));
 
     std::cout << "\nDone!\n";
     return 0;

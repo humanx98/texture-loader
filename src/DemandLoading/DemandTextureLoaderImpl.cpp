@@ -2,6 +2,7 @@
 // DemandTextureLoader implementation
 #include <hip/hip_runtime.h>
 #include "DemandTextureLoaderImpl.h"
+#include "Internal/HipCheck.h"
 #include "Internal/TextureMetadata.h"
 #include "Internal/Utils.h"
 
@@ -60,7 +61,7 @@ DemandTextureLoader::Impl::Impl(const LoaderOptions& options)
     err = hipMalloc(&deviceContext_.textures, options_.maxTextures * sizeof(TextureObject));
     if (err != hipSuccess) {
         lastError_ = LoaderError::OutOfMemory;
-        hipFree(deviceContext_.requests);
+        HIP_CHECK(hipFree(deviceContext_.requests));
         deviceContext_.requests = nullptr;
         return;
     }
@@ -70,8 +71,8 @@ DemandTextureLoader::Impl::Impl(const LoaderOptions& options)
     err = hipMalloc(&deviceContext_.residentFlags, flagWords * sizeof(uint32_t));
     if (err != hipSuccess) {
         lastError_ = LoaderError::OutOfMemory;
-        hipFree(deviceContext_.requests);
-        hipFree(deviceContext_.textures);
+        HIP_CHECK(hipFree(deviceContext_.requests));
+        HIP_CHECK(hipFree(deviceContext_.textures));
         deviceContext_.requests = nullptr;
         deviceContext_.textures = nullptr;
         return;
@@ -80,9 +81,9 @@ DemandTextureLoader::Impl::Impl(const LoaderOptions& options)
     err = hipMalloc(&d_requestStats_, sizeof(RequestStats));
     if (err != hipSuccess) {
         lastError_ = LoaderError::OutOfMemory;
-        hipFree(deviceContext_.requests);
-        hipFree(deviceContext_.textures);
-        hipFree(deviceContext_.residentFlags);
+        HIP_CHECK(hipFree(deviceContext_.requests));
+        HIP_CHECK(hipFree(deviceContext_.textures));
+        HIP_CHECK(hipFree(deviceContext_.residentFlags));
         deviceContext_.requests = nullptr;
         deviceContext_.textures = nullptr;
         deviceContext_.residentFlags = nullptr;
@@ -113,23 +114,23 @@ DemandTextureLoader::Impl::Impl(const LoaderOptions& options)
     }
     if (hipHostMalloc(reinterpret_cast<void**>(&h_textures_), options_.maxTextures * sizeof(TextureObject)) != hipSuccess) {
         lastError_ = LoaderError::OutOfMemory;
-        hipHostFree(h_residentFlags_);
+        HIP_CHECK(hipHostFree(h_residentFlags_));
         h_residentFlags_ = nullptr;
         return;
     }
     if (hipHostMalloc(reinterpret_cast<void**>(&h_requests_), options_.maxRequestsPerLaunch * sizeof(uint32_t)) != hipSuccess) {
         lastError_ = LoaderError::OutOfMemory;
-        hipHostFree(h_residentFlags_);
-        hipHostFree(h_textures_);
+        HIP_CHECK(hipHostFree(h_residentFlags_));
+        HIP_CHECK(hipHostFree(h_textures_));
         h_residentFlags_ = nullptr;
         h_textures_ = nullptr;
         return;
     }
     if (hipHostMalloc(reinterpret_cast<void**>(&h_requestStats_), sizeof(RequestStats)) != hipSuccess) {
         lastError_ = LoaderError::OutOfMemory;
-        hipHostFree(h_residentFlags_);
-        hipHostFree(h_textures_);
-        hipHostFree(h_requests_);
+        HIP_CHECK(hipHostFree(h_residentFlags_));
+        HIP_CHECK(hipHostFree(h_textures_));
+        HIP_CHECK(hipHostFree(h_requests_));
         h_residentFlags_ = nullptr;
         h_textures_ = nullptr;
         h_requests_ = nullptr;
@@ -182,21 +183,21 @@ DemandTextureLoader::Impl::~Impl() {
     hipEventPool_.reset();
 
     if (requestCopyStream_) {
-        hipStreamDestroy(requestCopyStream_);
+        HIP_CHECK(hipStreamDestroy(requestCopyStream_));
         requestCopyStream_ = nullptr;
     }
 
     unloadAll();
 
-    if (h_residentFlags_) hipHostFree(h_residentFlags_);
-    if (h_textures_) hipHostFree(h_textures_);
-    if (h_requests_) hipHostFree(h_requests_);
-    if (h_requestStats_) hipHostFree(h_requestStats_);
+    if (h_residentFlags_) HIP_CHECK(hipHostFree(h_residentFlags_));
+    if (h_textures_) HIP_CHECK(hipHostFree(h_textures_));
+    if (h_requests_) HIP_CHECK(hipHostFree(h_requests_));
+    if (h_requestStats_) HIP_CHECK(hipHostFree(h_requestStats_));
 
-    if (deviceContext_.residentFlags) hipFree(deviceContext_.residentFlags);
-    if (deviceContext_.textures) hipFree(deviceContext_.textures);
-    if (deviceContext_.requests) hipFree(deviceContext_.requests);
-    if (d_requestStats_) hipFree(d_requestStats_);
+    if (deviceContext_.residentFlags) HIP_CHECK(hipFree(deviceContext_.residentFlags));
+    if (deviceContext_.textures) HIP_CHECK(hipFree(deviceContext_.textures));
+    if (deviceContext_.requests) HIP_CHECK(hipFree(deviceContext_.requests));
+    if (d_requestStats_) HIP_CHECK(hipFree(d_requestStats_));
 }
 
 // AsyncGuard destructor
@@ -627,7 +628,7 @@ Ticket DemandTextureLoader::Impl::processRequestsAsync(hipStream_t stream, const
         lastError_ = LoaderError::HipError;
         return Ticket{};
     }
-    hipEventRecord(depsReady, stream);
+    HIP_CHECK(hipEventRecord(depsReady, stream));
 
     hipStream_t copyStream = requestCopyStream_ ? requestCopyStream_ : stream;
     if (copyStream != stream) {
@@ -669,7 +670,7 @@ Ticket DemandTextureLoader::Impl::processRequestsAsync(hipStream_t stream, const
         lastError_ = LoaderError::HipError;
         return Ticket{};
     }
-    hipEventRecord(copyDone, copyStream);
+    HIP_CHECK(hipEventRecord(copyDone, copyStream));
 
     // Bundle resources into a single shared allocation to reduce overhead
     struct AsyncResources {
@@ -695,7 +696,7 @@ Ticket DemandTextureLoader::Impl::processRequestsAsync(hipStream_t stream, const
         } guard{this};
 
         // Always clean up HIP events - return to pool
-        hipEventSynchronize(copyDone);
+        HIP_CHECK(hipEventSynchronize(copyDone));
         eventPool->release(copyDone);
         eventPool->release(depsReady);
 
@@ -1007,6 +1008,39 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
     bool useMipmaps = desc.generateMipmaps && (width > 1 || height > 1);
 
     if (useMipmaps) {
+        // Check if mipmaps are supported on this GPU (one-time check)
+        bool shouldUseMipmaps = true;
+        {
+            std::lock_guard<std::mutex> capLock(mutex_);
+            if (!mipmapsSupportChecked_) {
+                // Perform capability test with a minimal allocation
+                hipMipmappedArray_t testArray = nullptr;
+                hipChannelFormatDesc testChannelDesc = hipCreateChannelDesc<uchar4>();
+                hipExtent testExtent = make_hipExtent(1, 1, 0);
+                hipError_t testErr = hipMallocMipmappedArray(&testArray, &testChannelDesc, testExtent, 1);
+                
+                if (testErr != hipSuccess) {
+                    mipmapsSupported_ = false;
+                    std::cerr << "\n*** WARNING: Mipmapped arrays not supported on this GPU ***\n"
+                              << "    HIP Error: " << hipGetErrorString(testErr) << "\n"
+                              << "    Falling back to non-mipmapped textures for all loads.\n"
+                              << "    This may result in aliasing artifacts at distance.\n" << std::endl;
+                } else {
+                    HIP_CHECK(hipFreeMipmappedArray(testArray)); // Ignore cleanup errors during capability test
+                    mipmapsSupported_ = true;
+                }
+                mipmapsSupportChecked_ = true;
+            }
+            shouldUseMipmaps = mipmapsSupported_;
+        }
+        
+        // If mipmaps aren't supported, fall back to non-mipmapped path
+        if (!shouldUseMipmaps) {
+            useMipmaps = false;
+        }
+    }
+
+    if (useMipmaps) {
         int numLevels = calculateMipLevels(width, height);
         if (desc.maxMipLevel > 0) {
             numLevels = std::min(numLevels, (int)desc.maxMipLevel);
@@ -1109,11 +1143,11 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
 
     if (!success) {
         if (info.mipmapArray) {
-            hipFreeMipmappedArray(info.mipmapArray);
+            HIP_CHECK(hipFreeMipmappedArray(info.mipmapArray));
             info.mipmapArray = nullptr;
         }
         if (info.array) {
-            hipFreeArray(info.array);
+            HIP_CHECK(hipFreeArray(info.array));
             info.array = nullptr;
         }
         lock.lock();

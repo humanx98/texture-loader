@@ -75,7 +75,7 @@ public:
     ~PinnedMemoryPool() {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& entry : pool_) {
-            hipHostFree(entry.ptr);
+            HIP_CHECK(hipHostFree(entry.ptr));
         }
         pool_.clear();
     }
@@ -123,7 +123,7 @@ private:
         
         // If pool is full, free the buffer; otherwise add to pool
         if (pool_.size() >= maxPooledBuffers_) {
-            hipHostFree(ptr);
+            HIP_CHECK(hipHostFree(ptr));
         } else {
             pool_.push_back({ptr, size});
         }

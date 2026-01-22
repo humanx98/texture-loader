@@ -7,6 +7,7 @@
 
 #include "DemandLoading/DemandTextureLoader.h"
 #include "DemandLoading/Logging.h"
+#include "hip_check.h"
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -25,7 +26,7 @@ struct KernelModule {
     hipFunction_t kernel{nullptr};
     
     ~KernelModule() { 
-        if (module) hipModuleUnload(module); 
+        if (module) HIP_WARN(hipModuleUnload(module)); 
     }
 
     bool load(const char* modulePath, const char* kernelName) {
@@ -37,7 +38,7 @@ struct KernelModule {
         err = hipModuleGetFunction(&kernel, module, kernelName);
         if (err != hipSuccess) {
             std::cerr << "Failed to get kernel function '" << kernelName << "': " << hipGetErrorString(err) << "\n";
-            hipModuleUnload(module);
+            HIP_WARN(hipModuleUnload(module));
             module = nullptr;
             return false;
         }
@@ -209,14 +210,14 @@ int main(int argc, char** argv) {
 
     // Check for HIP devices
     int deviceCount = 0;
-    hipGetDeviceCount(&deviceCount);
+    HIP_CHECK(hipGetDeviceCount(&deviceCount));
     if (deviceCount == 0) {
         std::cerr << "No HIP devices found!\n";
         return 1;
     }
 
     hipDeviceProp_t prop{};
-    hipGetDeviceProperties(&prop, 0);
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
     std::cout << "Using device: " << prop.name << "\n\n";
 
     // Load kernel module
@@ -278,22 +279,22 @@ int main(int argc, char** argv) {
 
     // Create HIP stream
     hipStream_t stream;
-    hipStreamCreate(&stream);
+    HIP_CHECK(hipStreamCreate(&stream));
 
     // Allocate GPU buffers
     float4* d_output = nullptr;
     float4* d_accumulator = nullptr;
     uint32_t* d_textureIds = nullptr;
     
-    hipMalloc(&d_output, width * height * sizeof(float4));
-    hipMalloc(&d_accumulator, width * height * sizeof(float4));
-    hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t));
+    HIP_CHECK(hipMalloc(&d_output, width * height * sizeof(float4)));
+    HIP_CHECK(hipMalloc(&d_accumulator, width * height * sizeof(float4)));
+    HIP_CHECK(hipMalloc(&d_textureIds, textureIds.size() * sizeof(uint32_t)));
     
     // Initialize accumulator to zero
-    hipMemset(d_accumulator, 0, width * height * sizeof(float4));
+    HIP_CHECK(hipMemset(d_accumulator, 0, width * height * sizeof(float4)));
     
     // Copy texture IDs to device
-    hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice);
+    HIP_CHECK(hipMemcpy(d_textureIds, textureIds.data(), textureIds.size() * sizeof(uint32_t), hipMemcpyHostToDevice));
 
     // Kernel launch configuration
     dim3 blockSize(16, 16);
@@ -330,20 +331,15 @@ int main(int argc, char** argv) {
             &ctx
         };
         
-        hipError_t err = hipModuleLaunchKernel(
+        HIP_CHECK(hipModuleLaunchKernel(
             module.kernel,
             gridSize.x, gridSize.y, 1,
             blockSize.x, blockSize.y, 1,
             0, stream,
             args, nullptr
-        );
+        ));
         
-        if (err != hipSuccess) {
-            std::cerr << "Kernel launch failed: " << hipGetErrorString(err) << "\n";
-            break;
-        }
-        
-        hipStreamSynchronize(stream);
+        HIP_CHECK(hipStreamSynchronize(stream));
         
         // Process texture requests
         size_t requestCount = loader.processRequests(stream, ctx);
@@ -365,7 +361,7 @@ int main(int argc, char** argv) {
         // Save intermediate result
         if ((frame + 1) % saveInterval == 0 || frame == numFrames - 1) {
             std::vector<float4> h_output(width * height);
-            hipMemcpy(h_output.data(), d_output, width * height * sizeof(float4), hipMemcpyDeviceToHost);
+            HIP_CHECK(hipMemcpy(h_output.data(), d_output, width * height * sizeof(float4), hipMemcpyDeviceToHost));
             
             std::vector<uint8_t> output_rgb(width * height * 3);
             for (int i = 0; i < width * height; ++i) {
@@ -403,7 +399,7 @@ int main(int argc, char** argv) {
     // Save final render with higher quality filename
     {
         std::vector<float4> h_output(width * height);
-        hipMemcpy(h_output.data(), d_output, width * height * sizeof(float4), hipMemcpyDeviceToHost);
+        HIP_CHECK(hipMemcpy(h_output.data(), d_output, width * height * sizeof(float4), hipMemcpyDeviceToHost));
         
         std::vector<uint8_t> output_rgb(width * height * 3);
         for (int i = 0; i < width * height; ++i) {
@@ -422,10 +418,10 @@ int main(int argc, char** argv) {
     }
 
     // Cleanup
-    hipFree(d_output);
-    hipFree(d_accumulator);
-    hipFree(d_textureIds);
-    hipStreamDestroy(stream);
+    HIP_WARN(hipFree(d_output));
+    HIP_WARN(hipFree(d_accumulator));
+    HIP_WARN(hipFree(d_textureIds));
+    HIP_WARN(hipStreamDestroy(stream));
 
     std::cout << "\nDone!\n";
     return 0;

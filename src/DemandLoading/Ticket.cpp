@@ -1,7 +1,8 @@
 #include <hip/hip_runtime.h>
-#include "DemandLoading/Ticket.h"
 #include <thread>
 #include <queue>
+#include "DemandLoading/Ticket.h"
+#include "Internal/HipCheck.h"
 
 namespace hip_demand {
 
@@ -17,7 +18,7 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] { return done_.load(std::memory_order_acquire); });
         if (event && stream_) {
-            hipEventRecord(*event, stream_);
+            HIP_CHECK(hipEventRecord(*event, stream_));
         }
     }
 
