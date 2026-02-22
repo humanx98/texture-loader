@@ -127,7 +127,7 @@ TEST_F(HipTestFixture, EventPoolEventWorks) {
     EXPECT_EQ(hipEventSynchronize(event), hipSuccess);
     
     pool.release(event);
-    hipStreamDestroy(stream);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
 TEST_F(HipTestFixture, EventPoolReuse) {

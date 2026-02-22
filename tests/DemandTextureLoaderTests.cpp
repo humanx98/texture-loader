@@ -10,6 +10,7 @@
 #include <thread>
 #include <chrono>
 #include <set>
+#include <cstring>
 
 namespace hip_demand {
 namespace test {
@@ -257,7 +258,7 @@ TEST_F(LoaderTestFixture, LaunchPrepare) {
     DeviceContext ctx = loader_->getDeviceContext();
     EXPECT_NE(ctx.textures, nullptr);
     
-    hipStreamDestroy(stream);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess) << "Failed to destroy stream";
 }
 
 // ============================================================================
@@ -360,7 +361,7 @@ TEST_F(LoaderTestFixture, AbortPreventsNewRequests) {
     size_t loaded = loader_->processRequests(stream, ctx);
     EXPECT_EQ(loaded, 0u);
     
-    hipStreamDestroy(stream);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess) << "Failed to destroy stream";
 }
 
 // ============================================================================
