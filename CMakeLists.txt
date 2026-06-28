@@ -12,6 +12,15 @@ endif()
 
 if (UNIX)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+    # Let installed executables locate the shared library relative to their
+    # own location (bin/ -> ../lib) without requiring LD_LIBRARY_PATH.
+    if(APPLE)
+        set(CMAKE_INSTALL_RPATH "@loader_path/../lib")
+    else()
+        set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+    endif()
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
 endif()
 
 # Add cmake module path
@@ -61,7 +70,13 @@ if(USE_OIIO)
     )
 endif()
 
-add_library(hip_demand_texture ${TEXTURE_LOADER_SOURCES})
+add_library(hip_demand_texture SHARED ${TEXTURE_LOADER_SOURCES})
+
+# Export all symbols on Windows so the shared library is usable without
+# explicit __declspec(dllexport) annotations.
+set_target_properties(hip_demand_texture PROPERTIES
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
+)
 
 target_include_directories(hip_demand_texture
     PUBLIC
