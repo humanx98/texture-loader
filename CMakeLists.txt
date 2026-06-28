@@ -10,6 +10,10 @@ if(MSVC)
     add_compile_options(/EHsc)
 endif()
 
+if (UNIX)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # Add cmake module path
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -338,6 +342,62 @@ if(BUILD_EXAMPLES)
     
     add_dependencies(benchmark_suite benchmark_kernel)
     
+    # examples
+    install(TARGETS 
+        texture_loader_example
+        tiled_render_example
+        mega_texture_example
+        atlas_render_example
+        async_vs_sync_example
+        streaming_scene_example
+        path_tracing_example
+        benchmark_suite
+        RUNTIME DESTINATION bin
+    )
+    # kernels for examples
+    install(FILES
+        $<TARGET_PROPERTY:render_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME render_kernel.co
+    )
+    
+    install(FILES
+        $<TARGET_PROPERTY:tiled_render_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME tiled_render_kernel.co
+    )
+    
+    install(FILES
+        $<TARGET_PROPERTY:mega_texture_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME mega_texture_kernel.co
+    )
+    
+    install(FILES
+        $<TARGET_PROPERTY:atlas_render_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME atlas_render_kernel.co
+    )
+    
+    install(FILES
+        $<TARGET_PROPERTY:streaming_scene_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME streaming_scene_kernel.co
+    )
+    
+    install(FILES
+        $<TARGET_PROPERTY:path_tracing_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME path_tracing_kernel.co
+    )
+    
+    install(FILES
+        $<TARGET_PROPERTY:benchmark_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME benchmark_kernel.co
+    )
+
+    
     # OpenImageIO format example (only if OIIO is enabled)
     if(USE_OIIO)
         add_executable(oiio_formats_example
@@ -355,7 +415,7 @@ if(BUILD_EXAMPLES)
         )
         
         target_compile_definitions(oiio_formats_example PRIVATE __HIP_PLATFORM_AMD__ USE_OIIO)
-        
+        install(TARGETS oiio_formats_example RUNTIME DESTINATION bin)
         message(STATUS "Building OpenImageIO format example")
     endif()
 endif()

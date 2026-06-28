@@ -32,7 +32,7 @@ protected:
     }
     
     void TearDown() override {
-        hipDeviceReset();
+        ASSERT_EQ(hipDeviceReset(), hipSuccess) << "Failed to reset device";
     }
 };
 

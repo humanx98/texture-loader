@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "HipCheck.h"
+
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
