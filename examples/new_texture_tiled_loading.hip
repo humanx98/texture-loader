@@ -3,8 +3,6 @@
 
 #include <hip/hip_runtime.h>
 
-using namespace hip_demand::vmm;
-
 namespace {
 
 __device__ __forceinline__ uint8_t toUnorm8( float value )
@@ -15,7 +13,7 @@ __device__ __forceinline__ uint8_t toUnorm8( float value )
 
 }  // namespace
 
-extern "C" __global__ void renderVmmTexture( DeviceContext context,
+extern "C" __global__ void renderVmmTexture( hip_demand::vmm::DeviceContext context,
                                               uint32_t textureId,
                                               uint8_t* output,
                                               uint32_t width,
@@ -28,9 +26,9 @@ extern "C" __global__ void renderVmmTexture( DeviceContext context,
 
     const size_t outputOffset = ( static_cast<size_t>( y ) * width + x ) * 4;
     bool resident = false;
-    const float4 color =
-        fetchDemandTexel( context, context.textureInfos.ptr[textureId], 0,
-                          static_cast<int>( x ), static_cast<int>( y ), resident );
+    float u =  2 * (static_cast<float>(x) + 0.5f) / static_cast<float>(width);
+    float v =  2 * (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
+    const float4 color = hip_demand::vmm::tex2DLod<float4>( context, textureId, u, v, 0.0f, resident );
     if( resident )
     {
         output[outputOffset + 0] = toUnorm8( color.x );

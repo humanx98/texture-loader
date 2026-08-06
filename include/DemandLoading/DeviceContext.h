@@ -71,9 +71,12 @@ constexpr uint32_t MAX_TEXTURE_MIP_LEVELS = 15;
 
 struct DeviceMipLevel
 {
+    uint32_t width     = 0;
+    uint32_t height    = 0;
     uint32_t tilesX    = 0;
     uint32_t tilesY    = 0;
     uint32_t startPage = 0;
+
     HIP_DEMAND_INLINE uint32_t pageCount() const { return tilesX * tilesY; }
 };
 
@@ -87,6 +90,7 @@ struct DeviceTextureInfo
     uint32_t       mipCount         = 0;
     uint32_t       addressMode[2]   = { hipAddressModeWrap, hipAddressModeWrap };
     uint32_t       filterMode       = hipFilterModeLinear;
+    uint32_t       mipmapFilterMode = hipFilterModeLinear;
     uint32_t       normalizedCoords = 1;
     TextureFormat  format           = TextureFormat::RGBA8Unorm;
     uint32_t       bytesPerTexel    = 4;
@@ -108,11 +112,5 @@ struct DeviceContext
     DeviceSpan<uint32_t>          counters{};
     size_t                        pageSize = 0;
 };
-
-HIP_DEMAND_INLINE uint32_t mipDimension( uint32_t baseDimension, uint32_t mipLevel )
-{
-    const uint32_t dimension = baseDimension >> mipLevel;
-    return dimension == 0 ? 1u : dimension;
-}
 
 }  // namespace hip_demand::vmm

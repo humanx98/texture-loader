@@ -187,7 +187,7 @@ endif()
 function(hip_add_executable)
     set(options "")
     set(oneValueArgs TARGET)
-    set(multiValueArgs SOURCES ARCHITECTURES OPTIONS INCLUDES)
+    set(multiValueArgs SOURCES ARCHITECTURES OPTIONS INCLUDES DEPENDS)
     cmake_parse_arguments(HIP "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
     
     if(NOT HIP_TARGET)
@@ -234,7 +234,7 @@ function(hip_add_executable)
             ${HIP_SOURCES}
             ${ROCM_DEVICE_LIB_PATH_OPTION}
             -o ${OUTPUT_FILE}
-        DEPENDS ${HIP_SOURCES}
+        DEPENDS ${HIP_SOURCES} ${HIP_DEPENDS}
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         COMMENT "Compiling HIP device code: ${HIP_TARGET}"
         VERBATIM

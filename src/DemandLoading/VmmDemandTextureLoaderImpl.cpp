@@ -1,14 +1,15 @@
 #include "Internal/HipCheck.h"
 #include "Internal/Utils.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
-#include <mutex>
 #include <algorithm>
+#include <mutex>
 
 namespace hip_demand::vmm {
 
 using internal::Bitset;
 using internal::calculateMipLevels;
 using internal::ceilDiv;
+using internal::mipDimension;
 using internal::memcpyDtoHAsync;
 using internal::memcpyHtoDAsync;
 using internal::memset;
@@ -91,9 +92,8 @@ inline void readTile( const VmmTileKey& key, const ImageSource& image, const Dev
 {
     assert( info.tileWidth * info.tileHeight * info.bytesPerTexel <= pageBuffer.size() );
 
-    const size_t mipWidth  = mipDimension( info.width, key.mipLevel );
-    const size_t mipHeight = mipDimension( info.height, key.mipLevel );
-
+    const size_t   mipWidth   = info.mips[key.mipLevel].width;
+    const size_t   mipHeight  = info.mips[key.mipLevel].height;
     const size_t   firstX     = key.tileX * info.tileWidth;
     const size_t   firstY     = key.tileY * info.tileHeight;
     const size_t   copyWidth  = std::min( static_cast<size_t>( info.tileWidth ), mipWidth - firstX );
@@ -333,6 +333,7 @@ const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<Ima
     textureInfo.addressMode[0]   = descriptor.addressMode[0];
     textureInfo.addressMode[1]   = descriptor.addressMode[1];
     textureInfo.filterMode       = descriptor.filterMode;
+    textureInfo.mipmapFilterMode = descriptor.mipmapFilterMode;
     textureInfo.normalizedCoords = descriptor.normalizedCoords ? 1u : 0u;
     textureInfo.format           = descriptor.format;
     textureInfo.bytesPerTexel    = bytesPerTexel;
@@ -340,12 +341,11 @@ const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<Ima
     uint32_t pageCount = 0;
     for( uint32_t mip = 0; mip < mipCount; ++mip )
     {
-        uint32_t mipWidth  = mipDimension( textureInfo.width, mip );
-        uint32_t mipHeight = mipDimension( textureInfo.height, mip );
-
         auto& level     = textureInfo.mips[mip];
-        level.tilesX    = ceilDiv( mipWidth, textureInfo.tileWidth );
-        level.tilesY    = ceilDiv( mipHeight, textureInfo.tileHeight );
+        level.width     = mipDimension( textureInfo.width, mip );
+        level.height    = mipDimension( textureInfo.height, mip );
+        level.tilesX    = ceilDiv( level.width, textureInfo.tileWidth );
+        level.tilesY    = ceilDiv( level.height, textureInfo.tileHeight );
         level.startPage = nextAvailablePage_ + pageCount;
 
         pageCount += level.pageCount();
@@ -371,6 +371,8 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
     if( textureInfosDirty_ )
     {
         memcpyHtoDAsync( deviceContext_.textureInfos, textureInfos_, textureInfos_.size(), stream );
+        // change len because for device we preallocated for maxTextures
+        deviceContext_.textureInfos.len = textureInfos_.size();
         textureInfosDirty_ = false;
     }
 

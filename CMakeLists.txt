@@ -157,6 +157,9 @@ if(BUILD_EXAMPLES)
         ARCHITECTURES ${HIP_ARCHITECTURES}
             OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
         INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
+        DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/VmmTextureSampling.h
     )
 
     # Example application (host code only)
@@ -342,7 +345,7 @@ if(BUILD_EXAMPLES)
         COMMENT "Copying HIP kernel code object"
     )
 
-    add_custom_command(TARGET new_texture_tiled_loading_example POST_BUILD
+    add_custom_command(TARGET new_texture_tiled_loading_kernel POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_PROPERTY:new_texture_tiled_loading_kernel,HIP_CODE_OBJECT>
             $<TARGET_FILE_DIR:new_texture_tiled_loading_example>/new_texture_tiled_loading_kernel.co

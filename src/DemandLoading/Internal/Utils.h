@@ -126,6 +126,12 @@ inline uint2 tileShapeForGranularity( size_t granularity, uint32_t bytesPerTexel
     return { static_cast<uint32_t>( width ), static_cast<uint32_t>( height ) };
 }
 
+inline uint32_t mipDimension( uint32_t baseDimension, uint32_t mipLevel )
+{
+    const uint32_t dimension = baseDimension >> mipLevel;
+    return dimension == 0 ? 1u : dimension;
+}
+
 template <typename T>
 static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src )
 {

@@ -99,10 +99,11 @@ int main( int, char** argv )
 
 
         TextureDescriptor descriptor{ hip_demand::TextureFormat::RGBA8Unorm };
-        descriptor.addressMode[0]                = hipAddressModeClamp;
-        descriptor.addressMode[1]                = hipAddressModeClamp;
-        descriptor.filterMode                    = hipFilterModePoint;
-        descriptor.normalizedCoords              = false;
+        descriptor.addressMode[0]                = hipAddressModeMirror;
+        descriptor.addressMode[1]                = hipAddressModeMirror;
+        descriptor.filterMode                    = hipFilterModeLinear;
+        descriptor.mipmapFilterMode              = hipFilterModeLinear;
+        descriptor.normalizedCoords              = true;
         std::shared_ptr<ImageSource> imageSource = readImage( inputPath );
         uint32_t                     width       = imageSource->width;
         uint32_t                     height      = imageSource->height;
@@ -146,71 +147,69 @@ int main( int, char** argv )
         launchKernel( context );
         HIP_CHECK( hipMemcpyAsync( hostOutput.data(), deviceOutput, byteCount, hipMemcpyDeviceToHost, stream ) );
         HIP_CHECK( hipStreamSynchronize( stream ) );
-        // {
-        //     DeviceContext hostContext{};
+        //{
+        //    DeviceContext hostContext{};
 
-        //     std::vector<uint8_t>           pageMemory{};
-        //     std::vector<uint32_t>          requestedPageBitFlags{};
-        //     std::vector<uint32_t>          residentPageBitFlags{};
-        //     std::vector<DeviceTextureInfo> textureInfos{};
-        //     size_t                         pageSize = context.pageSize;
+        //    std::vector<uint8_t>           pageMemory{};
+        //    std::vector<uint32_t>          requestedPageBitFlags{};
+        //    std::vector<uint32_t>          residentPageBitFlags{};
+        //    std::vector<DeviceTextureInfo> textureInfos{};
+        //    size_t                         pageSize = context.pageSize;
 
-        //     residentPageBitFlags.resize( context.residentPageBitFlags.len );
-        //     HIP_CHECK( hipMemcpy( residentPageBitFlags.data(), context.residentPageBitFlags.ptr,
-        //                                context.residentPageBitFlags.sizeInBytes(), hipMemcpyDeviceToHost ) );
+        //    residentPageBitFlags.resize( context.residentPageBitFlags.len );
+        //    HIP_CHECK( hipMemcpy( residentPageBitFlags.data(), context.residentPageBitFlags.ptr,
+        //                          context.residentPageBitFlags.sizeInBytes(), hipMemcpyDeviceToHost ) );
 
-        //     requestedPageBitFlags.resize( context.requestedPageBitFlags.len );
-        //     HIP_CHECK( hipMemcpy( requestedPageBitFlags.data(), context.requestedPageBitFlags.ptr,
-        //                                context.requestedPageBitFlags.sizeInBytes(), hipMemcpyDeviceToHost ) );
+        //    requestedPageBitFlags.resize( context.requestedPageBitFlags.len );
+        //    HIP_CHECK( hipMemcpy( requestedPageBitFlags.data(), context.requestedPageBitFlags.ptr,
+        //                          context.requestedPageBitFlags.sizeInBytes(), hipMemcpyDeviceToHost ) );
 
-        //     textureInfos.resize( context.textureInfos.len );
-        //     HIP_CHECK( hipMemcpy( textureInfos.data(), context.textureInfos.ptr,
-        //                                context.textureInfos.sizeInBytes(), hipMemcpyDeviceToHost ) );
-        //     pageMemory.resize( 510 * pageSize );
-        //     HIP_CHECK( hipMemcpy( pageMemory.data(), context.pageMemory.ptr, pageMemory.size(), hipMemcpyDeviceToHost ) );
+        //    textureInfos.resize( context.textureInfos.len );
+        //    HIP_CHECK( hipMemcpy( textureInfos.data(), context.textureInfos.ptr, context.textureInfos.sizeInBytes(),
+        //                          hipMemcpyDeviceToHost ) );
+        //    pageMemory.resize( 510 * pageSize );
+        //    HIP_CHECK( hipMemcpy( pageMemory.data(), context.pageMemory.ptr, pageMemory.size(), hipMemcpyDeviceToHost ) );
 
-        //     hostContext.pageMemory = DeviceSpan<uint8_t>( pageMemory.data(), pageMemory.size() );
-        //     hostContext.requestedPageBitFlags =
-        //         DeviceSpan<uint32_t>( requestedPageBitFlags.data(), requestedPageBitFlags.size() );
-        //     hostContext.residentPageBitFlags = DeviceSpan<uint32_t>( residentPageBitFlags.data(), residentPageBitFlags.size() );
-        //     hostContext.textureInfos = DeviceSpan<DeviceTextureInfo>( textureInfos.data(), textureInfos.size() );
-        //     hostContext.pageSize     = pageSize;
+        //    hostContext.pageMemory = hip_demand::DeviceSpan<uint8_t>( pageMemory.data(), pageMemory.size() );
+        //    hostContext.requestedPageBitFlags =
+        //        hip_demand::DeviceSpan<uint32_t>( requestedPageBitFlags.data(), requestedPageBitFlags.size() );
+        //    hostContext.residentPageBitFlags =
+        //        hip_demand::DeviceSpan<uint32_t>( residentPageBitFlags.data(), residentPageBitFlags.size() );
+        //    hostContext.textureInfos = hip_demand::DeviceSpan<DeviceTextureInfo>( textureInfos.data(), textureInfos.size() );
+        //    hostContext.pageSize = pageSize;
 
-        //     for( int y = 0; y < height; y++ )
-        //     {
-        //         for( int x = 0; x < width; x++ )
-        //         {
-        //             auto toUnorm8 = []( float value ) {
-        //                 value = fminf( 1.0f, fmaxf( 0.0f, value ) );
-        //                 return static_cast<uint8_t>( value * 255.0f + 0.5f );
-        //             };
+        //    for( int y = 0; y < height; y++ )
+        //    {
+        //        for( int x = 0; x < width; x++ )
+        //        {
+        //            auto toUnorm8 = []( float value ) {
+        //                value = fminf( 1.0f, fmaxf( 0.0f, value ) );
+        //                return static_cast<uint8_t>( value * 255.0f + 0.5f );
+        //            };
 
-        //             if (x == width - 1 && y == height - 1)
-        //             {
-        //                 x = width - 1;
-        //             }
-
-        //             const size_t outputOffset = ( static_cast<size_t>( y ) * width + x ) * 4;
-        //             bool         resident     = false;
-        //             const float4 color = fetchDemandTexel( hostContext, hostContext.textureInfos.ptr[textureId], 0,
-        //                                                    static_cast<int>( x ), static_cast<int>( y ), resident );
-        //             if( resident )
-        //             {
-        //                 output[outputOffset + 0] = toUnorm8( color.x );
-        //                 output[outputOffset + 1] = toUnorm8( color.y );
-        //                 output[outputOffset + 2] = toUnorm8( color.z );
-        //                 output[outputOffset + 3] = toUnorm8( 1.0f );
-        //             }
-        //             else
-        //             {
-        //                 output[outputOffset + 0] = toUnorm8( 1.0f );
-        //                 output[outputOffset + 1] = toUnorm8( 0.0f );
-        //                 output[outputOffset + 2] = toUnorm8( 1.0f );
-        //                 output[outputOffset + 3] = toUnorm8( 1.0f );
-        //             }
-        //         }
-        //     }
-        // }
+        //            const size_t outputOffset = ( static_cast<size_t>( y ) * width + x ) * 4;
+        //            bool         resident     = false;
+        //            //const float4 color = fetchDemandTexel( hostContext, hostContext.textureInfos.ptr[textureId], 0,
+        //            //                                       static_cast<int>( x ), static_cast<int>( y ), resident );
+        //            const float mipLevel = 0;
+        //            const float4 color = hip_demand::vmm::tex2DLod<float4>( hostContext, textureId, x, y, mipLevel, resident );
+        //            if( resident )
+        //            {
+        //                hostOutput[outputOffset + 0] = toUnorm8( color.x );
+        //                hostOutput[outputOffset + 1] = toUnorm8( color.y );
+        //                hostOutput[outputOffset + 2] = toUnorm8( color.z );
+        //                hostOutput[outputOffset + 3] = toUnorm8( 1.0f );
+        //            }
+        //            else
+        //            {
+        //                hostOutput[outputOffset + 0] = toUnorm8( 1.0f );
+        //                hostOutput[outputOffset + 1] = toUnorm8( 0.0f );
+        //                hostOutput[outputOffset + 2] = toUnorm8( 1.0f );
+        //                hostOutput[outputOffset + 3] = toUnorm8( 1.0f );
+        //            }
+        //        }
+        //    }
+        //}
         if( stbi_write_png( outputPath.string().c_str(), width, height, 4, hostOutput.data(), ( width * 4 ) ) == 0 )
             throw std::runtime_error( "Failed to save output PNG" );
 
