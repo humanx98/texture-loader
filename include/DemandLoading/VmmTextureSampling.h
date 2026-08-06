@@ -264,4 +264,10 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
     return lerp( sample0, sample1, lod - static_cast<float>( mipLevel0 ) );
 }
 
+template <class Sample>
+HIP_DEMAND_INLINE Sample tex2D(const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& isResident)
+{
+    return tex2DLod<Sample>( context, textureId, x, y, 0.0f, isResident );
+}
+
 }  // namespace hip_demand::vmm
