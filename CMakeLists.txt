@@ -59,6 +59,7 @@ endif()
 set(TEXTURE_LOADER_SOURCES
     src/DemandLoading/DemandTextureLoader.cpp
     src/DemandLoading/DemandTextureLoaderImpl.cpp
+    src/DemandLoading/VmmDemandTextureLoaderImpl.cpp
     src/DemandLoading/Ticket.cpp
     src/DemandLoading/Logging.cpp
     src/DemandLoading/stb_image_impl.cpp
@@ -150,6 +151,14 @@ if(BUILD_EXAMPLES)
         INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
     )
 
+    hip_add_executable(
+        TARGET new_texture_tiled_loading_kernel
+        SOURCES examples/new_texture_tiled_loading.hip
+        ARCHITECTURES ${HIP_ARCHITECTURES}
+            OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
+        INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+
     # Example application (host code only)
     add_executable(texture_loader_example
         examples/simple_render.cpp
@@ -177,6 +186,10 @@ if(BUILD_EXAMPLES)
 
     add_executable(path_tracing_example
         examples/path_tracing.cpp
+    )
+
+    add_executable(new_texture_tiled_loading_example
+        examples/new_texture_tiled_loading.cpp
     )
 
     target_include_directories(texture_loader_example
@@ -216,6 +229,12 @@ if(BUILD_EXAMPLES)
     )
 
     target_include_directories(path_tracing_example
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${STB_INCLUDE_DIR}
+    )
+
+    target_include_directories(new_texture_tiled_loading_example
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${STB_INCLUDE_DIR}
@@ -262,6 +281,16 @@ if(BUILD_EXAMPLES)
             hip_demand_texture
     )
     target_compile_definitions(path_tracing_example PRIVATE __HIP_PLATFORM_AMD__)
+
+    target_link_libraries(new_texture_tiled_loading_example
+        PRIVATE
+            hip_demand_texture
+    )
+    target_compile_definitions(new_texture_tiled_loading_example
+        PRIVATE
+            __HIP_PLATFORM_AMD__
+            TEST_IMAGES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test_images"
+    )
 
     # Copy kernel code object to output directory
     add_custom_command(TARGET texture_loader_example POST_BUILD
@@ -313,6 +342,24 @@ if(BUILD_EXAMPLES)
         COMMENT "Copying HIP kernel code object"
     )
 
+    add_custom_command(TARGET new_texture_tiled_loading_example POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:new_texture_tiled_loading_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:new_texture_tiled_loading_example>/new_texture_tiled_loading_kernel.co
+        COMMENT "Copying tiled demand-loading HIP kernel code object"
+        VERBATIM
+    )
+
+    if(WIN32)
+        add_custom_command(TARGET new_texture_tiled_loading_example POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${HIP_RUNTIME_LIBRARIES}
+                $<TARGET_FILE_DIR:new_texture_tiled_loading_example>
+            COMMENT "Copying HIP runtime libraries"
+            VERBATIM
+        )
+    endif()
+
     # Add dependency to ensure kernel is built first
     add_dependencies(texture_loader_example render_kernel)
     add_dependencies(tiled_render_example tiled_render_kernel)
@@ -321,6 +368,7 @@ if(BUILD_EXAMPLES)
     add_dependencies(async_vs_sync_example render_kernel)
     add_dependencies(streaming_scene_example streaming_scene_kernel)
     add_dependencies(path_tracing_example path_tracing_kernel)
+    add_dependencies(new_texture_tiled_loading_example new_texture_tiled_loading_kernel)
     
     # Benchmark suite
     hip_add_executable(
@@ -366,6 +414,7 @@ if(BUILD_EXAMPLES)
         async_vs_sync_example
         streaming_scene_example
         path_tracing_example
+        new_texture_tiled_loading_example
         benchmark_suite
         RUNTIME DESTINATION bin
     )
@@ -405,7 +454,13 @@ if(BUILD_EXAMPLES)
         DESTINATION bin
         RENAME path_tracing_kernel.co
     )
-    
+
+    install(FILES
+        $<TARGET_PROPERTY:new_texture_tiled_loading_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME new_texture_tiled_loading_kernel.co
+    )
+
     install(FILES
         $<TARGET_PROPERTY:benchmark_kernel,HIP_CODE_OBJECT>
         DESTINATION bin

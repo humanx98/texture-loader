@@ -61,6 +61,35 @@ find_library(HIP_COMGR_LIBRARY
     NO_DEFAULT_PATH
 )
 
+# Find the Windows runtime libraries that must be next to HIP executables.
+if(WIN32)
+    find_file(HIP_COMGR_RUNTIME_LIBRARY
+        NAMES amd_comgr.dll
+        PATHS ${HIP_BIN_DIR}
+        NO_DEFAULT_PATH
+    )
+    find_file(HIP_RUNTIME_LIBRARY
+        NAMES amdhip64_7.dll
+        PATHS ${HIP_BIN_DIR}
+        NO_DEFAULT_PATH
+    )
+    find_file(HIP_KPACK_RUNTIME_LIBRARY
+        NAMES rocm_kpack.dll
+        PATHS ${HIP_BIN_DIR}
+        NO_DEFAULT_PATH
+    )
+
+    set(HIP_RUNTIME_LIBRARIES
+        ${HIP_COMGR_RUNTIME_LIBRARY}
+        ${HIP_RUNTIME_LIBRARY}
+    )
+    if(HIP_KPACK_RUNTIME_LIBRARY AND EXISTS "${HIP_KPACK_RUNTIME_LIBRARY}")
+        list(APPEND HIP_RUNTIME_LIBRARIES ${HIP_KPACK_RUNTIME_LIBRARY})
+    else()
+        message(STATUS "Optional HIP runtime library rocm_kpack.dll not found in ${HIP_BIN_DIR}")
+    endif()
+endif()
+
 # Find compilers
 find_program(HIP_HIPCC_EXECUTABLE
     NAMES hipcc hipcc.bat
@@ -79,7 +108,7 @@ find_program(HIP_CLANG_EXECUTABLE
 find_path(HIP_DEVICE_LIB_PATH
     NAME bitcode
     PATHS ${HIP_PATH}
-    PATH_SUFFIXES llvm amdgcn llvm/amdgcn
+    PATH_SUFFIXES llvm amdgcn llvm/amdgcn lib/llvm/amdgcn
     NO_DEFAULT_PATH
 )
 
@@ -91,6 +120,15 @@ endif()
 
 if(NOT HIP_COMGR_LIBRARY)
     message(FATAL_ERROR "HIP code object manager library (amd_comgr) not found in ${HIP_LIB_DIR}. Searched for: amd_comgr_2, amd_comgr${HIP_VERSION_STRING}, amd_comgr")
+endif()
+
+if(WIN32)
+    if(NOT HIP_COMGR_RUNTIME_LIBRARY)
+        message(FATAL_ERROR "HIP runtime library amd_comgr.dll not found in ${HIP_BIN_DIR}")
+    endif()
+    if(NOT HIP_RUNTIME_LIBRARY)
+        message(FATAL_ERROR "HIP runtime library amdhip64_7.dll not found in ${HIP_BIN_DIR}")
+    endif()
 endif()
 
 if(NOT HIP_HIPCC_EXECUTABLE)
@@ -107,6 +145,9 @@ endif()
 message(STATUS "Found HIP: ${HIP_PATH}")
 message(STATUS "Include: ${HIP_INCLUDE_DIR}")
 message(STATUS "Libraries: ${HIP_LIBRARY}, ${HIP_COMGR_LIBRARY}")
+if(WIN32)
+    message(STATUS "Runtime libraries: ${HIP_RUNTIME_LIBRARIES}")
+endif()
 message(STATUS "Compiler:\n  -- hipcc: ${HIP_HIPCC_EXECUTABLE}\n  -- clang: ${HIP_CLANG_EXECUTABLE}")
 message(STATUS "Device libs: ${HIP_DEVICE_LIB_PATH}")
 

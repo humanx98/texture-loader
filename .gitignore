@@ -43,8 +43,6 @@ cmake_configure_*.cmd
 .idea/
 
 # Generated images
-*.png
-*.jpg
 *.bmp
 
 # OS
