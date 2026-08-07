@@ -26,9 +26,11 @@ extern "C" __global__ void renderVmmTexture( hip_demand::vmm::DeviceContext cont
 
     const size_t outputOffset = ( static_cast<size_t>( y ) * width + x ) * 4;
     bool resident = false;
-    float u =  2 * (static_cast<float>(x) + 0.5f) / static_cast<float>(width);
-    float v =  2 * (static_cast<float>(y) + 0.5f) / static_cast<float>(height);
-    const float4 color = hip_demand::vmm::tex2DLod<float4>( context, textureId, u, v, 0.0f, resident );
+    const float u = 2.0f * ( static_cast<float>( x ) + 0.5f ) / static_cast<float>( width );
+    const float v = 2.0f * ( static_cast<float>( y ) + 0.5f ) / static_cast<float>( height );
+    const float2 ddx = make_float2( 2.0f / static_cast<float>( width ), 0.0f );
+    const float2 ddy = make_float2( 0.0f, 2.0f / static_cast<float>( height ) );
+    const auto color = hip_demand::vmm::tex2DGrad<float3>( context, textureId, u, v, ddx, ddy, resident );
     if( resident )
     {
         output[outputOffset + 0] = toUnorm8( color.x );

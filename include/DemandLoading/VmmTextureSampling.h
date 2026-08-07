@@ -18,6 +18,8 @@ HIP_DEMAND_INLINE uint32_t atomicOr( uint32_t* address, uint32_t value )
     return oldValue;
 }
 
+// float4 operators for cpu debugging
+
 HIP_DEMAND_INLINE float4 operator+( const float4& a, const float4& b )
 {
     return make_float4( a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w );
@@ -33,17 +35,41 @@ HIP_DEMAND_INLINE float4 operator*( float scalar, const float4& value )
     return value * scalar;
 }
 
+// float3 operators for cpu debugging
+
+HIP_DEMAND_INLINE float3 operator+( const float3& a, const float3& b )
+{
+    return make_float3( a.x + b.x, a.y + b.y, a.z + b.z );
+}
+
+HIP_DEMAND_INLINE float3 operator*( const float3& value, float scalar )
+{
+    return make_float3( value.x * scalar, value.y * scalar, value.z * scalar );
+}
+
+HIP_DEMAND_INLINE float3 operator*( float scalar, const float3& value )
+{
+    return value * scalar;
+}
+
+// float2 operators for cpu debugging
+
+HIP_DEMAND_INLINE float2 operator+( const float2& a, const float2& b )
+{
+    return make_float2( a.x + b.x, a.y + b.y );
+}
+
+HIP_DEMAND_INLINE float2 operator*( const float2& value, float scalar )
+{
+    return make_float2( value.x * scalar, value.y * scalar );
+}
+
+HIP_DEMAND_INLINE float2 operator*( float scalar, const float2& value )
+{
+    return value * scalar;
+}
+
 #endif
-
-HIP_DEMAND_INLINE float lerp( float a, float b, float t )
-{
-    return a + ( b - a ) * t;
-}
-
-HIP_DEMAND_INLINE float4 lerp( const float4& a, const float4& b, float t )
-{
-    return make_float4( lerp( a.x, b.x, t ), lerp( a.y, b.y, t ), lerp( a.z, b.z, t ), lerp( a.w, b.w, t ) );
-}
 
 HIP_DEMAND_INLINE void getWordIdxAndBitIdx( uint32_t idx, uint32_t& wordIdx, uint32_t& bitIdx )
 {
@@ -97,42 +123,9 @@ HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mod
     }
 }
 
-HIP_DEMAND_INLINE float4 fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, int x, int y, bool& resident )
+HIP_DEMAND_INLINE float4 decodeTexel( const uint8_t* texel, TextureFormat format, bool& resident )
 {
-    resident = false;
-    if( mipLevel >= texture.mipCount || mipLevel >= MAX_TEXTURE_MIP_LEVELS )
-        return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
-
-    const auto& mip   = texture.mips[mipLevel];
-    bool        valid = true;
-
-    x = applyAddressMode( x, static_cast<int>( mip.width ), texture.addressMode[0], valid );
-    y = applyAddressMode( y, static_cast<int>( mip.height ), texture.addressMode[1], valid );
-    if( !valid )
-    {
-        resident = true;
-        return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
-    }
-
-    const uint32_t tileX = static_cast<uint32_t>( x ) / texture.tileWidth;
-    const uint32_t tileY = static_cast<uint32_t>( y ) / texture.tileHeight;
-    if( tileX >= mip.tilesX || tileY >= mip.tilesY )
-        return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
-
-    const uint32_t pageId = mip.startPage + tileY * mip.tilesX + tileX;
-    if( !isPageResident( context, pageId ) )
-    {
-        recordPageRequest( context, pageId );
-        return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
-    }
-
-    const uint32_t localX = static_cast<uint32_t>( x ) % texture.tileWidth;
-    const uint32_t localY = static_cast<uint32_t>( y ) % texture.tileHeight;
-    const uint64_t byteOffset = pageId * context.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
-    const uint8_t* texel = context.pageMemory.ptr + byteOffset;
-    resident             = true;
-
-    switch( texture.format )
+    switch( format )
     {
         case TextureFormat::R8Unorm:
             return make_float4( texel[0] / 255.0f, 0.0f, 0.0f, 1.0f );
@@ -173,7 +166,60 @@ HIP_DEMAND_INLINE float4 fetchTexel( const DeviceContext& context, const DeviceT
     }
 }
 
-HIP_DEMAND_INLINE float4
+template <class Sample>
+HIP_DEMAND_INLINE Sample
+fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, int x, int y, bool& resident )
+{
+    resident = false;
+    if( mipLevel >= texture.mipCount || mipLevel >= MAX_TEXTURE_MIP_LEVELS )
+        return Sample{};
+
+    const auto& mip   = texture.mips[mipLevel];
+    bool        valid = true;
+
+    x = applyAddressMode( x, static_cast<int>( mip.width ), texture.addressMode[0], valid );
+    y = applyAddressMode( y, static_cast<int>( mip.height ), texture.addressMode[1], valid );
+    if( !valid )
+    {
+        // TODO_BS: do we need to have a texture border color here when addressMode == hipAddressModeBorder?
+        resident = true;
+        return Sample{};
+    }
+
+    const uint32_t tileX = static_cast<uint32_t>( x ) / texture.tileWidth;
+    const uint32_t tileY = static_cast<uint32_t>( y ) / texture.tileHeight;
+    if( tileX >= mip.tilesX || tileY >= mip.tilesY )
+        return Sample{};
+
+    const uint32_t pageId = mip.startPage + tileY * mip.tilesX + tileX;
+    if( !isPageResident( context, pageId ) )
+    {
+        recordPageRequest( context, pageId );
+        return Sample{};
+    }
+
+    const uint32_t localX = static_cast<uint32_t>( x ) % texture.tileWidth;
+    const uint32_t localY = static_cast<uint32_t>( y ) % texture.tileHeight;
+    const uint64_t byteOffset = pageId * context.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+    resident      = true;
+    float4 sample = decodeTexel( context.pageMemory.ptr + byteOffset, texture.format, resident );
+
+    static_assert( std::is_same<Sample, float>::value || std::is_same<Sample, float2>::value
+                       || std::is_same<Sample, float3>::value || std::is_same<Sample, float4>::value,
+                   "fetchTexel supports Sample = float, float2, float3, or float4" );
+
+    if constexpr( std::is_same<Sample, float>::value )
+        return sample.x;
+    else if constexpr( std::is_same<Sample, float2>::value )
+        return make_float2( sample.x, sample.y );
+    else if constexpr( std::is_same<Sample, float3>::value )
+        return make_float3( sample.x, sample.y, sample.z );
+    else
+        return sample;
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample
 sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, float x, float y, bool& isResident )
 {
     isResident = false;
@@ -188,7 +234,7 @@ sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, 
     {
         x = std::floorf( x );
         y = std::floorf( y );
-        return fetchTexel( context, texture, mipLevel, static_cast<int>( x ), static_cast<int>( y ), isResident );
+        return fetchTexel<Sample>( context, texture, mipLevel, static_cast<int>( x ), static_cast<int>( y ), isResident );
     }
 
     x = x - 0.5f;
@@ -204,35 +250,18 @@ sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, 
     bool resident01 = false;
     bool resident11 = false;
 
-    const float4 t00 = fetchTexel( context, texture, mipLevel, x0, y0, resident00 );
-    const float4 t10 = fetchTexel( context, texture, mipLevel, x0 + 1, y0, resident10 );
-    const float4 t01 = fetchTexel( context, texture, mipLevel, x0, y0 + 1, resident01 );
-    const float4 t11 = fetchTexel( context, texture, mipLevel, x0 + 1, y0 + 1, resident11 );
+    const Sample t00 = fetchTexel<Sample>( context, texture, mipLevel, x0, y0, resident00 );
+    const Sample t10 = fetchTexel<Sample>( context, texture, mipLevel, x0 + 1, y0, resident10 );
+    const Sample t01 = fetchTexel<Sample>( context, texture, mipLevel, x0, y0 + 1, resident01 );
+    const Sample t11 = fetchTexel<Sample>( context, texture, mipLevel, x0 + 1, y0 + 1, resident11 );
 
     isResident = resident00 && resident10 && resident01 && resident11;
     return ( 1.0f - a ) * ( 1.0f - b ) * t00 + a * ( 1.0f - b ) * t10 + ( 1.0f - a ) * b * t01 + a * b * t11;
 }
 
-HIP_DEMAND_INLINE float4 sampleTexture( const DeviceContext& context, uint32_t textureId, float u, float v, uint32_t mipLevel = 0 )
-{
-    if( textureId >= context.textureInfos.len )
-        return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
-
-    const DeviceTextureInfo& texture = context.textureInfos.ptr[textureId];
-    if( texture.mipCount == 0 )
-        return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
-    if( mipLevel >= texture.mipCount )
-        mipLevel = texture.mipCount - 1;
-
-    bool isResident = false;
-    return sampleMipLevel( context, texture, mipLevel, u, v, isResident );
-}
-
 template <class Sample>
 HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& isResident )
 {
-    static_assert( std::is_same<Sample, float4>::value, "VMM tex2DLod currently supports Sample = float4 only" );
-
     isResident = false;
     if( textureId >= context.textureInfos.len )
         return Sample{};
@@ -243,14 +272,14 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
     if( texture.mipmapFilterMode == hipFilterModePoint )
     {
         const uint32_t mipLevel = static_cast<uint32_t>( std::floorf( lod + 0.5f ) );
-        return sampleMipLevel( context, texture, mipLevel, x, y, isResident );
+        return sampleMipLevel<Sample>( context, texture, mipLevel, x, y, isResident );
     }
 
     const uint32_t mipLevel0 = static_cast<uint32_t>( std::floorf( lod ) );
     const uint32_t mipLevel1 = mipLevel0 + 1 < texture.mipCount ? mipLevel0 + 1 : mipLevel0;
 
     bool         resident0 = false;
-    const float4 sample0   = sampleMipLevel( context, texture, mipLevel0, x, y, resident0 );
+    const Sample sample0   = sampleMipLevel<Sample>( context, texture, mipLevel0, x, y, resident0 );
     if( mipLevel0 == mipLevel1 )
     {
         isResident = resident0;
@@ -258,14 +287,41 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
     }
 
     bool         resident1 = false;
-    const float4 sample1   = sampleMipLevel( context, texture, mipLevel1, x, y, resident1 );
+    const Sample sample1   = sampleMipLevel<Sample>( context, texture, mipLevel1, x, y, resident1 );
 
     isResident = resident0 && resident1;
-    return lerp( sample0, sample1, lod - static_cast<float>( mipLevel0 ) );
+    float t    = lod - static_cast<float>( mipLevel0 );
+    return ( 1.0f - t ) * sample0 + t * sample1;
+}
+
+// TODO_BS: this implementation is generated by chatGPT. I'll need to do more research about it
+template <class Sample>
+HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textureId, float x, float y, float2 ddx, float2 ddy, bool& isResident )
+{
+    isResident = false;
+    if( textureId >= context.textureInfos.len )
+        return Sample{};
+
+    const DeviceTextureInfo& texture = context.textureInfos.ptr[textureId];
+    if( texture.normalizedCoords )
+    {
+        const DeviceMipLevel& baseMip = texture.mips[0];
+        ddx.x *= static_cast<float>( baseMip.width );
+        ddx.y *= static_cast<float>( baseMip.height );
+        ddy.x *= static_cast<float>( baseMip.width );
+        ddy.y *= static_cast<float>( baseMip.height );
+    }
+
+    const float footprintXSquared = ddx.x * ddx.x + ddx.y * ddx.y;
+    const float footprintYSquared = ddy.x * ddy.x + ddy.y * ddy.y;
+    const float footprintSquared  = fmaxf( footprintXSquared, footprintYSquared );
+    const float lod               = 0.5f * log2f( fmaxf( footprintSquared, 1.0f ) );
+
+    return tex2DLod<Sample>( context, textureId, x, y, lod, isResident );
 }
 
 template <class Sample>
-HIP_DEMAND_INLINE Sample tex2D(const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& isResident)
+HIP_DEMAND_INLINE Sample tex2D( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& isResident )
 {
     return tex2DLod<Sample>( context, textureId, x, y, 0.0f, isResident );
 }
