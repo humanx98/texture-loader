@@ -2,6 +2,7 @@
 #include "Internal/Utils.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <algorithm>
+#include <array>
 #include <mutex>
 
 namespace hip_demand::vmm {
@@ -9,11 +10,11 @@ namespace hip_demand::vmm {
 using internal::Bitset;
 using internal::calculateMipLevels;
 using internal::ceilDiv;
-using internal::mipDimension;
 using internal::memcpyDtoHAsync;
 using internal::memcpyHtoDAsync;
 using internal::memset;
 using internal::memsetAsync;
+using internal::mipDimension;
 using internal::NonCopyble;
 using internal::tileShapeForGranularity;
 
@@ -270,11 +271,11 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     bool                  textureInfosDirty_      = false;
     bool                  residentPageFlagsDirty_ = false;
     Bitset                residentPageBitFlags_{};
-    Bitset                requestedPageBitFlags_{};
     std::vector<uint32_t> requestedPages_{};
-    uint32_t              requestedPageCount_ = 0;
     std::vector<uint8_t>  tmpPageBuffer_{};
     VmmPageSystem         pageSystem_;
+
+    std::array<uint32_t, static_cast<size_t>( CounterIndex::NumCounters )> counters_{};
 
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
     std::vector<DeviceTextureInfo>                  textureInfos_{};
@@ -289,15 +290,16 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
 {
     tmpPageBuffer_.resize( pageSystem_.pageBytes() );
     residentPageBitFlags_.resize( options_.maxVirtualPages );
-    requestedPageBitFlags_.resize( options_.maxVirtualPages );
     requestedPages_.resize( options_.maxRequestedPages );
 
-    deviceContext_.pageMemory            = pageSystem_.virtualAddressSpace();
-    deviceContext_.requestedPageBitFlags = hipGC_.allocArray<uint32_t>( requestedPageBitFlags_.wordCount(), true );
+    deviceContext_.pageMemory = pageSystem_.virtualAddressSpace();
+    // bits packed into 32 - bit words. for requestedPageBitFlags
+    deviceContext_.requestedPageBitFlags = hipGC_.allocArray<uint32_t>( ceilDiv( options_.maxVirtualPages, 32 ), true );
     deviceContext_.residentPageBitFlags  = hipGC_.allocArray<uint32_t>( residentPageBitFlags_.wordCount(), true );
+    deviceContext_.requestedPages        = hipGC_.allocArray<uint32_t>( requestedPages_.size(), true );
     deviceContext_.textureInfos          = hipGC_.allocArray<DeviceTextureInfo>( options_.maxTextures, true );
-    deviceContext_.counters = hipGC_.allocArray<uint32_t>( static_cast<uint32_t>( CounterIndex::NumCounters ), true );
-    deviceContext_.pageSize = pageSystem_.pageBytes();
+    deviceContext_.counters              = hipGC_.allocArray<uint32_t>( counters_.size(), true );
+    deviceContext_.pageSize              = pageSystem_.pageBytes();
 }
 
 DemandTextureLoaderImpl::~DemandTextureLoaderImpl() {}
@@ -373,7 +375,7 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
         memcpyHtoDAsync( deviceContext_.textureInfos, textureInfos_, textureInfos_.size(), stream );
         // change len because for device we preallocated for maxTextures
         deviceContext_.textureInfos.len = textureInfos_.size();
-        textureInfosDirty_ = false;
+        textureInfosDirty_              = false;
     }
 
     if( residentPageFlagsDirty_ )
@@ -390,6 +392,7 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
     if( deviceContext.pageMemory.ptr != deviceContext_.pageMemory.ptr
         || deviceContext.requestedPageBitFlags.ptr != deviceContext_.requestedPageBitFlags.ptr
         || deviceContext.residentPageBitFlags.ptr != deviceContext_.residentPageBitFlags.ptr
+        || deviceContext.requestedPages.ptr != deviceContext_.requestedPages.ptr
         || deviceContext.textureInfos.ptr != deviceContext_.textureInfos.ptr
         || deviceContext.counters.ptr != deviceContext_.counters.ptr || deviceContext.pageSize != deviceContext_.pageSize )
     {
@@ -398,30 +401,12 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
 
     std::lock_guard<std::mutex> lock( mutex_ );
 
-    // TODO_BS: move getting pageIds to GPU
-    memcpyDtoHAsync( requestedPageBitFlags_.words(), deviceContext.requestedPageBitFlags, stream );
+    memcpyDtoHAsync( requestedPages_, deviceContext.requestedPages, stream );
+    memcpyDtoHAsync( counters_, deviceContext.counters, stream );
     HIP_CHECK( hipStreamSynchronize( stream ) );
-    requestedPageCount_ = 0;
-    for( uint32_t wordIndex = 0; wordIndex < requestedPageBitFlags_.wordCount(); ++wordIndex )
-    {
-        uint32_t word = requestedPageBitFlags_.words()[wordIndex];
-        while( word != 0 )
-        {
-#if defined( _MSC_VER )
-            unsigned long bit = 0;
-            _BitScanForward( &bit, word );
-            const uint32_t bitIndex = static_cast<uint32_t>( bit );
-#else
-            const uint32_t bitIndex = static_cast<uint32_t>( __builtin_ctz( word ) );
-#endif
-            const uint32_t pageId = wordIndex * 32 + bitIndex;
-            if( pageId < options_.maxVirtualPages )
-                requestedPages_.at( requestedPageCount_++ ) = pageId;
-            word &= word - 1;
-        }
-    }
 
-    for( size_t i = 0; i < requestedPageCount_; i++ )
+    const uint32_t requestedPageCount = counters_[static_cast<uint32_t>( CounterIndex::RequestedPages )];
+    for( size_t i = 0; i < requestedPageCount; i++ )
     {
         const uint32_t pageId = requestedPages_[i];
         assert( pageId < options_.maxVirtualPages );

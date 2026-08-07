@@ -79,10 +79,49 @@ HIP_DEMAND_INLINE void getWordIdxAndBitIdx( uint32_t idx, uint32_t& wordIdx, uin
 
 HIP_DEMAND_INLINE void recordPageRequest( const DeviceContext& context, uint32_t pageId )
 {
+    // TODO_BS: create a kernel that will collect all requested pageids and remove atomics here
+    uint32_t  maxRequestedPages = static_cast<uint32_t>( context.requestedPages.len );
+    uint32_t* requestedPageCounter = &context.counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedPages )];
+    // Use __atomic_load_n for a true atomic load (no read-modify-write overhead).
+    uint32_t requestedPageCount = __atomic_load_n( requestedPageCounter, __ATOMIC_RELAXED );
+    if( requestedPageCount >= maxRequestedPages )
+        return;
+
+#if defined( HIP_ENABLE_WARP_SYNC_BUILTINS )
+    // Wave-level deduplication: only one lane per unique pageId writes to global memory.
+    // __match_any_sync returns a mask of lanes that have the same value.
+    const uint64_t active = __activemask();
+    const uint64_t match  = __match_any_sync( active, pageId );
+
+    // Find the leader lane (lowest active lane with this texId)
+    const int leader = __ffsll( static_cast<long long>( match ) ) - 1;
+    const int lane   = __lane_id();
+
+    // Only the leader lane issues the atomic
+    if( lane != leader )
+        return;
+#endif
+
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
     getWordIdxAndBitIdx( pageId, wordIdx, bitIdx );
-    atomicOr( &context.requestedPageBitFlags.ptr[wordIdx], 1u << bitIdx );
+    const uint32_t mask = 1u << bitIdx;
+
+    uint32_t old = atomicOr( &context.requestedPageBitFlags.ptr[wordIdx], mask );
+    if( ( old & mask ) != 0u )
+        return;
+
+    while( requestedPageCount < maxRequestedPages )
+    {
+        const uint32_t observed = atomicCAS( requestedPageCounter, requestedPageCount, requestedPageCount + 1u );
+        if( observed == requestedPageCount )
+        {
+            context.requestedPages.ptr[requestedPageCount] = pageId;
+            return;
+        }
+
+        requestedPageCount = observed;
+    }
 }
 
 HIP_DEMAND_INLINE bool isPageResident( const DeviceContext& context, uint32_t pageId )

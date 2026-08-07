@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <vector>
+#include <array>
 
 namespace hip_demand {
 namespace internal {
@@ -100,6 +101,12 @@ inline size_t sizeInBytes( const std::vector<T>& dst )
     return dst.size() * sizeof( T );
 }
 
+template <typename T, size_t N>
+inline size_t sizeInBytes( const std::array<T, N>& dst )
+{
+    return dst.size() * sizeof( T );
+}
+
 inline size_t highestPowerOfTwoAtMost( size_t value )
 {
     size_t result = 1;
@@ -155,6 +162,13 @@ static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src )
 
 template <typename T>
 static void memcpyDtoHAsync( std::vector<T>& dst, const DeviceSpan<T>& src, hipStream_t stream )
+{
+    assert( sizeInBytes( dst ) == src.sizeInBytes() );
+    HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );
+}
+
+template <typename T, size_t N>
+static void memcpyDtoHAsync( std::array<T, N>& dst, const DeviceSpan<T>& src, hipStream_t stream )
 {
     assert( sizeInBytes( dst ) == src.sizeInBytes() );
     HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );

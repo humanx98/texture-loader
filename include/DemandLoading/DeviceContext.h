@@ -107,6 +107,7 @@ struct DeviceContext
 {
     DeviceSpan<uint8_t>           pageMemory{};
     DeviceSpan<uint32_t>          requestedPageBitFlags{};
+    DeviceSpan<uint32_t>          requestedPages;
     DeviceSpan<uint32_t>          residentPageBitFlags{};
     DeviceSpan<DeviceTextureInfo> textureInfos{};
     DeviceSpan<uint32_t>          counters{};
