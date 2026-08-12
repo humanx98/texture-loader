@@ -46,14 +46,17 @@ enum class TextureFormat : uint32_t
 };
 
 template <typename T>
+using DevicePtr = T*;
+
+template <typename T>
 struct DeviceSpan
 {
-    T*     ptr = nullptr;
-    size_t len = 0;
+    DevicePtr<T> ptr = nullptr;
+    size_t       len = 0;
 
     DeviceSpan() = default;
 
-    explicit DeviceSpan( T* ptr_, size_t len_ )
+    explicit DeviceSpan( DevicePtr<T> ptr_, size_t len_ )
         : ptr( ptr_ )
         , len( len_ )
     {
@@ -66,6 +69,7 @@ struct DeviceSpan
 
 namespace hip_demand::vmm {
 
+constexpr uint32_t INVALID_TEXTURE        = ~0u;
 constexpr uint32_t INVALID_PAGE           = ~0u;
 constexpr uint32_t MAX_TEXTURE_MIP_LEVELS = 15;
 
@@ -75,43 +79,81 @@ struct DeviceMipLevel
     uint32_t height    = 0;
     uint32_t tilesX    = 0;
     uint32_t tilesY    = 0;
-    uint32_t startPage = 0;
+    uint32_t startPage = INVALID_PAGE;
 
     HIP_DEMAND_INLINE uint32_t pageCount() const { return tilesX * tilesY; }
 };
 
 struct DeviceTextureInfo
 {
+    uint32_t       textureId        = INVALID_TEXTURE;
     uint32_t       width            = 0;
     uint32_t       height           = 0;
     uint32_t       tileWidth        = 0;
     uint32_t       tileHeight       = 0;
-    uint32_t       startPage        = 0;
-    uint32_t       mipCount         = 0;
     uint32_t       addressMode[2]   = { hipAddressModeWrap, hipAddressModeWrap };
     uint32_t       filterMode       = hipFilterModeLinear;
     uint32_t       mipmapFilterMode = hipFilterModeLinear;
     uint32_t       normalizedCoords = 1;
     TextureFormat  format           = TextureFormat::RGBA8Unorm;
     uint32_t       bytesPerTexel    = 4;
+    uint32_t       startPage        = INVALID_PAGE;
+    uint32_t       mipCount         = 0;
     DeviceMipLevel mips[MAX_TEXTURE_MIP_LEVELS]{};
+};
+
+struct PageTable
+{
+    struct Range
+    {
+        uint32_t startPage         = 0;
+        uint32_t pageCount         = 0;
+        uint32_t nextAvailablePage = 0;
+
+        HIP_DEMAND_INLINE Range() {}
+        HIP_DEMAND_INLINE Range( uint32_t start, uint32_t count )
+            : startPage( start )
+            , pageCount( count )
+            , nextAvailablePage( start )
+        {
+        }
+    };
+
+    size_t   pageSize = 0;
+    Range    textureInfos{};
+    uint32_t maxTextures = 0;
+    Range    textureTiles{};
+
+    HIP_DEMAND_INLINE uint32_t getTextureIdByResourceId( uint32_t resourceId ) const { return resourceId; }
+
+    HIP_DEMAND_INLINE uint32_t getTextureTilePageByResourceId( uint32_t resourceId ) const
+    {
+        return textureTiles.startPage + resourceId - maxTextures;
+    }
+
+
+    HIP_DEMAND_INLINE uint32_t getResourceIdByTextureId( uint32_t textureId ) const { return textureId; }
+    HIP_DEMAND_INLINE uint32_t getResourceIdByTextureTilePage( uint32_t pageId ) const
+    {
+        return pageId - textureTiles.startPage + maxTextures;
+    }
 };
 
 enum class CounterIndex : uint32_t
 {
-    RequestedPages = 0,
+    RequestedResources = 0,
     NumCounters
 };
 
 struct DeviceContext
 {
-    DeviceSpan<uint8_t>           pageMemory{};
-    DeviceSpan<uint32_t>          requestedPageBitFlags{};
-    DeviceSpan<uint32_t>          requestedPages;
-    DeviceSpan<uint32_t>          residentPageBitFlags{};
-    DeviceSpan<DeviceTextureInfo> textureInfos{};
-    DeviceSpan<uint32_t>          counters{};
-    size_t                        pageSize = 0;
+    DeviceSpan<uint8_t>            pageMemory{};
+    DeviceSpan<uint32_t>           requestedBits{};
+    DeviceSpan<uint32_t>           requestedResources;
+    DeviceSpan<uint32_t>           residentBits{};
+    DeviceSpan<uint32_t>           counters{};
+    DeviceSpan<DeviceTextureInfo*> textureInfos{};
+    PageTable                      pageTable{};
 };
 
 }  // namespace hip_demand::vmm

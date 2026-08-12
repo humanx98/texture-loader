@@ -1,6 +1,7 @@
 #pragma once
 
 #include <DemandLoading/DeviceContext.h>
+// #include <ImageSource/ImageSource.h>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -38,10 +39,10 @@ struct ImageSource
 
 struct Options
 {
-    uint32_t maxTextures       = 1024;
-    uint32_t maxVirtualPages   = 32 * 1024;
-    uint32_t maxPhysicalPages  = 1024;  // 64KB * 1024
-    uint32_t maxRequestedPages = 1024;
+    uint32_t maxTextures      = 1024;
+    uint32_t maxVirtualPages  = 32 * 1024;
+    uint32_t maxPhysicalPages = 1024;  // 64KB * 1024
+    uint32_t maxRequests      = 1024;
     //bool     enableEviction     = true;
     //uint32_t maxThreads         = 0;
     //uint32_t minResidentFrames  = 3;

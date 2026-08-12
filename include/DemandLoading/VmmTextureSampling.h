@@ -11,6 +11,24 @@ namespace hip_demand::vmm {
 
 #if !defined( __HIPCC__ )
 
+#if !defined( __ATOMIC_RELAXED )
+#define __ATOMIC_RELAXED 0
+#endif
+
+template <typename T>
+HIP_DEMAND_INLINE T __atomic_load_n( const T* address, int )
+{
+    return *address;
+}
+
+HIP_DEMAND_INLINE uint32_t atomicCAS( uint32_t* address, uint32_t compare, uint32_t value )
+{
+    const uint32_t oldValue = *address;
+    if( oldValue == compare )
+        *address = value;
+    return oldValue;
+}
+
 HIP_DEMAND_INLINE uint32_t atomicOr( uint32_t* address, uint32_t value )
 {
     const uint32_t oldValue = *address;
@@ -77,21 +95,21 @@ HIP_DEMAND_INLINE void getWordIdxAndBitIdx( uint32_t idx, uint32_t& wordIdx, uin
     bitIdx  = idx & 31u;  // idx % 32
 }
 
-HIP_DEMAND_INLINE void recordPageRequest( const DeviceContext& context, uint32_t pageId )
+HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId )
 {
-    // TODO_BS: create a kernel that will collect all requested pageids and remove atomics here
-    uint32_t  maxRequestedPages = static_cast<uint32_t>( context.requestedPages.len );
-    uint32_t* requestedPageCounter = &context.counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedPages )];
+    // TODO_BS: create a kernel that will collect all requested resource ids and remove atomics here
+    uint32_t  maxRequests    = static_cast<uint32_t>( context.requestedResources.len );
+    uint32_t* requestCounter = &context.counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
     // Use __atomic_load_n for a true atomic load (no read-modify-write overhead).
-    uint32_t requestedPageCount = __atomic_load_n( requestedPageCounter, __ATOMIC_RELAXED );
-    if( requestedPageCount >= maxRequestedPages )
+    uint32_t requestCount = __atomic_load_n( requestCounter, __ATOMIC_RELAXED );
+    if( requestCount >= maxRequests )
         return;
 
 #if defined( HIP_ENABLE_WARP_SYNC_BUILTINS )
-    // Wave-level deduplication: only one lane per unique pageId writes to global memory.
+    // Wave-level deduplication: only one lane per unique resourceId writes to global memory.
     // __match_any_sync returns a mask of lanes that have the same value.
     const uint64_t active = __activemask();
-    const uint64_t match  = __match_any_sync( active, pageId );
+    const uint64_t match  = __match_any_sync( active, resourceId );
 
     // Find the leader lane (lowest active lane with this texId)
     const int leader = __ffsll( static_cast<long long>( match ) ) - 1;
@@ -104,32 +122,32 @@ HIP_DEMAND_INLINE void recordPageRequest( const DeviceContext& context, uint32_t
 
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
-    getWordIdxAndBitIdx( pageId, wordIdx, bitIdx );
+    getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
     const uint32_t mask = 1u << bitIdx;
 
-    uint32_t old = atomicOr( &context.requestedPageBitFlags.ptr[wordIdx], mask );
+    uint32_t old = atomicOr( &context.requestedBits.ptr[wordIdx], mask );
     if( ( old & mask ) != 0u )
         return;
 
-    while( requestedPageCount < maxRequestedPages )
+    while( requestCount < maxRequests )
     {
-        const uint32_t observed = atomicCAS( requestedPageCounter, requestedPageCount, requestedPageCount + 1u );
-        if( observed == requestedPageCount )
+        const uint32_t observed = atomicCAS( requestCounter, requestCount, requestCount + 1u );
+        if( observed == requestCount )
         {
-            context.requestedPages.ptr[requestedPageCount] = pageId;
+            context.requestedResources.ptr[requestCount] = resourceId;
             return;
         }
 
-        requestedPageCount = observed;
+        requestCount = observed;
     }
 }
 
-HIP_DEMAND_INLINE bool isPageResident( const DeviceContext& context, uint32_t pageId )
+HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId )
 {
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
-    getWordIdxAndBitIdx( pageId, wordIdx, bitIdx );
-    return ( context.residentPageBitFlags.ptr[wordIdx] & ( 1u << bitIdx ) ) != 0;
+    getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
+    return ( context.residentBits.ptr[wordIdx] & ( 1u << bitIdx ) ) != 0;
 }
 
 HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mode, bool& valid )
@@ -162,7 +180,7 @@ HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mod
     }
 }
 
-HIP_DEMAND_INLINE float4 decodeTexel( const uint8_t* texel, TextureFormat format, bool& resident )
+HIP_DEMAND_INLINE float4 decodeTexel( const uint8_t* texel, TextureFormat format )
 {
     switch( format )
     {
@@ -200,7 +218,6 @@ HIP_DEMAND_INLINE float4 decodeTexel( const uint8_t* texel, TextureFormat format
         }
 
         default:
-            resident = false;
             return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
     }
 }
@@ -230,18 +247,19 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint
     if( tileX >= mip.tilesX || tileY >= mip.tilesY )
         return Sample{};
 
-    const uint32_t pageId = mip.startPage + tileY * mip.tilesX + tileX;
-    if( !isPageResident( context, pageId ) )
+    const uint32_t pageId     = mip.startPage + tileY * mip.tilesX + tileX;
+    const uint32_t resourceId = context.pageTable.getResourceIdByTextureTilePage( pageId );
+    if( !isResourceResident( context, resourceId ) )
     {
-        recordPageRequest( context, pageId );
+        recordRequest( context, resourceId );
         return Sample{};
     }
 
     const uint32_t localX = static_cast<uint32_t>( x ) % texture.tileWidth;
     const uint32_t localY = static_cast<uint32_t>( y ) % texture.tileHeight;
-    const uint64_t byteOffset = pageId * context.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+    const uint32_t byteOffset = pageId * context.pageTable.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+    float4 sample = decodeTexel( context.pageMemory.ptr + byteOffset, texture.format );
     resident      = true;
-    float4 sample = decodeTexel( context.pageMemory.ptr + byteOffset, texture.format, resident );
 
     static_assert( std::is_same<Sample, float>::value || std::is_same<Sample, float2>::value
                        || std::is_same<Sample, float3>::value || std::is_same<Sample, float4>::value,
@@ -303,9 +321,19 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
 {
     isResident = false;
     if( textureId >= context.textureInfos.len )
+    {
+        isResident = true;
         return Sample{};
+    }
 
-    const DeviceTextureInfo& texture = context.textureInfos.ptr[textureId];
+    const uint32_t resourceId = context.pageTable.getResourceIdByTextureId( textureId );
+    if( !isResourceResident( context, resourceId ) )
+    {
+        recordRequest( context, resourceId );
+        return Sample{};
+    }
+
+    const DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
 
     lod = std::clamp( lod, 0.0f, static_cast<float>( texture.mipCount - 1 ) );
     if( texture.mipmapFilterMode == hipFilterModePoint )
@@ -339,9 +367,19 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
 {
     isResident = false;
     if( textureId >= context.textureInfos.len )
+    {
+        isResident = true;
         return Sample{};
+    }
 
-    const DeviceTextureInfo& texture = context.textureInfos.ptr[textureId];
+    const uint32_t resourceId = context.pageTable.getResourceIdByTextureId( textureId );
+    if( !isResourceResident( context, resourceId ) )
+    {
+        recordRequest( context, resourceId );
+        return Sample{};
+    }
+
+    const DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
     if( texture.normalizedCoords )
     {
         const DeviceMipLevel& baseMip = texture.mips[0];

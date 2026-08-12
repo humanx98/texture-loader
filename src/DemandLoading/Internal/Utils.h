@@ -4,11 +4,13 @@
 #pragma once
 
 #include <DemandLoading/DeviceContext.h>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <hip/hip_runtime.h>
+#include <limits>
+#include <optional>
 #include <vector>
-#include <array>
 
 namespace hip_demand {
 namespace internal {
@@ -22,10 +24,16 @@ class NonCopyble
     NonCopyble() = default;
 };
 
-inline uint32_t ceilDiv( uint32_t value, uint32_t divisor )
+HIP_DEMAND_INLINE uint32_t ceilDiv( uint32_t value, uint32_t divisor )
 {
     assert( divisor != 0 );
     return value / divisor + static_cast<uint32_t>( value % divisor != 0 );
+}
+
+HIP_DEMAND_INLINE size_t ceilDiv( size_t value, size_t divisor )
+{
+    assert( divisor != 0 );
+    return value / divisor + static_cast<size_t>( value % divisor != 0 );
 }
 
 class Bitset : NonCopyble
@@ -115,6 +123,15 @@ inline size_t highestPowerOfTwoAtMost( size_t value )
     return result;
 }
 
+inline bool safeAdd( uint32_t a, uint32_t b, uint32_t& result )
+{
+    if( a > std::numeric_limits<uint32_t>::max() - b )
+        return false;
+
+    result = a + b;
+    return true;
+}
+
 inline uint2 tileShapeForGranularity( size_t granularity, uint32_t bytesPerTexel )
 {
     assert( bytesPerTexel );
@@ -174,7 +191,6 @@ static void memcpyDtoHAsync( std::array<T, N>& dst, const DeviceSpan<T>& src, hi
     HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );
 }
 
-
 template <typename T>
 static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src, size_t count )
 {
@@ -197,8 +213,8 @@ template <typename T>
 static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src, size_t count )
 {
     size_t bytes = count * sizeof( T );
-    assert( bytes <= sizeInBytes( src ) );
-    assert( bytes <= dst.sizeInBytes() );
+    assert( bytes <= src.sizeInBytes() );
+    assert( bytes <= sizeInBytes( dst ) );
     HIP_CHECK( hipMemcpy( dst.data(), src.ptr, bytes, hipMemcpyDeviceToHost ) );
 }
 
@@ -206,11 +222,10 @@ template <typename T>
 static void memcpyDtoHAsync( std::vector<T>& dst, const DeviceSpan<T>& src, size_t count, hipStream_t stream )
 {
     size_t bytes = count * sizeof( T );
-    assert( bytes <= sizeInBytes( src ) );
-    assert( bytes <= dst.sizeInBytes() );
+    assert( bytes <= src.sizeInBytes() );
+    assert( bytes <= sizeInBytes( dst ) );
     HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, bytes, hipMemcpyDeviceToHost, stream ) );
 }
-
 
 template <typename T>
 static void memset( const DeviceSpan<T>& dst, int value )
