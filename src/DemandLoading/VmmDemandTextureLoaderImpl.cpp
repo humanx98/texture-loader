@@ -412,6 +412,9 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     , pageSystem_( options_.maxVirtualPages, options_.maxPhysicalPages )
     , textureInfoAllocator_( pageSystem_ )
 {
+    if( options_.maxRequests == 0 )
+        throw std::invalid_argument( "maxRequests cannot be 0" );
+
     uint32_t resourceCount = 0;
     initPageTable( resourceCount );
     textureInfoAllocator_.setRange( pageTable_.textureInfos );

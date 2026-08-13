@@ -255,9 +255,9 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint
         return Sample{};
     }
 
-    const uint32_t localX = static_cast<uint32_t>( x ) % texture.tileWidth;
-    const uint32_t localY = static_cast<uint32_t>( y ) % texture.tileHeight;
-    const uint32_t byteOffset = pageId * context.pageTable.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+    const size_t localX = static_cast<size_t>( x ) % texture.tileWidth;
+    const size_t localY = static_cast<size_t>( y ) % texture.tileHeight;
+    const size_t byteOffset = pageId * context.pageTable.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
     float4 sample = decodeTexel( context.pageMemory.ptr + byteOffset, texture.format );
     resident      = true;
 
@@ -398,7 +398,7 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
 }
 
 template <class Sample>
-HIP_DEMAND_INLINE Sample tex2D( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& isResident )
+HIP_DEMAND_INLINE Sample tex2D( const DeviceContext& context, uint32_t textureId, float x, float y, bool& isResident )
 {
     return tex2DLod<Sample>( context, textureId, x, y, 0.0f, isResident );
 }

@@ -82,7 +82,7 @@ static void memcpyDtoH( std::vector<T>& dst, const hip_demand::DeviceSpan<T>& sr
 {
     size_t bytes = count * sizeof( T );
     assert( bytes <= src.sizeInBytes() );
-    assert( bytes <= sizeInBytes( dst ) );
+    assert( bytes <= dst.size() * sizeof(T) );
     HIP_CHECK( hipMemcpy( dst.data(), src.ptr, bytes, hipMemcpyDeviceToHost ) );
 }
 
