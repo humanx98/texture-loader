@@ -398,10 +398,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
     // note that this list should be accessed by texture.loadedTextureInfoId
     // and it's ordered by startPage in order to use std::upper_bound
-    std::vector<DeviceTextureInfo>            loadedTextureInfos_{};
-    bool                                      textureInfosDirty_ = true;
-    std::vector<DevicePtr<DeviceTextureInfo>> textureInfos_{};
-    VmmAllocator<DeviceTextureInfo>           textureInfoAllocator_;
+    std::vector<DeviceTextureInfo>  loadedTextureInfos_{};
+    VmmAllocator<DeviceTextureInfo> textureInfoAllocator_;
 
     HipGC         hipGC_{};
     DeviceContext deviceContext_{};
@@ -422,7 +420,6 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     tmpPageBuffer_.resize( pageSystem_.pageBytes() );
     residentBits_.resize( resourceCount );
     requestedResources_.resize( options_.maxRequests );
-    textureInfos_.resize( options_.maxTextures );
 
     deviceContext_.pageMemory         = pageSystem_.virtualAddressSpace();
     deviceContext_.requestedBits      = hipGC_.allocArray<uint32_t>( residentBits_.wordCount(), true );
@@ -486,15 +483,8 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
         residentBitsDirty_ = false;
     }
 
-    if( textureInfosDirty_ )
-    {
-        memcpyHtoDAsync( deviceContext_.textureInfos, textureInfos_, textures_.size(), stream );
-        textureInfosDirty_ = false;
-    }
-
     deviceContext_.textureInfos.len = static_cast<uint32_t>( textures_.size() );
-
-    deviceContext = deviceContext_;
+    deviceContext                   = deviceContext_;
 }
 
 void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceContext& deviceContext )
@@ -571,11 +561,9 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
                 texture.loadedTextureInfoId = static_cast<uint32_t>( loadedTextureInfos_.size() );
                 loadedTextureInfos_.push_back( info );
 
-                textureInfos_.at( texture.id ) = dstInfo;
-                textureInfosDirty_             = true;
-
                 pageTable_.textureTiles.nextAvailablePage += pageCount;
 
+                HIP_CHECK( hipMemcpyHtoDAsync( deviceContext.textureInfos.ptr + texture.id, &dstInfo, sizeof( dstInfo ), stream ) );
                 HIP_CHECK( hipMemcpyHtoDAsync( dstInfo, &info, sizeof( info ), stream ) );
                 HIP_CHECK( hipStreamSynchronize( stream ) );
                 break;
