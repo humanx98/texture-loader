@@ -5,11 +5,17 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "stb_image.h"
@@ -35,13 +41,16 @@ class KernelModule
     {
         HIP_CHECK( hipModuleLoad( &module_, path.string().c_str() ) );
         HIP_CHECK( hipModuleGetFunction( &kernel_, module_, "renderVmmTexture" ) );
+        HIP_CHECK( hipModuleGetFunction( &gridKernel_, module_, "renderVmmTextureGrid" ) );
     }
 
     hipFunction_t kernel() const { return kernel_; }
+    hipFunction_t gridKernel() const { return gridKernel_; }
 
   private:
     hipModule_t   module_ = nullptr;
     hipFunction_t kernel_ = nullptr;
+    hipFunction_t gridKernel_ = nullptr;
 };
 
 std::shared_ptr<hip_demand::vmm::ImageSource> readImage( const fs::path& path )
@@ -56,9 +65,11 @@ std::shared_ptr<hip_demand::vmm::ImageSource> readImage( const fs::path& path )
     int      height   = 0;
     int      channels = 0;
     stbi_uc* pixels   = stbi_load( path.string().c_str(), &width, &height, &channels, 4 );
+    if( pixels == nullptr )
+        throw std::runtime_error( "Failed to load image " + path.string() + ": " + stbi_failure_reason() );
 
     auto image = std::make_shared<hip_demand::vmm::ImageSource>();
-    image->data.resize( width * height * 4 );
+    image->data.resize( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 4 );
     image->width  = static_cast<uint32_t>( width );
     image->height = static_cast<uint32_t>( height );
     std::memcpy( image->data.data(), pixels, image->data.size() );
@@ -242,12 +253,140 @@ void test( const fs::path& executableDir )
     std::cout << "Saved: " << fs::absolute( outputPath ) << '\n';
 }
 
+void test2( const fs::path& executableDir )
+{
+    using namespace hip_demand::vmm;
+
+    uint32_t           outputWidth  = 3840;
+    uint32_t           outputHeight = 2160;
+    constexpr uint32_t blockWidth   = 16;
+    constexpr uint32_t blockHeight  = 16;
+    constexpr uint32_t maxPasses    = 128;
+
+    const fs::path inputDirectory = fs::path{ TEST_IMAGES_DIR } / "png";
+    const fs::path outputPath{ "new_texture_tiled_loading_test2_output.png" };
+    const fs::path kernelPath = executableDir / "new_texture_tiled_loading_kernel.co";
+
+    if( !fs::is_directory( inputDirectory ) )
+        throw std::runtime_error( "Image directory not found: " + inputDirectory.string() );
+    if( !fs::exists( kernelPath ) )
+        throw std::runtime_error( "HIP module not found: " + kernelPath.string() );
+
+    std::vector<fs::path> imagePaths;
+    for( const fs::directory_entry& entry : fs::directory_iterator( inputDirectory ) )
+    {
+        if( !entry.is_regular_file() )
+            continue;
+
+        std::string extension = entry.path().extension().string();
+        std::transform( extension.begin(), extension.end(), extension.begin(),
+                        []( unsigned char c ) { return static_cast<char>( std::tolower( c ) ); } );
+        if( extension == ".png" || extension == ".jpg" || extension == ".jpeg" || extension == ".bmp"
+            || extension == ".tga" )
+        {
+            imagePaths.push_back( entry.path() );
+        }
+    }
+    std::sort( imagePaths.begin(), imagePaths.end() );
+
+    if( imagePaths.empty() )
+        throw std::runtime_error( "No supported images found in: " + inputDirectory.string() );
+
+    HIP_CHECK( hipSetDevice( 0 ) );
+
+    KernelModule module;
+    module.load( kernelPath );
+
+    Options options{};
+    options.maxRequests = 4096;
+    std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
+
+    TextureDescriptor descriptor{ hip_demand::TextureFormat::RGBA8Unorm };
+    descriptor.addressMode[0]   = hipAddressModeClamp;
+    descriptor.addressMode[1]   = hipAddressModeClamp;
+    descriptor.filterMode       = hipFilterModeLinear;
+    descriptor.mipmapFilterMode = hipFilterModeLinear;
+    descriptor.normalizedCoords = true;
+
+    for( const fs::path& imagePath : imagePaths )
+    {
+        std::shared_ptr<ImageSource> image = readImage( imagePath );
+        loader->createTexture( image, descriptor );
+        std::cout << "Loaded: " << imagePath.filename() << " (" << image->width << 'x' << image->height << ")\n";
+    }
+
+    uint32_t textureCount = static_cast<uint32_t>( imagePaths.size() );
+    uint32_t columnCount  = static_cast<uint32_t>( std::ceil( std::sqrt( static_cast<double>( textureCount ) ) ) );
+    uint32_t rowCount     = ( textureCount + columnCount - 1 ) / columnCount;
+
+    const size_t byteCount = static_cast<size_t>( outputWidth ) * outputHeight * 4;
+    std::vector<uint8_t> hostOutput( byteCount, 0 );
+    for( size_t offset = 3; offset < hostOutput.size(); offset += 4 )
+        hostOutput[offset] = 255;
+
+    hipStream_t stream = nullptr;
+    HIP_CHECK( hipStreamCreate( &stream ) );
+
+    uint8_t* deviceOutput = nullptr;
+    HIP_CHECK( hipMalloc( reinterpret_cast<void**>( &deviceOutput ), byteCount ) );
+    HIP_CHECK( hipMemcpyAsync( deviceOutput, hostOutput.data(), byteCount, hipMemcpyHostToDevice, stream ) );
+
+    const uint32_t gridWidth  = ( outputWidth + blockWidth - 1 ) / blockWidth;
+    const uint32_t gridHeight = ( outputHeight + blockHeight - 1 ) / blockHeight;
+    const auto launchGrid = [&]( const DeviceContext& context ) {
+        DeviceContext mutableContext = context;
+        void* arguments[] = { &mutableContext, &deviceOutput, &outputWidth, &outputHeight,
+                              &textureCount,    &columnCount,  &rowCount };
+
+        HIP_CHECK( hipModuleLaunchKernel( module.gridKernel(), gridWidth, gridHeight, 1, blockWidth, blockHeight, 1,
+                                          0, stream, arguments, nullptr ) );
+    };
+
+    DeviceContext context{};
+    bool          complete = false;
+    for( uint32_t pass = 0; pass < maxPasses; ++pass )
+    {
+        loader->launchPrepare( stream, context );
+        launchGrid( context );
+
+        uint32_t requestCount = 0;
+        HIP_CHECK( hipMemcpyAsync( &requestCount, context.counters.ptr, sizeof( requestCount ),
+                                   hipMemcpyDeviceToHost, stream ) );
+        loader->processRequests( stream, context );
+
+        std::cout << "Pass " << pass + 1 << ": " << requestCount << " resource requests\n";
+        if( requestCount == 0 )
+        {
+            complete = true;
+            break;
+        }
+    }
+
+    if( !complete )
+        throw std::runtime_error( "Rendering did not converge after " + std::to_string( maxPasses ) + " passes" );
+
+    HIP_CHECK( hipMemcpyAsync( hostOutput.data(), deviceOutput, byteCount, hipMemcpyDeviceToHost, stream ) );
+    HIP_CHECK( hipStreamSynchronize( stream ) );
+
+    if( stbi_write_png( outputPath.string().c_str(), static_cast<int>( outputWidth ), static_cast<int>( outputHeight ),
+                        4, hostOutput.data(), static_cast<int>( outputWidth * 4 ) )
+        == 0 )
+    {
+        throw std::runtime_error( "Failed to save output PNG" );
+    }
+
+    HIP_WARN( hipFree( deviceOutput ) );
+    HIP_WARN( hipStreamDestroy( stream ) );
+
+    std::cout << "Saved 4K texture grid: " << fs::absolute( outputPath ) << '\n';
+}
+
 int main( int, char** argv )
 {
     try
     {
         const fs::path executableDir = fs::absolute( fs::path{ argv[0] } ).parent_path();
-        test( executableDir );
+        test2( executableDir );
         return 0;
     }
     catch( const std::exception& error )

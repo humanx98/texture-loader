@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
-#include <new>
 
 namespace hip_demand::vmm {
 
