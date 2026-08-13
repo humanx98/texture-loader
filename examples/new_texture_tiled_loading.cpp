@@ -1,5 +1,6 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <DemandLoading/VmmTextureSampling.h>
+#include <ImageSource/TextureInfo.h>
 
 #include "hip_check.h"
 
@@ -18,7 +19,6 @@
 #include <string>
 #include <vector>
 
-#include "stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -53,28 +53,25 @@ class KernelModule
     hipFunction_t gridKernel_ = nullptr;
 };
 
-std::shared_ptr<hip_demand::vmm::ImageSource> readImage( const fs::path& path )
+std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path )
 {
+#if !defined( USE_OIIO )
+#error "This example requires a build configured with USE_OIIO=ON"
+#endif
+
     if( !fs::exists( path ) )
-    {
-        std::cerr << "Texture not found: " << path << '\n';
-        std::abort();
-    }
+        throw std::runtime_error( "Texture not found: " + path.string() );
 
-    int      width    = 0;
-    int      height   = 0;
-    int      channels = 0;
-    stbi_uc* pixels   = stbi_load( path.string().c_str(), &width, &height, &channels, 4 );
-    if( pixels == nullptr )
-        throw std::runtime_error( "Failed to load image " + path.string() + ": " + stbi_failure_reason() );
+    std::unique_ptr<hip_demand::ImageSource> image = hip_demand::createImageSource( path.string() );
+    if( !image )
+        throw std::runtime_error( "Failed to create an image source for: " + path.string() );
 
-    auto image = std::make_shared<hip_demand::vmm::ImageSource>();
-    image->data.resize( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 4 );
-    image->width  = static_cast<uint32_t>( width );
-    image->height = static_cast<uint32_t>( height );
-    std::memcpy( image->data.data(), pixels, image->data.size() );
-    stbi_image_free( pixels );
-    return image;
+    hip_demand::TextureInfo info{};
+    image->open( &info );
+    if( !info.isValid || info.width == 0 || info.height == 0 )
+        throw std::runtime_error( "Invalid image: " + path.string() );
+
+    return std::shared_ptr<hip_demand::ImageSource>( std::move( image ) );
 }
 
 template <typename T>
@@ -117,15 +114,17 @@ void test( const fs::path& executableDir )
     std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
 
 
-    TextureDescriptor descriptor{ hip_demand::TextureFormat::RGBA8Unorm };
+    TextureDescriptor descriptor{};
     descriptor.addressMode[0]                = hipAddressModeMirror;
     descriptor.addressMode[1]                = hipAddressModeMirror;
     descriptor.filterMode                    = hipFilterModeLinear;
     descriptor.mipmapFilterMode              = hipFilterModeLinear;
     descriptor.normalizedCoords              = true;
-    std::shared_ptr<ImageSource> imageSource = readImage( inputPath );
-    uint32_t                     width       = imageSource->width;
-    uint32_t                     height      = imageSource->height;
+    std::shared_ptr<hip_demand::ImageSource> imageSource = readImage( inputPath );
+    assert( imageSource->isOpen() );
+    const hip_demand::TextureInfo&           imageInfo   = imageSource->getInfo();
+    uint32_t                                 width       = imageInfo.width;
+    uint32_t                                 height      = imageInfo.height;
 
 
     const DemandTexture& texture   = loader->createTexture( imageSource, descriptor );
@@ -301,7 +300,7 @@ void test2( const fs::path& executableDir )
     options.maxRequests = 4096;
     std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
 
-    TextureDescriptor descriptor{ hip_demand::TextureFormat::RGBA8Unorm };
+    TextureDescriptor descriptor{};
     descriptor.addressMode[0]   = hipAddressModeClamp;
     descriptor.addressMode[1]   = hipAddressModeClamp;
     descriptor.filterMode       = hipFilterModeLinear;
@@ -310,9 +309,11 @@ void test2( const fs::path& executableDir )
 
     for( const fs::path& imagePath : imagePaths )
     {
-        std::shared_ptr<ImageSource> image = readImage( imagePath );
+        std::shared_ptr<hip_demand::ImageSource> image = readImage( imagePath );
+        assert( image->isOpen() );
         loader->createTexture( image, descriptor );
-        std::cout << "Loaded: " << imagePath.filename() << " (" << image->width << 'x' << image->height << ")\n";
+        const hip_demand::TextureInfo& imageInfo = image->getInfo();
+        std::cout << "Loaded: " << imagePath.filename() << " (" << imageInfo.width << 'x' << imageInfo.height << ")\n";
     }
 
     uint32_t textureCount = static_cast<uint32_t>( imagePaths.size() );

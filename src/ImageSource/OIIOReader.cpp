@@ -217,6 +217,62 @@ bool OIIOReader::readMipLevel(char* dest,
     return true;
 }
 
+bool OIIOReader::readTile( char* dest, unsigned int mipLevel, const Tile& tile, hipStream_t stream )
+{
+    (void)stream;
+
+    if( dest == nullptr || tile.width == 0 || tile.height == 0 )
+        return false;
+
+    if( !isOpen_ || mipLevel >= info_.numMipLevels )
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock( mutex_ );
+        if( mipLevels_.empty() )
+        {
+            if( !loadImage() )
+                return false;
+        }
+    }
+
+    const size_t mipWidth  = std::max( 1u, info_.width >> mipLevel );
+    const size_t mipHeight = std::max( 1u, info_.height >> mipLevel );
+    const size_t firstX    = static_cast<size_t>( tile.x ) * tile.width;
+    const size_t firstY    = static_cast<size_t>( tile.y ) * tile.height;
+
+    if( firstX >= mipWidth || firstY >= mipHeight )
+        return false;
+
+    // loadImage() converts all cached mip levels to UINT8, so each cached
+    // texel occupies one byte per channel regardless of the source format.
+    const size_t bytesPerTexel = info_.numChannels;
+    if( bytesPerTexel == 0 )
+        return false;
+
+    const size_t copyWidth  = std::min( static_cast<size_t>( tile.width ), mipWidth - firstX );
+    const size_t copyHeight = std::min( static_cast<size_t>( tile.height ), mipHeight - firstY );
+    const size_t tileRowBytes = static_cast<size_t>( tile.width ) * bytesPerTexel;
+
+    const std::vector<unsigned char>& source = mipLevels_[mipLevel];
+    if( source.size() < mipWidth * mipHeight * bytesPerTexel )
+        return false;
+
+    // Edge tiles are padded with zeroes so data left in a reused page buffer
+    // cannot leak into the unused part of the tile.
+    if( copyWidth < tile.width || copyHeight < tile.height )
+        std::memset( dest, 0, static_cast<size_t>( tile.height ) * tileRowBytes );
+
+    for( size_t row = 0; row < copyHeight; ++row )
+    {
+        const size_t sourceOffset = ( ( firstY + row ) * mipWidth + firstX ) * bytesPerTexel;
+        const size_t destOffset   = row * tileRowBytes;
+        std::memcpy( dest + destOffset, source.data() + sourceOffset, copyWidth * bytesPerTexel );
+    }
+
+    return true;
+}
+
 bool OIIOReader::readBaseColor(float4& dest)
 {
     std::lock_guard<std::mutex> lock(mutex_);

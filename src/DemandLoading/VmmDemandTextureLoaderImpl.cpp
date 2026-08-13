@@ -1,6 +1,7 @@
 #include "Internal/HipCheck.h"
 #include "Internal/Utils.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
+#include <ImageSource/TextureInfo.h>
 #include <algorithm>
 #include <array>
 #include <mutex>
@@ -18,6 +19,7 @@ using internal::mipDimension;
 using internal::NonCopyble;
 using internal::safeAdd;
 using internal::tileShapeForGranularity;
+using internal::sizeInBytes;
 
 class HipGC : NonCopyble
 {
@@ -50,34 +52,19 @@ class HipGC : NonCopyble
     std::vector<hipDeviceptr_t> allocations_;
 };
 
-inline uint32_t pixelSize( TextureFormat format )
+inline uint32_t pixelSize( hipArray_Format format, uint32_t numChannels )
 {
-    switch( format )
-    {
-        case TextureFormat::R8Unorm:
-            return 1 * sizeof( uint8_t );
-        case TextureFormat::RG8Unorm:
-            return 2 * sizeof( uint8_t );
-        case TextureFormat::RGBA8Unorm:
-            return 4 * sizeof( uint8_t );
-        case TextureFormat::R16Unorm:
-            return 1 * sizeof( uint16_t );
-        case TextureFormat::RG16Unorm:
-            return 2 * sizeof( uint16_t );
-        case TextureFormat::RGBA16Unorm:
-            return 4 * sizeof( uint16_t );
-        case TextureFormat::R32Float:
-            return 1 * sizeof( float );
-        case TextureFormat::RG32Float:
-            return 2 * sizeof( float );
-        case TextureFormat::RGBA32Float:
-            return 4 * sizeof( float );
-        default:
-            throw std::invalid_argument( "Unsupported texture format" );
-    }
+    if( numChannels == 0 || numChannels > 4 )
+        throw std::invalid_argument( "Texture channel count must be between 1 and 4" );
+
+    const uint32_t bytesPerChannel = getBytesPerChannel( format );
+    if( bytesPerChannel == 0 )
+        throw std::invalid_argument( "Unsupported hipArray_Format" );
+
+    return bytesPerChannel * numChannels;
 }
 
-struct Tile
+struct ResourceTile
 {
     uint32_t textureId = 0;
     uint32_t mipLevel  = 0;
@@ -101,7 +88,7 @@ struct Resource
         {
             uint32_t textureId;
         } textureInfo;
-        Tile tile;
+        ResourceTile tile;
     };
 
     static Resource TextureInfo( uint32_t textureId )
@@ -127,27 +114,6 @@ struct Resource
   private:
     Resource() {}
 };
-
-inline void readTile( const Tile& key, const ImageSource& image, const DeviceTextureInfo& info, std::vector<uint8_t>& pageBuffer )
-{
-    assert( info.tileWidth * info.tileHeight * info.bytesPerTexel <= pageBuffer.size() );
-
-    const size_t   mipWidth   = info.mips[key.mipLevel].width;
-    const size_t   mipHeight  = info.mips[key.mipLevel].height;
-    const size_t   firstX     = key.tileX * info.tileWidth;
-    const size_t   firstY     = key.tileY * info.tileHeight;
-    const size_t   copyWidth  = std::min( static_cast<size_t>( info.tileWidth ), mipWidth - firstX );
-    const size_t   copyHeight = std::min( static_cast<size_t>( info.tileHeight ), mipHeight - firstY );
-    const uint8_t* source     = image.data.data();
-    uint8_t*       output     = pageBuffer.data();
-
-    for( size_t row = 0; row < copyHeight; ++row )
-    {
-        const size_t sourceOffset = ( ( firstY + row ) * mipWidth + firstX ) * info.bytesPerTexel;
-        const size_t outputOffset = row * info.tileWidth * info.bytesPerTexel;
-        std::memcpy( output + outputOffset, source + sourceOffset, copyWidth * info.bytesPerTexel );
-    }
-}
 
 struct VmmPhysicalPage
 {
@@ -383,6 +349,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
   private:
     void     initPageTable( uint32_t& resourceCount );
     Resource decode( uint32_t resourceId );
+    void     processTextureInfo( uint32_t textureId, hipStream_t stream, const DeviceContext& deviceContext );
+    void     processTextureTile( const ResourceTile& tile, hipStream_t stream, const DeviceContext& deviceContext );
 
     mutable std::mutex    mutex_;
     Options               options_{};
@@ -456,11 +424,8 @@ const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<Ima
 {
     std::lock_guard<std::mutex> lock( mutex_ );
 
-    if( !imageSource || imageSource->data.empty() )
-        throw std::invalid_argument( "createTexture requires an image source" );
-
-    if( imageSource->width == 0 || imageSource->height == 0 )
-        throw std::invalid_argument( "createTexture requires width > 0 and height > 0" );
+    if( !imageSource )
+        throw std::invalid_argument( "Image source is null" );
 
     if( textures_.size() >= options_.maxTextures )
         throw std::runtime_error( "Maximum demand texture count exceeded" );
@@ -474,22 +439,29 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
 {
     std::lock_guard<std::mutex> lock( mutex_ );
 
-    memsetAsync( deviceContext_.requestedBits, 0, stream );
-    memsetAsync( deviceContext_.counters, 0, stream );
-
-    if( residentBitsDirty_ )
+    if( !textures_.empty() )
     {
-        memcpyHtoDAsync( deviceContext_.residentBits, residentBits_.words(), stream );
-        residentBitsDirty_ = false;
+        memsetAsync( deviceContext_.requestedBits, 0, stream );
+        memsetAsync( deviceContext_.counters, 0, stream );
+
+        if( residentBitsDirty_ )
+        {
+            memcpyHtoDAsync( deviceContext_.residentBits, residentBits_.words(), stream );
+            residentBitsDirty_ = false;
+        }
+
+        deviceContext_.textureInfos.len = static_cast<uint32_t>( textures_.size() );
     }
 
-    deviceContext_.textureInfos.len = static_cast<uint32_t>( textures_.size() );
-    deviceContext                   = deviceContext_;
+    deviceContext = deviceContext_;
 }
 
 void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceContext& deviceContext )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
+
+    if( textures_.empty() )
+        return;
 
     if( deviceContext.pageMemory.ptr != deviceContext_.pageMemory.ptr
         || deviceContext.requestedBits.ptr != deviceContext_.requestedBits.ptr
@@ -514,68 +486,11 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
         switch( resource.type )
         {
             case ResourceType::TextureInfo: {
-                // TODO_BS: implement mip count > 1
-                const uint32_t mipCount = 1;
-                if( mipCount > MAX_TEXTURE_MIP_LEVELS )
-                    throw std::runtime_error( "Texture has more mip levels than DeviceTextureInfo can store" );
-
-                DemandTextureImpl& texture = *textures_.at( resource.textureInfo.textureId );
-
-                const uint32_t bytesPerTexel = pixelSize( texture.descriptor.format );
-                const uint2    tileShape     = tileShapeForGranularity( pageSystem_.granularity(), bytesPerTexel );
-
-                DevicePtr<DeviceTextureInfo> dstInfo = textureInfoAllocator_.alloc();
-                DeviceTextureInfo            info{};
-                info.textureId        = texture.id;
-                info.addressMode[0]   = texture.descriptor.addressMode[0];
-                info.addressMode[1]   = texture.descriptor.addressMode[1];
-                info.filterMode       = texture.descriptor.filterMode;
-                info.mipmapFilterMode = texture.descriptor.mipmapFilterMode;
-                info.normalizedCoords = texture.descriptor.normalizedCoords ? 1u : 0u;
-                info.format           = texture.descriptor.format;
-                info.tileWidth        = tileShape.x;
-                info.tileHeight       = tileShape.y;
-                info.bytesPerTexel    = bytesPerTexel;
-                info.width            = texture.image->width;
-                info.height           = texture.image->height;
-                info.startPage        = pageTable_.textureTiles.nextAvailablePage;
-                info.mipCount         = mipCount;
-
-                uint32_t pageCount = 0;
-                for( uint32_t mip = 0; mip < info.mipCount; ++mip )
-                {
-                    auto& level     = info.mips[mip];
-                    level.width     = mipDimension( info.width, mip );
-                    level.height    = mipDimension( info.height, mip );
-                    level.tilesX    = ceilDiv( level.width, info.tileWidth );
-                    level.tilesY    = ceilDiv( level.height, info.tileHeight );
-                    level.startPage = pageTable_.textureTiles.nextAvailablePage + pageCount;
-
-                    pageCount += level.pageCount();
-                }
-
-                // TODO_BS: how to handle it?
-                if( pageTable_.textureTiles.nextAvailablePage + pageCount > options_.maxVirtualPages )
-                    throw std::runtime_error( "Maximum demand virtual page count exceeded" );
-
-                texture.loadedTextureInfoId = static_cast<uint32_t>( loadedTextureInfos_.size() );
-                loadedTextureInfos_.push_back( info );
-
-                pageTable_.textureTiles.nextAvailablePage += pageCount;
-
-                HIP_CHECK( hipMemcpyHtoDAsync( deviceContext.textureInfos.ptr + texture.id, &dstInfo, sizeof( dstInfo ), stream ) );
-                HIP_CHECK( hipMemcpyHtoDAsync( dstInfo, &info, sizeof( info ), stream ) );
-                HIP_CHECK( hipStreamSynchronize( stream ) );
+                processTextureInfo( resource.textureInfo.textureId, stream, deviceContext );
                 break;
             }
             case ResourceType::TextureTile: {
-                if( !pageSystem_.mapped( resource.tile.pageId ) )
-                    pageSystem_.map( resource.tile.pageId );
-
-                const DemandTextureImpl& texture = *textures_.at( resource.tile.textureId );
-                readTile( resource.tile, *texture.image, loadedTextureInfos_.at( texture.loadedTextureInfoId ), tmpPageBuffer_ );
-                memcpyHtoDAsync( pageSystem_.page( resource.tile.pageId ), tmpPageBuffer_, stream );
-                HIP_CHECK( hipStreamSynchronize( stream ) );
+                processTextureTile( resource.tile, stream, deviceContext );
                 break;
             }
             default: {
@@ -586,6 +501,81 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
         residentBits_.set( resourceId, true );
         residentBitsDirty_ = true;
     }
+}
+
+void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_t stream, const DeviceContext& deviceContext )
+{
+    DemandTextureImpl& texture = *textures_.at( textureId );
+    TextureInfo        hostInfo{};
+    texture.image->open( &hostInfo );
+    assert( hostInfo.isValid );
+
+    const uint32_t bytesPerTexel = pixelSize( hostInfo.format, hostInfo.numChannels );
+    const uint2    tileShape     = tileShapeForGranularity( pageSystem_.granularity(), bytesPerTexel );
+
+    DevicePtr<DeviceTextureInfo> dstInfo = textureInfoAllocator_.alloc();
+    DeviceTextureInfo            deviceInfo{};
+    deviceInfo.textureId        = textureId;
+    deviceInfo.addressMode[0]   = texture.descriptor.addressMode[0];
+    deviceInfo.addressMode[1]   = texture.descriptor.addressMode[1];
+    deviceInfo.filterMode       = texture.descriptor.filterMode;
+    deviceInfo.mipmapFilterMode = texture.descriptor.mipmapFilterMode;
+    deviceInfo.normalizedCoords = texture.descriptor.normalizedCoords ? 1u : 0u;
+    deviceInfo.format           = hostInfo.format;
+    deviceInfo.numChannels      = hostInfo.numChannels;
+    deviceInfo.tileWidth        = tileShape.x;
+    deviceInfo.tileHeight       = tileShape.y;
+    deviceInfo.bytesPerTexel    = bytesPerTexel;
+    deviceInfo.width            = hostInfo.width;
+    deviceInfo.height           = hostInfo.height;
+    deviceInfo.startPage        = pageTable_.textureTiles.nextAvailablePage;
+    deviceInfo.mipCount         = hostInfo.numMipLevels;
+
+    uint32_t pageCount = 0;
+    for( uint32_t mip = 0; mip < deviceInfo.mipCount; ++mip )
+    {
+        auto& level     = deviceInfo.mips[mip];
+        level.width     = mipDimension( deviceInfo.width, mip );
+        level.height    = mipDimension( deviceInfo.height, mip );
+        level.tilesX    = ceilDiv( level.width, deviceInfo.tileWidth );
+        level.tilesY    = ceilDiv( level.height, deviceInfo.tileHeight );
+        level.startPage = pageTable_.textureTiles.nextAvailablePage + pageCount;
+
+        pageCount += level.pageCount();
+    }
+
+    // TODO_BS: how to handle it?
+    if( pageTable_.textureTiles.nextAvailablePage + pageCount > options_.maxVirtualPages )
+        throw std::runtime_error( "Maximum demand virtual page count exceeded" );
+
+    texture.loadedTextureInfoId = static_cast<uint32_t>( loadedTextureInfos_.size() );
+    loadedTextureInfos_.push_back( deviceInfo );
+
+    pageTable_.textureTiles.nextAvailablePage += pageCount;
+
+    HIP_CHECK( hipMemcpyHtoDAsync( dstInfo, &deviceInfo, sizeof( deviceInfo ), stream ) );
+    HIP_CHECK( hipMemcpyHtoDAsync( deviceContext.textureInfos.ptr + textureId, &dstInfo, sizeof( dstInfo ), stream ) );
+    HIP_CHECK( hipStreamSynchronize( stream ) );
+}
+
+void DemandTextureLoaderImpl::processTextureTile( const ResourceTile& tile, hipStream_t stream, const DeviceContext& deviceContext )
+{
+    if( !pageSystem_.mapped( tile.pageId ) )
+        pageSystem_.map( tile.pageId );
+
+    const DemandTextureImpl& texture = *textures_.at( tile.textureId );
+    const DeviceTextureInfo& info    = loadedTextureInfos_.at( texture.loadedTextureInfoId );
+    
+    Tile t{};
+    t.x      = tile.tileX;
+    t.y      = tile.tileY;
+    t.width  = info.tileWidth;
+    t.height = info.tileHeight;
+    assert( static_cast<size_t>( t.width ) * t.height * info.bytesPerTexel <= sizeInBytes( tmpPageBuffer_ ) );
+    assert( texture.image->readTile( reinterpret_cast<char*>( tmpPageBuffer_.data() ), tile.mipLevel, t, stream ) );
+
+    memcpyHtoDAsync( pageSystem_.page( tile.pageId ), tmpPageBuffer_, stream );
+    HIP_CHECK( hipStreamSynchronize( stream ) );
 }
 
 Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )

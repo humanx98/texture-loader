@@ -32,19 +32,6 @@ struct DeviceContext
     uint32_t       maxRequests;
 };
 
-enum class TextureFormat : uint32_t
-{
-    R8Unorm,
-    RG8Unorm,
-    RGBA8Unorm,
-    R16Unorm,
-    RG16Unorm,
-    RGBA16Unorm,
-    R32Float,
-    RG32Float,
-    RGBA32Float,
-};
-
 template <typename T>
 using DevicePtr = T*;
 
@@ -95,7 +82,8 @@ struct DeviceTextureInfo
     uint32_t       filterMode       = hipFilterModeLinear;
     uint32_t       mipmapFilterMode = hipFilterModeLinear;
     uint32_t       normalizedCoords = 1;
-    TextureFormat  format           = TextureFormat::RGBA8Unorm;
+    hipArray_Format format          = HIP_AD_FORMAT_UNSIGNED_INT8;
+    uint32_t       numChannels      = 4;
     uint32_t       bytesPerTexel    = 4;
     uint32_t       startPage        = INVALID_PAGE;
     uint32_t       mipCount         = 0;

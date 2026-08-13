@@ -3,6 +3,7 @@
 #include "DeviceContext.h"
 #include <algorithm>
 #include <cmath>
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <type_traits>
 
@@ -180,45 +181,71 @@ HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mod
     }
 }
 
-HIP_DEMAND_INLINE float4 decodeTexel( const uint8_t* texel, TextureFormat format )
+HIP_DEMAND_INLINE float decodeTexelChannel( const uint8_t* texel, hipArray_Format format, uint32_t channel )
 {
     switch( format )
     {
-        case TextureFormat::R8Unorm:
-            return make_float4( texel[0] / 255.0f, 0.0f, 0.0f, 1.0f );
-        case TextureFormat::RG8Unorm:
-            return make_float4( texel[0] / 255.0f, texel[1] / 255.0f, 0.0f, 1.0f );
-        case TextureFormat::RGBA8Unorm:
-            return make_float4( texel[0] / 255.0f, texel[1] / 255.0f, texel[2] / 255.0f, texel[3] / 255.0f );
-
-        case TextureFormat::R16Unorm: {
-            const uint16_t* value = reinterpret_cast<const uint16_t*>( texel );
-            return make_float4( value[0] / 65535.0f, 0.0f, 0.0f, 1.0f );
-        }
-        case TextureFormat::RG16Unorm: {
-            const uint16_t* value = reinterpret_cast<const uint16_t*>( texel );
-            return make_float4( value[0] / 65535.0f, value[1] / 65535.0f, 0.0f, 1.0f );
-        }
-        case TextureFormat::RGBA16Unorm: {
-            const uint16_t* value = reinterpret_cast<const uint16_t*>( texel );
-            return make_float4( value[0] / 65535.0f, value[1] / 65535.0f, value[2] / 65535.0f, value[3] / 65535.0f );
-        }
-
-        case TextureFormat::R32Float: {
-            const float* value = reinterpret_cast<const float*>( texel );
-            return make_float4( value[0], 0.0f, 0.0f, 1.0f );
-        }
-        case TextureFormat::RG32Float: {
-            const float* value = reinterpret_cast<const float*>( texel );
-            return make_float4( value[0], value[1], 0.0f, 1.0f );
-        }
-        case TextureFormat::RGBA32Float: {
-            const float* value = reinterpret_cast<const float*>( texel );
-            return make_float4( value[0], value[1], value[2], value[3] );
-        }
-
+        case HIP_AD_FORMAT_UNSIGNED_INT8:
+            return reinterpret_cast<const uint8_t*>( texel )[channel] / 255.0f;
+        case HIP_AD_FORMAT_SIGNED_INT8:
+            return fmaxf( -1.0f, reinterpret_cast<const int8_t*>( texel )[channel] / 127.0f );
+        case HIP_AD_FORMAT_UNSIGNED_INT16:
+            return reinterpret_cast<const uint16_t*>( texel )[channel] / 65535.0f;
+        case HIP_AD_FORMAT_SIGNED_INT16:
+            return fmaxf( -1.0f, reinterpret_cast<const int16_t*>( texel )[channel] / 32767.0f );
+        case HIP_AD_FORMAT_UNSIGNED_INT32:
+            return static_cast<float>( reinterpret_cast<const uint32_t*>( texel )[channel] ) / 4294967295.0f;
+        case HIP_AD_FORMAT_SIGNED_INT32:
+            return fmaxf( -1.0f, static_cast<float>( reinterpret_cast<const int32_t*>( texel )[channel] ) / 2147483647.0f );
+        case HIP_AD_FORMAT_HALF:
+            return __half2float( reinterpret_cast<const __half*>( texel )[channel] );
+        case HIP_AD_FORMAT_FLOAT:
+            return reinterpret_cast<const float*>( texel )[channel];
         default:
-            return make_float4( 0.0f, 0.0f, 0.0f, 0.0f );
+            return 0.0f;
+    }
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample decodeTexel( const uint8_t* texel, hipArray_Format format, uint32_t numChannels )
+{
+    if constexpr( std::is_same<Sample, float>::value )
+    {
+        return decodeTexelChannel( texel, format, 0 );
+    }
+    else if constexpr( std::is_same<Sample, float2>::value )
+    {
+        float2 result;
+        result.x = decodeTexelChannel( texel, format, 0 );
+        if( numChannels > 0 )
+            result.y = decodeTexelChannel( texel, format, 1 );
+        return result;
+    }
+    else if constexpr( std::is_same<Sample, float3>::value )
+    {
+        float3 result;
+        result.x = decodeTexelChannel( texel, format, 0 );
+        if( numChannels > 0 )
+            result.y = decodeTexelChannel( texel, format, 1 );
+        if( numChannels > 1 )
+            result.z = decodeTexelChannel( texel, format, 2 );
+        return result;
+    }
+    else if constexpr( std::is_same<Sample, float4>::value )
+    {
+        float4 result;
+        result.x = decodeTexelChannel( texel, format, 0 );
+        if( numChannels > 0 )
+            result.y = decodeTexelChannel( texel, format, 1 );
+        if( numChannels > 1 )
+            result.z = decodeTexelChannel( texel, format, 2 );
+        if( numChannels > 2 )
+            result.w = decodeTexelChannel( texel, format, 3 );
+        return result;
+    }
+    else
+    {
+        static_assert( false, "decodeTexel supports Sample = float, float2, float3, or float4" );
     }
 }
 
@@ -258,21 +285,8 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint
     const size_t localX = static_cast<size_t>( x ) % texture.tileWidth;
     const size_t localY = static_cast<size_t>( y ) % texture.tileHeight;
     const size_t byteOffset = pageId * context.pageTable.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
-    float4 sample = decodeTexel( context.pageMemory.ptr + byteOffset, texture.format );
-    resident      = true;
-
-    static_assert( std::is_same<Sample, float>::value || std::is_same<Sample, float2>::value
-                       || std::is_same<Sample, float3>::value || std::is_same<Sample, float4>::value,
-                   "fetchTexel supports Sample = float, float2, float3, or float4" );
-
-    if constexpr( std::is_same<Sample, float>::value )
-        return sample.x;
-    else if constexpr( std::is_same<Sample, float2>::value )
-        return make_float2( sample.x, sample.y );
-    else if constexpr( std::is_same<Sample, float3>::value )
-        return make_float3( sample.x, sample.y, sample.z );
-    else
-        return sample;
+    resident = true;
+    return decodeTexel<Sample>( context.pageMemory.ptr + byteOffset, texture.format, texture.numChannels );
 }
 
 template <class Sample>

@@ -32,6 +32,8 @@ class OIIOReader : public ImageSource
                      unsigned int expectedWidth,
                      unsigned int expectedHeight,
                      hipStream_t stream = 0) override;
+
+    bool readTile( char* dest, unsigned int mipLevel, const Tile& tile, hipStream_t stream ) override;
     
     bool readBaseColor(float4& dest) override;
     
