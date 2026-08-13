@@ -95,3 +95,109 @@ extern "C" __global__ void renderVmmTextureGrid( hip_demand::vmm::DeviceContext 
         output[outputOffset + 3] = toUnorm8( 1.0f );
     }
 }
+
+extern "C" __global__ void renderVmmTextureMipGrid( hip_demand::vmm::DeviceContext context,
+                                                     uint8_t* output,
+                                                     uint32_t outputWidth,
+                                                     uint32_t outputHeight,
+                                                     uint32_t textureCount,
+                                                     uint32_t columnCount,
+                                                     uint32_t rowCount )
+{
+    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
+    if( x >= outputWidth || y >= outputHeight )
+        return;
+
+    const uint32_t column    = x * columnCount / outputWidth;
+    const uint32_t row       = y * rowCount / outputHeight;
+    const uint32_t textureId = row * columnCount + column;
+    if( textureId >= textureCount )
+        return;
+
+    const uint32_t cellX0     = column * outputWidth / columnCount;
+    const uint32_t cellX1     = ( column + 1 ) * outputWidth / columnCount;
+    const uint32_t cellY0     = row * outputHeight / rowCount;
+    const uint32_t cellY1     = ( row + 1 ) * outputHeight / rowCount;
+    const uint32_t cellWidth  = cellX1 - cellX0;
+    const uint32_t cellHeight = cellY1 - cellY0;
+    const uint32_t localX     = x - cellX0;
+    const uint32_t localY     = y - cellY0;
+    const size_t   outputOffset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
+
+    // The texture metadata must be resident before the mip count can be inspected.
+    const uint32_t textureResourceId = context.pageTable.getResourceIdByTextureId( textureId );
+    if( !hip_demand::vmm::isResourceResident( context, textureResourceId ) )
+    {
+        bool resident = false;
+        hip_demand::vmm::tex2DLod<float3>( context, textureId, 0.5f, 0.5f, 0.0f, resident );
+        output[outputOffset + 0] = 255;
+        output[outputOffset + 1] = 0;
+        output[outputOffset + 2] = 255;
+        output[outputOffset + 3] = 255;
+        return;
+    }
+
+    const hip_demand::vmm::DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
+
+    // Pack a conventional mip chain into each grid cell: mip 0 fills the left
+    // two thirds and all smaller levels are stacked, at relative size, on the right.
+    const uint32_t baseWidth = max( 1u, cellWidth * 2u / 3u );
+    uint32_t       mipLevel  = 0;
+    uint32_t       mipX      = 0;
+    uint32_t       mipY      = 0;
+    uint32_t       mipWidth  = baseWidth;
+    uint32_t       mipHeight = cellHeight;
+    bool           inMip     = localX < baseWidth;
+
+    if( !inMip )
+    {
+        mipY = 0;
+        for( uint32_t level = 1; level < texture.mipCount; ++level )
+        {
+            const uint32_t levelWidth  = max( 1u, baseWidth >> level );
+            const uint32_t levelHeight = max( 1u, cellHeight >> level );
+            if( localX >= baseWidth && localX < baseWidth + levelWidth && localY >= mipY
+                && localY < mipY + levelHeight )
+            {
+                mipLevel  = level;
+                mipX      = baseWidth;
+                mipWidth  = levelWidth;
+                mipHeight = levelHeight;
+                inMip     = true;
+                break;
+            }
+            mipY += levelHeight;
+        }
+    }
+
+    if( !inMip )
+    {
+        output[outputOffset + 0] = 0;
+        output[outputOffset + 1] = 0;
+        output[outputOffset + 2] = 0;
+        output[outputOffset + 3] = 255;
+        return;
+    }
+
+    const float u = ( static_cast<float>( localX - mipX ) + 0.5f ) / static_cast<float>( mipWidth );
+    const float v = ( static_cast<float>( localY - mipY ) + 0.5f ) / static_cast<float>( mipHeight );
+    bool        resident = false;
+    const auto  color = hip_demand::vmm::tex2DLod<float3>( context, textureId, u, v,
+                                                           static_cast<float>( mipLevel ), resident );
+
+    if( resident )
+    {
+        output[outputOffset + 0] = toUnorm8( color.x );
+        output[outputOffset + 1] = toUnorm8( color.y );
+        output[outputOffset + 2] = toUnorm8( color.z );
+        output[outputOffset + 3] = 255;
+    }
+    else
+    {
+        output[outputOffset + 0] = 255;
+        output[outputOffset + 1] = 0;
+        output[outputOffset + 2] = 255;
+        output[outputOffset + 3] = 255;
+    }
+}

@@ -42,15 +42,18 @@ class KernelModule
         HIP_CHECK( hipModuleLoad( &module_, path.string().c_str() ) );
         HIP_CHECK( hipModuleGetFunction( &kernel_, module_, "renderVmmTexture" ) );
         HIP_CHECK( hipModuleGetFunction( &gridKernel_, module_, "renderVmmTextureGrid" ) );
+        HIP_CHECK( hipModuleGetFunction( &mipGridKernel_, module_, "renderVmmTextureMipGrid" ) );
     }
 
     hipFunction_t kernel() const { return kernel_; }
     hipFunction_t gridKernel() const { return gridKernel_; }
+    hipFunction_t mipGridKernel() const { return mipGridKernel_; }
 
   private:
-    hipModule_t   module_ = nullptr;
-    hipFunction_t kernel_ = nullptr;
-    hipFunction_t gridKernel_ = nullptr;
+    hipModule_t   module_        = nullptr;
+    hipFunction_t kernel_        = nullptr;
+    hipFunction_t gridKernel_    = nullptr;
+    hipFunction_t mipGridKernel_ = nullptr;
 };
 
 std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path )
@@ -252,7 +255,7 @@ void test( const fs::path& executableDir )
     std::cout << "Saved: " << fs::absolute( outputPath ) << '\n';
 }
 
-void test2( const fs::path& executableDir )
+void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool renderMipmaps )
 {
     using namespace hip_demand::vmm;
 
@@ -263,8 +266,7 @@ void test2( const fs::path& executableDir )
     constexpr uint32_t maxPasses    = 128;
 
     const fs::path inputDirectory = fs::path{ TEST_IMAGES_DIR } / "png";
-    const fs::path outputPath{ "new_texture_tiled_loading_test2_output.png" };
-    const fs::path kernelPath = executableDir / "new_texture_tiled_loading_kernel.co";
+    const fs::path kernelPath     = executableDir / "new_texture_tiled_loading_kernel.co";
 
     if( !fs::is_directory( inputDirectory ) )
         throw std::runtime_error( "Image directory not found: " + inputDirectory.string() );
@@ -297,14 +299,15 @@ void test2( const fs::path& executableDir )
     module.load( kernelPath );
 
     Options options{};
-    options.maxRequests = 4096;
+    options.maxPhysicalPages = renderMipmaps ? 4096 : 1024;
+    options.maxRequests      = 4096;
     std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
 
     TextureDescriptor descriptor{};
     descriptor.addressMode[0]   = hipAddressModeClamp;
     descriptor.addressMode[1]   = hipAddressModeClamp;
     descriptor.filterMode       = hipFilterModeLinear;
-    descriptor.mipmapFilterMode = hipFilterModeLinear;
+    descriptor.mipmapFilterMode = renderMipmaps ? hipFilterModePoint : hipFilterModeLinear;
     descriptor.normalizedCoords = true;
 
     for( const fs::path& imagePath : imagePaths )
@@ -339,8 +342,9 @@ void test2( const fs::path& executableDir )
         void* arguments[] = { &mutableContext, &deviceOutput, &outputWidth, &outputHeight,
                               &textureCount,    &columnCount,  &rowCount };
 
-        HIP_CHECK( hipModuleLaunchKernel( module.gridKernel(), gridWidth, gridHeight, 1, blockWidth, blockHeight, 1,
-                                          0, stream, arguments, nullptr ) );
+        const hipFunction_t kernel = renderMipmaps ? module.mipGridKernel() : module.gridKernel();
+        HIP_CHECK( hipModuleLaunchKernel( kernel, gridWidth, gridHeight, 1, blockWidth, blockHeight, 1, 0, stream,
+                                          arguments, nullptr ) );
     };
 
     DeviceContext context{};
@@ -379,15 +383,28 @@ void test2( const fs::path& executableDir )
     HIP_WARN( hipFree( deviceOutput ) );
     HIP_WARN( hipStreamDestroy( stream ) );
 
-    std::cout << "Saved 4K texture grid: " << fs::absolute( outputPath ) << '\n';
+    std::cout << "Saved 4K " << ( renderMipmaps ? "texture + mipmap" : "texture" )
+              << " grid: " << fs::absolute( outputPath ) << '\n';
 }
 
-int main( int, char** argv )
+void test2( const fs::path& executableDir )
+{
+    renderGrid( executableDir, "new_texture_tiled_loading_test2_output.png", false );
+}
+
+void test3( const fs::path& executableDir )
+{
+    renderGrid( executableDir, "new_texture_tiled_loading_test3_output.png", true );
+}
+
+int main( int argc, char** argv )
 {
     try
     {
         const fs::path executableDir = fs::absolute( fs::path{ argv[0] } ).parent_path();
-        test2( executableDir );
+        //test( executableDir );
+        //test2( executableDir );
+        test3( executableDir );
         return 0;
     }
     catch( const std::exception& error )
