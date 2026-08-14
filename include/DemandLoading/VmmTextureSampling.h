@@ -251,13 +251,9 @@ HIP_DEMAND_INLINE Sample decodeTexel( const uint8_t* texel, hipArray_Format form
 
 template <class Sample>
 HIP_DEMAND_INLINE Sample
-fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, int x, int y, bool& resident )
+fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, const DeviceMipLevel& mip, int x, int y, bool& resident )
 {
     resident = false;
-    if( mipLevel >= texture.mipCount || mipLevel >= MAX_TEXTURE_MIP_LEVELS )
-        return Sample{};
-
-    const auto& mip   = texture.mips[mipLevel];
     bool        valid = true;
 
     x = applyAddressMode( x, static_cast<int>( mip.width ), texture.addressMode[0], valid );
@@ -269,12 +265,24 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint
         return Sample{};
     }
 
-    const uint32_t tileX = static_cast<uint32_t>( x ) / texture.tileWidth;
-    const uint32_t tileY = static_cast<uint32_t>( y ) / texture.tileHeight;
-    if( tileX >= mip.tilesX || tileY >= mip.tilesY )
-        return Sample{};
+    uint32_t pageId         = INVALID_PAGE;
+    size_t   pageByteOffset = 0;
+    if( mip.mipTail )
+    {
+        pageId = texture.mipTailPage;
+        pageByteOffset =
+            mip.mipTailOffset + ( static_cast<size_t>( y ) * mip.width + static_cast<size_t>( x ) ) * texture.bytesPerTexel;
+    }
+    else
+    {
+        const uint32_t tileX = static_cast<uint32_t>( x ) / texture.tileWidth;
+        const uint32_t tileY = static_cast<uint32_t>( y ) / texture.tileHeight;
+        pageId              = mip.startPage + tileY * mip.tilesX + tileX;
+        const size_t localX = static_cast<size_t>( x ) % texture.tileWidth;
+        const size_t localY = static_cast<size_t>( y ) % texture.tileHeight;
+        pageByteOffset      = ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+    }
 
-    const uint32_t pageId     = mip.startPage + tileY * mip.tilesX + tileX;
     const uint32_t resourceId = context.pageTable.getResourceIdByTextureTilePage( pageId );
     if( !isResourceResident( context, resourceId ) )
     {
@@ -282,10 +290,8 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, uint
         return Sample{};
     }
 
-    const size_t localX = static_cast<size_t>( x ) % texture.tileWidth;
-    const size_t localY = static_cast<size_t>( y ) % texture.tileHeight;
-    const size_t byteOffset = pageId * context.pageTable.pageSize + ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
-    resident = true;
+    const size_t byteOffset = static_cast<size_t>( pageId ) * context.pageTable.pageSize + pageByteOffset;
+    resident                = true;
     return decodeTexel<Sample>( context.pageMemory.ptr + byteOffset, texture.format, texture.numChannels );
 }
 
@@ -294,18 +300,18 @@ HIP_DEMAND_INLINE Sample
 sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, float x, float y, bool& isResident )
 {
     isResident = false;
-
+    const DeviceMipLevel mip = texture.getMipLevel( mipLevel );
     if( texture.normalizedCoords )
     {
-        x = x * static_cast<float>( texture.mips[mipLevel].width );
-        y = y * static_cast<float>( texture.mips[mipLevel].height );
+        x = x * static_cast<float>( mip.width );
+        y = y * static_cast<float>( mip.height );
     }
 
     if( texture.filterMode == hipFilterModePoint )
     {
         x = std::floorf( x );
         y = std::floorf( y );
-        return fetchTexel<Sample>( context, texture, mipLevel, static_cast<int>( x ), static_cast<int>( y ), isResident );
+        return fetchTexel<Sample>( context, texture, mip, static_cast<int>( x ), static_cast<int>( y ), isResident );
     }
 
     x = x - 0.5f;
@@ -321,10 +327,10 @@ sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, 
     bool resident01 = false;
     bool resident11 = false;
 
-    const Sample t00 = fetchTexel<Sample>( context, texture, mipLevel, x0, y0, resident00 );
-    const Sample t10 = fetchTexel<Sample>( context, texture, mipLevel, x0 + 1, y0, resident10 );
-    const Sample t01 = fetchTexel<Sample>( context, texture, mipLevel, x0, y0 + 1, resident01 );
-    const Sample t11 = fetchTexel<Sample>( context, texture, mipLevel, x0 + 1, y0 + 1, resident11 );
+    const Sample t00 = fetchTexel<Sample>( context, texture, mip, x0, y0, resident00 );
+    const Sample t10 = fetchTexel<Sample>( context, texture, mip, x0 + 1, y0, resident10 );
+    const Sample t01 = fetchTexel<Sample>( context, texture, mip, x0, y0 + 1, resident01 );
+    const Sample t11 = fetchTexel<Sample>( context, texture, mip, x0 + 1, y0 + 1, resident11 );
 
     isResident = resident00 && resident10 && resident01 && resident11;
     return ( 1.0f - a ) * ( 1.0f - b ) * t00 + a * ( 1.0f - b ) * t10 + ( 1.0f - a ) * b * t01 + a * b * t11;
@@ -396,7 +402,7 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
     const DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
     if( texture.normalizedCoords )
     {
-        const DeviceMipLevel& baseMip = texture.mips[0];
+        const DeviceMipLevel baseMip = texture.getMipLevel(0);
         ddx.x *= static_cast<float>( baseMip.width );
         ddx.y *= static_cast<float>( baseMip.height );
         ddy.x *= static_cast<float>( baseMip.width );

@@ -62,32 +62,55 @@ constexpr uint32_t MAX_TEXTURE_MIP_LEVELS = 15;
 
 struct DeviceMipLevel
 {
-    uint32_t width     = 0;
-    uint32_t height    = 0;
-    uint32_t tilesX    = 0;
-    uint32_t tilesY    = 0;
-    uint32_t startPage = INVALID_PAGE;
+    uint32_t width         = 0;
+    uint32_t height        = 0;
+    uint32_t tilesX        = 0;
+    uint32_t tilesY        = 0;
+    uint32_t startPage     = INVALID_PAGE;
+    uint32_t mipTailOffset = 0;
+    bool     mipTail       = false;
 
     HIP_DEMAND_INLINE uint32_t pageCount() const { return tilesX * tilesY; }
 };
 
 struct DeviceTextureInfo
 {
-    uint32_t       textureId        = INVALID_TEXTURE;
-    uint32_t       width            = 0;
-    uint32_t       height           = 0;
-    uint32_t       tileWidth        = 0;
-    uint32_t       tileHeight       = 0;
-    uint32_t       addressMode[2]   = { hipAddressModeWrap, hipAddressModeWrap };
-    uint32_t       filterMode       = hipFilterModeLinear;
-    uint32_t       mipmapFilterMode = hipFilterModeLinear;
-    uint32_t       normalizedCoords = 1;
-    hipArray_Format format          = HIP_AD_FORMAT_UNSIGNED_INT8;
-    uint32_t       numChannels      = 4;
-    uint32_t       bytesPerTexel    = 4;
-    uint32_t       startPage        = INVALID_PAGE;
-    uint32_t       mipCount         = 0;
-    DeviceMipLevel mips[MAX_TEXTURE_MIP_LEVELS]{};
+    uint32_t        textureId        = INVALID_TEXTURE;
+    uint32_t        width            = 0;
+    uint32_t        height           = 0;
+    uint32_t        tileWidth        = 0;
+    uint32_t        tileHeight       = 0;
+    uint32_t        addressMode[2]   = { hipAddressModeWrap, hipAddressModeWrap };
+    uint32_t        filterMode       = hipFilterModeLinear;
+    uint32_t        mipmapFilterMode = hipFilterModeLinear;
+    uint32_t        normalizedCoords = 1;
+    hipArray_Format format           = HIP_AD_FORMAT_UNSIGNED_INT8;
+    uint32_t        numChannels      = 4;
+    uint32_t        bytesPerTexel    = 4;
+    uint32_t        startPage        = INVALID_PAGE;
+
+    uint32_t mipCount          = 0;
+    uint32_t mipTailFirstLevel = MAX_TEXTURE_MIP_LEVELS;
+    uint32_t mipTailPage       = INVALID_PAGE;
+    uint32_t mipTailSize       = 0;
+    struct
+    {
+        uint32_t startPage = INVALID_PAGE;
+        uint32_t mipTailOffset = 0;  // Byte offset within the 64 KiB mip-tail page; uint32_t keeps each mip descriptor compact.
+    } mips[MAX_TEXTURE_MIP_LEVELS]{};
+
+    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level ) const
+    {
+        DeviceMipLevel mip{};
+        mip.startPage     = mips[level].startPage;
+        mip.mipTailOffset = mips[level].mipTailOffset;
+        mip.width         = std::max( width >> level, 1u);
+        mip.height        = std::max( height >> level, 1u );
+        mip.tilesX        = mip.width / tileWidth + static_cast<uint32_t>( mip.width % tileWidth != 0 );
+        mip.tilesY        = mip.height / tileHeight + static_cast<uint32_t>( mip.height % tileHeight != 0 );
+        mip.mipTail       = level >= mipTailFirstLevel;
+        return mip;
+    }
 };
 
 struct PageTable

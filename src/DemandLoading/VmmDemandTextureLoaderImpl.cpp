@@ -15,11 +15,11 @@ using internal::memcpyDtoHAsync;
 using internal::memcpyHtoDAsync;
 using internal::memset;
 using internal::memsetAsync;
-using internal::mipDimension;
+using internal::mipDimensions;
 using internal::NonCopyble;
 using internal::safeAdd;
-using internal::tileShapeForGranularity;
 using internal::sizeInBytes;
+using internal::tileShapeForGranularity;
 
 class HipGC : NonCopyble
 {
@@ -73,10 +73,17 @@ struct ResourceTile
     uint32_t pageId    = 0;
 };
 
+struct ResourceMipTail
+{
+    uint32_t textureId = 0;
+    uint32_t pageId    = 0;
+};
+
 enum class ResourceType
 {
     TextureInfo,
-    TextureTile
+    TextureTile,
+    MipTail
 };
 
 struct Resource
@@ -88,7 +95,8 @@ struct Resource
         {
             uint32_t textureId;
         } textureInfo;
-        ResourceTile tile;
+        ResourceTile    tile;
+        ResourceMipTail mipTail;
     };
 
     static Resource TextureInfo( uint32_t textureId )
@@ -108,6 +116,15 @@ struct Resource
         resource.tile.tileX     = tileX;
         resource.tile.tileY     = tileY;
         resource.tile.pageId    = pageId;
+        return resource;
+    }
+
+    static Resource MipTail( uint32_t pageId, uint32_t textureId )
+    {
+        Resource resource{};
+        resource.type              = ResourceType::MipTail;
+        resource.mipTail.textureId = textureId;
+        resource.mipTail.pageId    = pageId;
         return resource;
     }
 
@@ -351,6 +368,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     Resource decode( uint32_t resourceId );
     void     processTextureInfo( uint32_t textureId, hipStream_t stream, const DeviceContext& deviceContext );
     void     processTextureTile( const ResourceTile& tile, hipStream_t stream, const DeviceContext& deviceContext );
+    void     processMipTail( const ResourceMipTail& mipTail, hipStream_t stream, const DeviceContext& deviceContext );
 
     mutable std::mutex    mutex_;
     Options               options_{};
@@ -493,6 +511,10 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
                 processTextureTile( resource.tile, stream, deviceContext );
                 break;
             }
+            case ResourceType::MipTail: {
+                processMipTail( resource.mipTail, stream, deviceContext );
+                break;
+            }
             default: {
                 throw std::logic_error( "Unhandled resource type: " + std::to_string( static_cast<uint32_t>( resource.type ) ) );
             }
@@ -508,10 +530,47 @@ void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_
     DemandTextureImpl& texture = *textures_.at( textureId );
     TextureInfo        hostInfo{};
     texture.image->open( &hostInfo );
+    hostInfo.numMipLevels = std::min( hostInfo.numMipLevels, MAX_TEXTURE_MIP_LEVELS );
     assert( hostInfo.isValid );
 
     const uint32_t bytesPerTexel = pixelSize( hostInfo.format, hostInfo.numChannels );
     const uint2    tileShape     = tileShapeForGranularity( pageSystem_.granularity(), bytesPerTexel );
+
+    // TODO_BS: handle images with width = 0, height = 0, mips = 0
+    if( hostInfo.width == 0 )
+        throw std::runtime_error( "Unsupported width: 0" );
+    if( hostInfo.height == 0 )
+        throw std::runtime_error( "Unsupported height: 0" );
+    if( hostInfo.numMipLevels == 0 )
+        throw std::runtime_error( "Unsupported mip count: " + std::to_string( hostInfo.numMipLevels ) );
+
+
+    std::array<size_t, MAX_TEXTURE_MIP_LEVELS> mipTailOffsets{};
+
+    uint32_t mipTailFirstLevel = hostInfo.numMipLevels;
+    size_t   tailBytes         = 0;
+    for( uint32_t mipLevel = hostInfo.numMipLevels; mipLevel-- > 0; )
+    {
+        const uint2  dimensions = mipDimensions( make_uint2( hostInfo.width, hostInfo.height ), mipLevel );
+        const size_t levelBytes = dimensions.x * dimensions.y * bytesPerTexel;
+
+        if( levelBytes > pageSystem_.pageBytes() - tailBytes )
+            break;
+
+        tailBytes += levelBytes;
+        mipTailFirstLevel = mipLevel;
+    }
+
+    size_t mipTailOffset = 0;
+    for( uint32_t mipLevel = mipTailFirstLevel; mipLevel < hostInfo.numMipLevels; ++mipLevel )
+    {
+        const uint2  dimensions = mipDimensions( make_uint2( hostInfo.width, hostInfo.height ), mipLevel );
+        const size_t levelBytes = dimensions.x * dimensions.y * bytesPerTexel;
+
+        mipTailOffsets[mipLevel] = mipTailOffset;
+        mipTailOffset += levelBytes;
+    }
+    size_t mipTailSize = mipTailOffset;
 
     DevicePtr<DeviceTextureInfo> dstInfo = textureInfoAllocator_.alloc();
     DeviceTextureInfo            deviceInfo{};
@@ -529,19 +588,31 @@ void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_
     deviceInfo.width            = hostInfo.width;
     deviceInfo.height           = hostInfo.height;
     deviceInfo.startPage        = pageTable_.textureTiles.nextAvailablePage;
-    deviceInfo.mipCount         = hostInfo.numMipLevels;
+
+    deviceInfo.mipCount          = hostInfo.numMipLevels;
+    deviceInfo.mipTailFirstLevel = mipTailFirstLevel;
+    deviceInfo.mipTailSize       = static_cast<uint32_t>( mipTailSize );
 
     uint32_t pageCount = 0;
-    for( uint32_t mip = 0; mip < deviceInfo.mipCount; ++mip )
+    for( uint32_t mip = 0; mip < deviceInfo.mipTailFirstLevel; ++mip )
     {
         auto& level     = deviceInfo.mips[mip];
-        level.width     = mipDimension( deviceInfo.width, mip );
-        level.height    = mipDimension( deviceInfo.height, mip );
-        level.tilesX    = ceilDiv( level.width, deviceInfo.tileWidth );
-        level.tilesY    = ceilDiv( level.height, deviceInfo.tileHeight );
         level.startPage = pageTable_.textureTiles.nextAvailablePage + pageCount;
+        // we can call getMipLevel after we init deviceInfo.mips[mip]
+        pageCount += deviceInfo.getMipLevel( mip ).pageCount();
+    }
 
-        pageCount += level.pageCount();
+    if( deviceInfo.mipTailFirstLevel < deviceInfo.mipCount )
+    {
+        deviceInfo.mipTailPage = pageTable_.textureTiles.nextAvailablePage + pageCount;
+        pageCount++;
+
+        for( uint32_t mip = deviceInfo.mipTailFirstLevel; mip < deviceInfo.mipCount; ++mip )
+        {
+            auto& level         = deviceInfo.mips[mip];
+            level.startPage     = deviceInfo.mipTailPage;
+            level.mipTailOffset = static_cast<uint32_t>( mipTailOffsets[mip] );
+        }
     }
 
     // TODO_BS: how to handle it?
@@ -560,21 +631,51 @@ void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_
 
 void DemandTextureLoaderImpl::processTextureTile( const ResourceTile& tile, hipStream_t stream, const DeviceContext& deviceContext )
 {
+    const DemandTextureImpl& texture = *textures_.at( tile.textureId );
+    const DeviceTextureInfo& info    = loadedTextureInfos_.at( texture.loadedTextureInfoId );
+
     if( !pageSystem_.mapped( tile.pageId ) )
         pageSystem_.map( tile.pageId );
 
-    const DemandTextureImpl& texture = *textures_.at( tile.textureId );
-    const DeviceTextureInfo& info    = loadedTextureInfos_.at( texture.loadedTextureInfoId );
-    
     Tile t{};
     t.x      = tile.tileX;
     t.y      = tile.tileY;
     t.width  = info.tileWidth;
     t.height = info.tileHeight;
     assert( static_cast<size_t>( t.width ) * t.height * info.bytesPerTexel <= sizeInBytes( tmpPageBuffer_ ) );
-    assert( texture.image->readTile( reinterpret_cast<char*>( tmpPageBuffer_.data() ), tile.mipLevel, t, stream ) );
+    if( !texture.image->readTile( reinterpret_cast<char*>( tmpPageBuffer_.data() ), tile.mipLevel, t, stream ) )
+    {
+        throw std::runtime_error( "Failed to read texture tile for texture " + std::to_string( tile.textureId )
+                                  + ", mip " + std::to_string( tile.mipLevel ) + ", tile ("
+                                  + std::to_string( tile.tileX ) + ", " + std::to_string( tile.tileY ) + ")" );
+    }
 
     memcpyHtoDAsync( pageSystem_.page( tile.pageId ), tmpPageBuffer_, stream );
+    HIP_CHECK( hipStreamSynchronize( stream ) );
+}
+
+void DemandTextureLoaderImpl::processMipTail( const ResourceMipTail& mipTail, hipStream_t stream, const DeviceContext& deviceContext )
+{
+    const DemandTextureImpl& texture = *textures_.at( mipTail.textureId );
+    const DeviceTextureInfo& info    = loadedTextureInfos_.at( texture.loadedTextureInfoId );
+    assert( info.mipTailFirstLevel < info.mipCount );
+
+    if( !pageSystem_.mapped( mipTail.pageId ) )
+        pageSystem_.map( mipTail.pageId );
+
+    std::fill( tmpPageBuffer_.begin(), tmpPageBuffer_.end(), 0 );
+    for( uint32_t mipLevel = info.mipTailFirstLevel; mipLevel < info.mipCount; ++mipLevel )
+    {
+        const DeviceMipLevel mip = info.getMipLevel( mipLevel );
+        char*                dst = reinterpret_cast<char*>( tmpPageBuffer_.data() + mip.mipTailOffset );
+        if( !texture.image->readMipLevel( dst, mipLevel, mip.width, mip.height, stream ) )
+        {
+            throw std::runtime_error( "Failed to read mip tail level " + std::to_string( mipLevel ) + " for texture "
+                                      + std::to_string( mipTail.textureId ) );
+        }
+    }
+
+    memcpyHtoDAsync( pageSystem_.page( mipTail.pageId ), tmpPageBuffer_, stream );
     HIP_CHECK( hipStreamSynchronize( stream ) );
 }
 
@@ -598,9 +699,12 @@ Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
         const auto infoIt = std::prev( it );
 
         const DeviceTextureInfo& info = *infoIt;
-        for( uint32_t mipLevel = 0; mipLevel < info.mipCount; ++mipLevel )
+        if( pageId == info.mipTailPage )
+            return Resource::MipTail( pageId, info.textureId );
+
+        for( uint32_t mipLevel = 0; mipLevel < info.mipTailFirstLevel; ++mipLevel )
         {
-            const DeviceMipLevel& level = info.mips[mipLevel];
+            const DeviceMipLevel level = info.getMipLevel( mipLevel );
             if( level.startPage <= pageId && pageId < level.startPage + level.pageCount() )
             {
                 const uint32_t pageInLevel = pageId - level.startPage;

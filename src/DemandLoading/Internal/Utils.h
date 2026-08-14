@@ -152,8 +152,12 @@ inline uint2 tileShapeForGranularity( size_t granularity, uint32_t bytesPerTexel
 
 inline uint32_t mipDimension( uint32_t baseDimension, uint32_t mipLevel )
 {
-    const uint32_t dimension = baseDimension >> mipLevel;
-    return dimension == 0 ? 1u : dimension;
+    return std::max( baseDimension >> mipLevel, 1u );
+}
+
+inline uint2 mipDimensions( uint2 dimensions, uint32_t mipLevel )
+{
+    return make_uint2( mipDimension( dimensions.x, mipLevel ), mipDimension( dimensions.y, mipLevel ) );
 }
 
 template <typename T>
