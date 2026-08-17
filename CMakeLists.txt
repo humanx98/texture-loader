@@ -75,7 +75,6 @@ set(TEXTURE_LOADER_HEADERS
     src/DemandLoading/Internal/Utils.h
     src/DemandLoading/vmm/Allocator.h
     src/DemandLoading/vmm/PageSystem.h
-    src/DemandLoading/vmm/Resource.h
     src/DemandLoading/DemandTextureLoaderImpl.h
 )
 

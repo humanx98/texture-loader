@@ -2,7 +2,6 @@
 #include "../Internal/Utils.h"
 #include "Allocator.h"
 #include "PageSystem.h"
-#include "Resource.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <ImageSource/TextureInfo.h>
 #include <algorithm>
@@ -55,6 +54,41 @@ class HipGC : NonCopyble
     std::vector<hipDeviceptr_t> allocations_;
 };
 
+struct Resource
+{
+    enum class Type
+    {
+        TextureId,
+        Tile,
+        MipTail
+    };
+
+    struct Tile
+    {
+        uint32_t textureId = 0;
+        uint32_t mipLevel  = 0;
+        uint32_t tileX     = 0;
+        uint32_t tileY     = 0;
+        uint32_t pageId    = 0;
+    };
+
+    struct MipTail
+    {
+        uint32_t textureId = 0;
+        uint32_t pageId    = 0;
+    };
+
+    Type type;
+    union
+    {
+        uint32_t textureId;
+        Tile     tile;
+        MipTail  mipTail;
+    };
+
+    Resource() {}
+};
+
 class DemandTextureImpl : public DemandTexture, NonCopyble
 {
   public:
@@ -86,8 +120,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     void     initPageTable( uint32_t& resourceCount );
     Resource decode( uint32_t resourceId );
     void     processTextureInfo( uint32_t textureId, hipStream_t stream, const DeviceContext& deviceContext );
-    void     processTextureTile( const ResourceTile& tile, hipStream_t stream, const DeviceContext& deviceContext );
-    void     processMipTail( const ResourceMipTail& mipTail, hipStream_t stream, const DeviceContext& deviceContext );
+    void     processTile( const Resource::Tile& tile, hipStream_t stream, const DeviceContext& deviceContext );
+    void     processMipTail( const Resource::MipTail& mipTail, hipStream_t stream, const DeviceContext& deviceContext );
 
     mutable std::mutex    mutex_;
     Options               options_{};
@@ -222,15 +256,15 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
         const Resource resource = decode( resourceId );
         switch( resource.type )
         {
-            case ResourceType::TextureInfo: {
-                processTextureInfo( resource.textureInfo.textureId, stream, deviceContext );
+            case Resource::Type::TextureId: {
+                processTextureInfo( resource.textureId, stream, deviceContext );
                 break;
             }
-            case ResourceType::TextureTile: {
-                processTextureTile( resource.tile, stream, deviceContext );
+            case Resource::Type::Tile: {
+                processTile( resource.tile, stream, deviceContext );
                 break;
             }
-            case ResourceType::MipTail: {
+            case Resource::Type::MipTail: {
                 processMipTail( resource.mipTail, stream, deviceContext );
                 break;
             }
@@ -350,7 +384,7 @@ void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_
     HIP_CHECK( hipStreamSynchronize( stream ) );
 }
 
-void DemandTextureLoaderImpl::processTextureTile( const ResourceTile& tile, hipStream_t stream, const DeviceContext& deviceContext )
+void DemandTextureLoaderImpl::processTile( const Resource::Tile& tile, hipStream_t stream, const DeviceContext& deviceContext )
 {
     const DemandTextureImpl& texture = *textures_.at( tile.textureId );
     const DeviceTextureInfo& info    = loadedTextureInfos_.at( texture.loadedTextureInfoId );
@@ -375,7 +409,7 @@ void DemandTextureLoaderImpl::processTextureTile( const ResourceTile& tile, hipS
     HIP_CHECK( hipStreamSynchronize( stream ) );
 }
 
-void DemandTextureLoaderImpl::processMipTail( const ResourceMipTail& mipTail, hipStream_t stream, const DeviceContext& deviceContext )
+void DemandTextureLoaderImpl::processMipTail( const Resource::MipTail& mipTail, hipStream_t stream, const DeviceContext& deviceContext )
 {
     const DemandTextureImpl& texture = *textures_.at( mipTail.textureId );
     const DeviceTextureInfo& info    = loadedTextureInfos_.at( texture.loadedTextureInfoId );
@@ -404,7 +438,10 @@ Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
 {
     if( resourceId < options_.maxTextures )
     {
-        return Resource::TextureInfo( pageTable_.getTextureIdByResourceId( resourceId ) );
+        Resource resource{};
+        resource.type      = Resource::Type::TextureId;
+        resource.textureId = pageTable_.getTextureIdByResourceId( resourceId );
+        return resource;
     }
     else
     {
@@ -421,7 +458,13 @@ Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
 
         const DeviceTextureInfo& info = *infoIt;
         if( pageId == info.mipTailPage )
-            return Resource::MipTail( pageId, info.textureId );
+        {
+            Resource resource{};
+            resource.type              = Resource::Type::MipTail;
+            resource.mipTail.textureId = info.textureId;
+            resource.mipTail.pageId    = pageId;
+            return resource;
+        }
 
         for( uint32_t mipLevel = 0; mipLevel < info.mipTailFirstLevel; ++mipLevel )
         {
@@ -431,7 +474,15 @@ Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
                 const uint32_t pageInLevel = pageId - level.startPage;
                 const uint32_t tileX       = pageInLevel % level.tilesX;
                 const uint32_t tileY       = pageInLevel / level.tilesX;
-                return Resource::TextureTile( pageId, info.textureId, mipLevel, tileX, tileY );
+
+                Resource resource{};
+                resource.type           = Resource::Type::Tile;
+                resource.tile.textureId = info.textureId;
+                resource.tile.mipLevel  = mipLevel;
+                resource.tile.tileX     = tileX;
+                resource.tile.tileY     = tileY;
+                resource.tile.pageId    = pageId;
+                return resource;
             }
         }
 
