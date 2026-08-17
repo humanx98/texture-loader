@@ -57,9 +57,10 @@ endif()
 
 # Library
 set(TEXTURE_LOADER_SOURCES
+    src/DemandLoading/vmm/DemandTextureLoaderImpl.cpp
+    src/DemandLoading/vmm/PageSystem.cpp
     src/DemandLoading/DemandTextureLoader.cpp
     src/DemandLoading/DemandTextureLoaderImpl.cpp
-    src/DemandLoading/VmmDemandTextureLoaderImpl.cpp
     src/DemandLoading/Ticket.cpp
     src/DemandLoading/Logging.cpp
     src/DemandLoading/stb_image_impl.cpp
@@ -70,6 +71,12 @@ if(USE_OIIO)
         src/ImageSource/OIIOReader.cpp
     )
 endif()
+
+source_group(
+    TREE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    PREFIX "Source Files"
+    FILES ${TEXTURE_LOADER_SOURCES}
+)
 
 add_library(hip_demand_texture SHARED ${TEXTURE_LOADER_SOURCES})
 

@@ -1,5 +1,8 @@
-#include "Internal/HipCheck.h"
-#include "Internal/Utils.h"
+#include "../Internal/HipCheck.h"
+#include "../Internal/Utils.h"
+#include "Allocator.h"
+#include "PageSystem.h"
+#include "Resource.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <ImageSource/TextureInfo.h>
 #include <algorithm>
@@ -52,290 +55,6 @@ class HipGC : NonCopyble
     std::vector<hipDeviceptr_t> allocations_;
 };
 
-inline uint32_t pixelSize( hipArray_Format format, uint32_t numChannels )
-{
-    if( numChannels == 0 || numChannels > 4 )
-        throw std::invalid_argument( "Texture channel count must be between 1 and 4" );
-
-    const uint32_t bytesPerChannel = getBytesPerChannel( format );
-    if( bytesPerChannel == 0 )
-        throw std::invalid_argument( "Unsupported hipArray_Format" );
-
-    return bytesPerChannel * numChannels;
-}
-
-struct ResourceTile
-{
-    uint32_t textureId = 0;
-    uint32_t mipLevel  = 0;
-    uint32_t tileX     = 0;
-    uint32_t tileY     = 0;
-    uint32_t pageId    = 0;
-};
-
-struct ResourceMipTail
-{
-    uint32_t textureId = 0;
-    uint32_t pageId    = 0;
-};
-
-enum class ResourceType
-{
-    TextureInfo,
-    TextureTile,
-    MipTail
-};
-
-struct Resource
-{
-    ResourceType type;
-    union
-    {
-        struct
-        {
-            uint32_t textureId;
-        } textureInfo;
-        ResourceTile    tile;
-        ResourceMipTail mipTail;
-    };
-
-    static Resource TextureInfo( uint32_t textureId )
-    {
-        Resource resource{};
-        resource.type                  = ResourceType::TextureInfo;
-        resource.textureInfo.textureId = textureId;
-        return resource;
-    }
-
-    static Resource TextureTile( uint32_t pageId, uint32_t textureId, uint32_t mipLevel, uint32_t tileX, uint32_t tileY )
-    {
-        Resource resource{};
-        resource.type           = ResourceType::TextureTile;
-        resource.tile.textureId = textureId;
-        resource.tile.mipLevel  = mipLevel;
-        resource.tile.tileX     = tileX;
-        resource.tile.tileY     = tileY;
-        resource.tile.pageId    = pageId;
-        return resource;
-    }
-
-    static Resource MipTail( uint32_t pageId, uint32_t textureId )
-    {
-        Resource resource{};
-        resource.type              = ResourceType::MipTail;
-        resource.mipTail.textureId = textureId;
-        resource.mipTail.pageId    = pageId;
-        return resource;
-    }
-
-  private:
-    Resource() {}
-};
-
-struct VmmPhysicalPage
-{
-    hipMemGenericAllocationHandle_t handle        = nullptr;
-    uint32_t                        virtualPageId = INVALID_PAGE;
-};
-
-class VmmPageSystem : NonCopyble
-{
-  public:
-    explicit VmmPageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages );
-    ~VmmPageSystem();
-    void                map( uint32_t pageId );
-    void                unmap( uint32_t pageId );
-    bool                mapped( uint32_t pageId ) const { return virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE; }
-    DeviceSpan<uint8_t> page( uint32_t pageId ) const
-    {
-        return DeviceSpan<uint8_t>( virtualAddressSpace_.ptr + pageId * pageBytes_, pageBytes_ );
-    }
-    DeviceSpan<uint8_t> virtualAddressSpace() const { return virtualAddressSpace_; }
-    size_t              granularity() const { return granularity_; }
-    size_t              pageBytes() const { return pageBytes_; }
-
-  private:
-    uint32_t                     maxVirtualPages_  = 0;
-    uint32_t                     maxPhysicalPages_ = 0;
-    int                          device_           = 0;
-    size_t                       granularity_      = 0;
-    size_t                       pageBytes_        = 0;
-    hipMemAllocationProp         allocationProp_{};
-    std::vector<uint32_t>        virtualIdToPhysicalId_{};
-    std::vector<VmmPhysicalPage> physicalPages_{};
-    std::vector<uint32_t>        freePhysicalPages_{};
-    DeviceSpan<uint8_t>          virtualAddressSpace_{};
-};
-
-VmmPageSystem::VmmPageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
-    : maxVirtualPages_( maxVirtualPages )
-    , maxPhysicalPages_( maxPhysicalPages )
-{
-    HIP_CHECK( hipGetDevice( &device_ ) );
-    int vmmSupported = 0;
-    HIP_CHECK( hipDeviceGetAttribute( &vmmSupported, hipDeviceAttributeVirtualMemoryManagementSupported, device_ ) );
-    if( vmmSupported == 0 )
-        throw std::runtime_error( "The active HIP device does not support virtual memory management" );
-
-    allocationProp_.type          = hipMemAllocationTypePinned;
-    allocationProp_.location.type = hipMemLocationTypeDevice;
-    allocationProp_.location.id   = device_;
-    HIP_CHECK( hipMemGetAllocationGranularity( &granularity_, &allocationProp_, hipMemAllocationGranularityMinimum ) );
-    if( granularity_ == 0 )
-        throw std::runtime_error( "hipMemAllocationGranularityMinimum is zero" );
-
-    pageBytes_               = granularity_;
-    virtualAddressSpace_.len = maxVirtualPages_ * pageBytes_;
-    HIP_CHECK( hipMemAddressReserve( reinterpret_cast<void**>( &virtualAddressSpace_.ptr ), virtualAddressSpace_.len,
-                                     granularity_, nullptr, 0 ) );
-
-    virtualIdToPhysicalId_.assign( maxVirtualPages_, INVALID_PAGE );
-}
-
-VmmPageSystem::~VmmPageSystem()
-{
-    for( VmmPhysicalPage& physicalPage : physicalPages_ )
-    {
-        if( physicalPage.virtualPageId != INVALID_PAGE )
-        {
-            DeviceSpan<uint8_t> virtualPage = page( physicalPage.virtualPageId );
-            HIP_WARN( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
-        }
-
-        HIP_WARN( hipMemRelease( physicalPage.handle ) );
-    }
-
-    if( virtualAddressSpace_.ptr )
-        HIP_WARN( hipMemAddressFree( virtualAddressSpace_.ptr, virtualAddressSpace_.len ) );
-}
-
-void VmmPageSystem::map( uint32_t pageId )
-{
-    if( mapped( pageId ) )
-        return;
-
-    uint32_t physicalPageId = INVALID_PAGE;
-    if( freePhysicalPages_.empty() )
-    {
-        // TODO_BS: handle max physical pages
-        if( physicalPages_.size() >= maxPhysicalPages_ )
-            throw std::runtime_error( "Maximum demand physical page count exceeded" );
-
-        physicalPageId                         = static_cast<uint32_t>( physicalPages_.size() );
-        hipMemGenericAllocationHandle_t handle = nullptr;
-        HIP_CHECK( hipMemCreate( &handle, pageBytes_, &allocationProp_, 0 ) );
-        physicalPages_.push_back( VmmPhysicalPage{ handle, INVALID_PAGE } );
-    }
-    else
-    {
-        physicalPageId = freePhysicalPages_.back();
-        freePhysicalPages_.pop_back();
-    }
-
-    VmmPhysicalPage&    physicalPage = physicalPages_.at( physicalPageId );
-    DeviceSpan<uint8_t> virtualPage  = page( pageId );
-    HIP_CHECK( hipMemMap( virtualPage.ptr, virtualPage.len, 0, physicalPage.handle, 0 ) );
-
-    hipMemAccessDesc access{};
-    access.location.type = hipMemLocationTypeDevice;
-    access.location.id   = device_;
-    access.flags         = hipMemAccessFlagsProtReadWrite;
-    HIP_CHECK( hipMemSetAccess( virtualPage.ptr, virtualPage.len, &access, 1 ) );
-
-    virtualIdToPhysicalId_.at( pageId ) = physicalPageId;
-    physicalPage.virtualPageId          = pageId;
-}
-
-void VmmPageSystem::unmap( uint32_t pageId )
-{
-    if( !mapped( pageId ) )
-        return;
-
-    const uint32_t            physicalPageId = virtualIdToPhysicalId_.at( pageId );
-    const DeviceSpan<uint8_t> virtualPage    = page( pageId );
-    HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
-    virtualIdToPhysicalId_.at( pageId )               = INVALID_PAGE;
-    physicalPages_.at( physicalPageId ).virtualPageId = INVALID_PAGE;
-    freePhysicalPages_.push_back( physicalPageId );
-}
-
-template <typename T>
-class VmmAllocator : NonCopyble
-{
-  public:
-    explicit VmmAllocator( VmmPageSystem& pageSystem );
-
-    DevicePtr<T> alloc() { return reinterpret_cast<DevicePtr<T>>( alloc( sizeof( T ) ) ); }
-
-    void setRange( const PageTable::Range& pageRange )
-    {
-        pageRange_          = pageRange;
-        availablePageBytes_ = pageSystem_.pageBytes();
-    }
-
-  private:
-    hipDeviceptr_t alloc( size_t size );
-
-    VmmPageSystem&   pageSystem_;
-    PageTable::Range pageRange_{};
-    size_t           availablePageBytes_ = 0;
-};
-
-template <typename T>
-VmmAllocator<T>::VmmAllocator( VmmPageSystem& pageSystem )
-    : pageSystem_( pageSystem )
-{
-}
-
-template <typename T>
-hipDeviceptr_t VmmAllocator<T>::alloc( size_t size )
-{
-    assert( size > 0 );
-
-    if( pageRange_.nextAvailablePage < pageRange_.startPage )
-        throw std::logic_error( "VmmAllocator page range has an invalid next available page" );
-
-    const uint32_t usedPages = pageRange_.nextAvailablePage - pageRange_.startPage;
-    if( usedPages >= pageRange_.pageCount )
-        throw std::bad_alloc{};
-
-    const size_t   pageBytes      = pageSystem_.pageBytes();
-    const uint32_t remainingPages = pageRange_.pageCount - usedPages;
-
-    size_t bytesAfterCurrentPage = 0;
-    size_t additionalPages       = 0;
-    if( size > availablePageBytes_ )
-    {
-        bytesAfterCurrentPage = size - availablePageBytes_;
-        additionalPages       = 1 + ( bytesAfterCurrentPage - 1 ) / pageBytes;
-    }
-
-    if( additionalPages > remainingPages - 1 )
-        throw std::bad_alloc{};
-
-    for( size_t pageOffset = 0; pageOffset < additionalPages + 1; ++pageOffset )
-    {
-        const uint32_t page = static_cast<uint32_t>( pageRange_.nextAvailablePage + pageOffset );
-        if( !pageSystem_.mapped( page ) )
-            pageSystem_.map( page );
-    }
-
-    hipDeviceptr_t result = pageSystem_.page( pageRange_.nextAvailablePage ).ptr + pageBytes - availablePageBytes_;
-
-    if( size < availablePageBytes_ )
-    {
-        availablePageBytes_ -= size;
-    }
-    else
-    {
-        const uint32_t pagesAdvanced = static_cast<uint32_t>( 1 + bytesAfterCurrentPage / pageBytes );
-        pageRange_.nextAvailablePage += pagesAdvanced;
-        availablePageBytes_ = pageBytes - ( bytesAfterCurrentPage % pageBytes );
-    }
-
-    return result;
-}
-
 class DemandTextureImpl : public DemandTexture, NonCopyble
 {
   public:
@@ -376,7 +95,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     Bitset                residentBits_{};
     std::vector<uint32_t> requestedResources_{};
     std::vector<uint8_t>  tmpPageBuffer_{};
-    VmmPageSystem         pageSystem_;
+    PageSystem            pageSystem_;
     PageTable             pageTable_{};
 
     std::array<uint32_t, static_cast<size_t>( CounterIndex::NumCounters )> counters_{};
@@ -384,8 +103,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
     // note that this list should be accessed by texture.loadedTextureInfoId
     // and it's ordered by startPage in order to use std::upper_bound
-    std::vector<DeviceTextureInfo>  loadedTextureInfos_{};
-    VmmAllocator<DeviceTextureInfo> textureInfoAllocator_;
+    std::vector<DeviceTextureInfo> loadedTextureInfos_{};
+    Allocator<DeviceTextureInfo>   textureInfoAllocator_;
 
     HipGC         hipGC_{};
     DeviceContext deviceContext_{};
@@ -533,10 +252,10 @@ void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_
     hostInfo.numMipLevels = std::min( hostInfo.numMipLevels, MAX_TEXTURE_MIP_LEVELS );
     assert( hostInfo.isValid );
 
-    const uint32_t bytesPerTexel = pixelSize( hostInfo.format, hostInfo.numChannels );
-    const uint2    tileShape     = tileShapeForGranularity( pageSystem_.granularity(), bytesPerTexel );
-
-    // TODO_BS: handle images with width = 0, height = 0, mips = 0
+    const uint32_t bytesPerChannel = getBytesPerChannel( hostInfo.format );
+    // TODO_BS: handle images with width = 0, height = 0, mips = 0, unsupported format
+    if( bytesPerChannel == 0 )
+        throw std::invalid_argument( "Unsupported hipArray_Format" );
     if( hostInfo.width == 0 )
         throw std::runtime_error( "Unsupported width: 0" );
     if( hostInfo.height == 0 )
@@ -544,6 +263,8 @@ void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_
     if( hostInfo.numMipLevels == 0 )
         throw std::runtime_error( "Unsupported mip count: " + std::to_string( hostInfo.numMipLevels ) );
 
+    const uint32_t bytesPerTexel = bytesPerChannel * hostInfo.numChannels;
+    const uint2    tileShape     = tileShapeForGranularity( pageSystem_.granularity(), bytesPerTexel );
 
     std::array<size_t, MAX_TEXTURE_MIP_LEVELS> mipTailOffsets{};
 

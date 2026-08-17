@@ -11,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <vector>
+#include <stdexcept>
 
 namespace hip_demand {
 namespace internal {
