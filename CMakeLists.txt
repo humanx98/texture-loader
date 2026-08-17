@@ -66,6 +66,19 @@ set(TEXTURE_LOADER_SOURCES
     src/DemandLoading/stb_image_impl.cpp
 )
 
+set(TEXTURE_LOADER_HEADERS
+    src/DemandLoading/Internal/HipCheck.h
+    src/DemandLoading/Internal/HipEventPool.h
+    src/DemandLoading/Internal/PinnedMemoryPool.h
+    src/DemandLoading/Internal/TextureMetadata.h
+    src/DemandLoading/Internal/ThreadPool.h
+    src/DemandLoading/Internal/Utils.h
+    src/DemandLoading/vmm/Allocator.h
+    src/DemandLoading/vmm/PageSystem.h
+    src/DemandLoading/vmm/Resource.h
+    src/DemandLoading/DemandTextureLoaderImpl.h
+)
+
 if(USE_OIIO)
     list(APPEND TEXTURE_LOADER_SOURCES
         src/ImageSource/OIIOReader.cpp
@@ -75,10 +88,15 @@ endif()
 source_group(
     TREE "${CMAKE_CURRENT_SOURCE_DIR}/src"
     PREFIX "Source Files"
-    FILES ${TEXTURE_LOADER_SOURCES}
+    FILES
+        ${TEXTURE_LOADER_SOURCES}
+        ${TEXTURE_LOADER_HEADERS}
 )
 
-add_library(hip_demand_texture SHARED ${TEXTURE_LOADER_SOURCES})
+add_library(hip_demand_texture SHARED
+    ${TEXTURE_LOADER_SOURCES}
+    ${TEXTURE_LOADER_HEADERS}
+)
 
 # Export all symbols on Windows so the shared library is usable without
 # explicit __declspec(dllexport) annotations.
