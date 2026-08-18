@@ -104,7 +104,7 @@ struct DeviceTextureInfo
         DeviceMipLevel mip{};
         mip.startPage     = mips[level].startPage;
         mip.mipTailOffset = mips[level].mipTailOffset;
-        mip.width         = std::max( width >> level, 1u);
+        mip.width         = std::max( width >> level, 1u );
         mip.height        = std::max( height >> level, 1u );
         mip.tilesX        = mip.width / tileWidth + static_cast<uint32_t>( mip.width % tileWidth != 0 );
         mip.tilesY        = mip.height / tileHeight + static_cast<uint32_t>( mip.height % tileHeight != 0 );
@@ -158,13 +158,17 @@ enum class CounterIndex : uint32_t
 
 struct DeviceContext
 {
-    DeviceSpan<uint8_t>            pageMemory{};
-    DeviceSpan<uint32_t>           requestedBits{};
-    DeviceSpan<uint32_t>           requestedResources;
-    DeviceSpan<uint32_t>           residentBits{};
-    DeviceSpan<uint32_t>           counters{};
-    DeviceSpan<DeviceTextureInfo*> textureInfos{};
+    // per loader data
     PageTable                      pageTable{};
+    DeviceSpan<uint8_t>            pageMemory{};
+    DeviceSpan<uint32_t>           residentBits{};
+    DeviceSpan<DeviceTextureInfo*> textureInfos{};
+    
+    // per stream data
+    DeviceSpan<uint32_t>           requestedBits{};
+    DeviceSpan<uint32_t>           requestedResources{};
+    DeviceSpan<uint32_t>           counters{};
+    size_t                         poolIndex = 0;
 };
 
 }  // namespace hip_demand::vmm

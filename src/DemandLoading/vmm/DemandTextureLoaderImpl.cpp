@@ -2,56 +2,44 @@
 #include "../Internal/Utils.h"
 #include "Allocator.h"
 #include "PageSystem.h"
+// #include "TicketImpl.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <ImageSource/TextureInfo.h>
 #include <algorithm>
 #include <array>
+// #include <condition_variable>
+// #include <exception>
+// #include <functional>
 #include <mutex>
+// #include <queue>
+// #include <stdexcept>
+// #include <thread>
 
 namespace hip_demand::vmm {
 
+using internal::allocArray;
 using internal::Bitset;
-using internal::calculateMipLevels;
 using internal::ceilDiv;
-using internal::memcpyDtoHAsync;
-using internal::memcpyHtoDAsync;
+using internal::freeArray;
+using internal::memcpyDtoH;
+using internal::memcpyHtoD;
 using internal::memset;
-using internal::memsetAsync;
 using internal::mipDimensions;
 using internal::NonCopyble;
 using internal::safeAdd;
 using internal::sizeInBytes;
 using internal::tileShapeForGranularity;
 
-class HipGC : NonCopyble
+class RequestQueue : NonCopyble
 {
   public:
-    template <typename T>
-    DeviceSpan<T> allocArray( size_t count, bool zero = false )
-    {
-        const size_t size = count * sizeof( T );
-        if( size == 0 )
-            return {};
-
-        T* ptr = nullptr;
-        HIP_CHECK( hipMalloc( &ptr, size ) );
-        allocations_.push_back( ptr );
-
-        DeviceSpan<T> result( ptr, count );
-        if( zero )
-            memset( result, 0 );
-
-        return result;
-    }
-
-    ~HipGC()
-    {
-        for( hipDeviceptr_t a : allocations_ )
-            HIP_WARN( hipFree( a ) );
-    }
-
   private:
-    std::vector<hipDeviceptr_t> allocations_;
+};
+
+class ThreadPool : NonCopyble
+{
+  public:
+  private:
 };
 
 struct Resource
@@ -115,9 +103,12 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) override;
     void launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     void processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
+    void processRequestsCallback( const DeviceContext& deviceContext );
 
   private:
     void     initPageTable( uint32_t& resourceCount );
+    void     initDeviceContext( DeviceContext& deviceContext, hipStream_t stream );
+    void     freeDeviceContext( const DeviceContext& deviceContext );
     Resource decode( uint32_t resourceId );
     void     processTextureInfo( uint32_t textureId, hipStream_t stream, const DeviceContext& deviceContext );
     void     processTile( const Resource::Tile& tile, hipStream_t stream, const DeviceContext& deviceContext );
@@ -125,7 +116,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     mutable std::mutex    mutex_;
     Options               options_{};
-    bool                  residentBitsDirty_ = false;
+    std::atomic<bool>     residentBitsDirty_{ false };
     Bitset                residentBits_{};
     std::vector<uint32_t> requestedResources_{};
     std::vector<uint8_t>  tmpPageBuffer_{};
@@ -140,8 +131,35 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     std::vector<DeviceTextureInfo> loadedTextureInfos_{};
     Allocator<DeviceTextureInfo>   textureInfoAllocator_;
 
-    HipGC         hipGC_{};
-    DeviceContext deviceContext_{};
+    std::vector<std::unique_ptr<DeviceContext>> deviceContextPool_{};
+    std::vector<size_t>                         freeDeviceContextList_{};
+};
+
+class ProcessRequestCallback
+{
+  public:
+    explicit ProcessRequestCallback( DemandTextureLoaderImpl* loader, DeviceContext deviceContext )
+        : loader_( loader )
+        , deviceContext_( deviceContext )
+    {
+    }
+
+    static void enqueue( hipStream_t stream, ProcessRequestCallback* callback )
+    {
+        HIP_CHECK( hipLaunchHostFunc( stream, &staticCallback, callback ) );
+    }
+
+  private:
+    void callback() { loader_->processRequestsCallback( deviceContext_ ); }
+
+    static void staticCallback( void* arg )
+    {
+        std::unique_ptr<ProcessRequestCallback> callback( static_cast<ProcessRequestCallback*>( arg ) );
+        callback->callback();
+    }
+
+    DemandTextureLoaderImpl* loader_;
+    DeviceContext            deviceContext_;
 };
 
 DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
@@ -159,14 +177,6 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     tmpPageBuffer_.resize( pageSystem_.pageBytes() );
     residentBits_.resize( resourceCount );
     requestedResources_.resize( options_.maxRequests );
-
-    deviceContext_.pageMemory         = pageSystem_.virtualAddressSpace();
-    deviceContext_.requestedBits      = hipGC_.allocArray<uint32_t>( residentBits_.wordCount(), true );
-    deviceContext_.residentBits       = hipGC_.allocArray<uint32_t>( residentBits_.wordCount(), true );
-    deviceContext_.requestedResources = hipGC_.allocArray<uint32_t>( requestedResources_.size(), true );
-    deviceContext_.counters           = hipGC_.allocArray<uint32_t>( counters_.size(), true );
-    deviceContext_.textureInfos       = hipGC_.allocArray<DeviceTextureInfo*>( options.maxTextures, true );
-    deviceContext_.pageTable          = pageTable_;
 }
 
 void DemandTextureLoaderImpl::initPageTable( uint32_t& resourceCount )
@@ -189,7 +199,20 @@ void DemandTextureLoaderImpl::initPageTable( uint32_t& resourceCount )
             "Cannot create demand texture loader: total resource count exceeds the uint32_t limit" );
 }
 
-DemandTextureLoaderImpl::~DemandTextureLoaderImpl() {}
+DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
+{
+    if( !deviceContextPool_.empty() )
+    {
+        freeArray( deviceContextPool_[0]->residentBits );
+        freeArray( deviceContextPool_[0]->textureInfos );
+        for( auto& ctx : deviceContextPool_ )
+        {
+            freeArray( ctx->requestedBits );
+            freeArray( ctx->requestedResources );
+            freeArray( ctx->counters );
+        }
+    }
+}
 
 const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& descriptor )
 {
@@ -210,42 +233,71 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
 {
     std::lock_guard<std::mutex> lock( mutex_ );
 
+    initDeviceContext( deviceContext, stream );
+
     if( !textures_.empty() )
     {
-        memsetAsync( deviceContext_.requestedBits, 0, stream );
-        memsetAsync( deviceContext_.counters, 0, stream );
+        memset( deviceContext.requestedBits, 0, stream );
+        memset( deviceContext.counters, 0, stream );
 
-        if( residentBitsDirty_ )
-        {
-            memcpyHtoDAsync( deviceContext_.residentBits, residentBits_.words(), stream );
-            residentBitsDirty_ = false;
-        }
+        if( residentBitsDirty_.exchange( false, std::memory_order_acquire ) )
+            memcpyHtoD( deviceContext.residentBits, residentBits_.words(), stream );
 
-        deviceContext_.textureInfos.len = static_cast<uint32_t>( textures_.size() );
+        deviceContext.textureInfos.len = static_cast<uint32_t>( textures_.size() );
+    }
+}
+
+void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, hipStream_t stream )
+{
+    if( !freeDeviceContextList_.empty() )
+    {
+        deviceContext = *deviceContextPool_.at( freeDeviceContextList_.back() ).get();
+        freeDeviceContextList_.pop_back();
+        return;
     }
 
-    deviceContext = deviceContext_;
+    deviceContextPool_.push_back( std::make_unique<DeviceContext>() );
+    deviceContext = *deviceContextPool_.back().get();
+
+    // set data per stream
+    deviceContext.poolIndex          = deviceContextPool_.size() - 1;
+    deviceContext.requestedBits      = allocArray<uint32_t>( residentBits_.wordCount(), true, stream );
+    deviceContext.requestedResources = allocArray<uint32_t>( requestedResources_.size(), true, stream );
+    deviceContext.counters           = allocArray<uint32_t>( counters_.size(), true, stream );
+
+    // set data per loader
+    deviceContext.pageTable  = pageTable_;
+    deviceContext.pageMemory = pageSystem_.virtualAddressSpace();
+    if( deviceContextPool_.empty() )
+    {
+        deviceContext.residentBits = allocArray<uint32_t>( residentBits_.wordCount(), true, stream );
+        deviceContext.textureInfos = allocArray<DeviceTextureInfo*>( options_.maxTextures, true, stream );
+    }
+    else
+    {
+        deviceContext.residentBits = deviceContextPool_.front()->residentBits;
+        deviceContext.textureInfos = deviceContextPool_.front()->textureInfos;
+    }
+}
+
+void DemandTextureLoaderImpl::freeDeviceContext( const DeviceContext& deviceContext )
+{
+    assert( deviceContext.poolIndex < deviceContextPool_.size() );
+    freeDeviceContextList_.push_back( deviceContext.poolIndex );
 }
 
 void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceContext& deviceContext )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
 
+    assert( deviceContext.poolIndex < deviceContextPool_.size() );
+
     if( textures_.empty() )
         return;
 
-    if( deviceContext.pageMemory.ptr != deviceContext_.pageMemory.ptr
-        || deviceContext.requestedBits.ptr != deviceContext_.requestedBits.ptr
-        || deviceContext.residentBits.ptr != deviceContext_.residentBits.ptr
-        || deviceContext.requestedResources.ptr != deviceContext_.requestedResources.ptr
-        || deviceContext.counters.ptr != deviceContext_.counters.ptr  // TODO_BS: || deviceContext.pageTable != deviceContext_.pageTable
-        || deviceContext.textureInfos.ptr != deviceContext_.textureInfos.ptr )
-    {
-        throw std::invalid_argument( "DeviceContext does not belong to this demand texture loader" );
-    }
-
-    memcpyDtoHAsync( requestedResources_, deviceContext.requestedResources, stream );
-    memcpyDtoHAsync( counters_, deviceContext.counters, stream );
+    memcpyDtoH( requestedResources_, deviceContext.requestedResources, stream );
+    memcpyDtoH( counters_, deviceContext.counters, stream );
+    ProcessRequestCallback::enqueue( stream, new ProcessRequestCallback( this, deviceContext ) );
     HIP_CHECK( hipStreamSynchronize( stream ) );
 
     const uint32_t requestCount = counters_[static_cast<uint32_t>( CounterIndex::RequestedResources )];
@@ -274,8 +326,12 @@ void DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceC
         }
 
         residentBits_.set( resourceId, true );
-        residentBitsDirty_ = true;
+        residentBitsDirty_.store(true, std::memory_order_release);
     }
+}
+
+void DemandTextureLoaderImpl::processRequestsCallback( const DeviceContext& deviceContext ) {
+    freeDeviceContext( deviceContext );
 }
 
 void DemandTextureLoaderImpl::processTextureInfo( uint32_t textureId, hipStream_t stream, const DeviceContext& deviceContext )
@@ -405,7 +461,7 @@ void DemandTextureLoaderImpl::processTile( const Resource::Tile& tile, hipStream
                                   + std::to_string( tile.tileX ) + ", " + std::to_string( tile.tileY ) + ")" );
     }
 
-    memcpyHtoDAsync( pageSystem_.page( tile.pageId ), tmpPageBuffer_, stream );
+    memcpyHtoD( pageSystem_.page( tile.pageId ), tmpPageBuffer_, stream );
     HIP_CHECK( hipStreamSynchronize( stream ) );
 }
 
@@ -430,7 +486,7 @@ void DemandTextureLoaderImpl::processMipTail( const Resource::MipTail& mipTail, 
         }
     }
 
-    memcpyHtoDAsync( pageSystem_.page( mipTail.pageId ), tmpPageBuffer_, stream );
+    memcpyHtoD( pageSystem_.page( mipTail.pageId ), tmpPageBuffer_, stream );
     HIP_CHECK( hipStreamSynchronize( stream ) );
 }
 

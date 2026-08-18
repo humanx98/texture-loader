@@ -10,8 +10,8 @@
 #include <hip/hip_runtime.h>
 #include <limits>
 #include <optional>
-#include <vector>
 #include <stdexcept>
+#include <vector>
 
 namespace hip_demand {
 namespace internal {
@@ -162,51 +162,28 @@ inline uint2 mipDimensions( uint2 dimensions, uint32_t mipLevel )
 }
 
 template <typename T>
-static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src )
-{
-    assert( dst.sizeInBytes() == sizeInBytes( src ) );
-    HIP_CHECK( hipMemcpy( dst.ptr, src.data(), dst.sizeInBytes(), hipMemcpyHostToDevice ) );
-}
-
-template <typename T>
-static void memcpyHtoDAsync( const DeviceSpan<T>& dst, const std::vector<T>& src, hipStream_t stream )
+static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src, hipStream_t stream = nullptr )
 {
     assert( dst.sizeInBytes() == sizeInBytes( src ) );
     HIP_CHECK( hipMemcpyAsync( dst.ptr, src.data(), dst.sizeInBytes(), hipMemcpyHostToDevice, stream ) );
 }
 
 template <typename T>
-static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src )
-{
-    assert( sizeInBytes( dst ) == src.sizeInBytes() );
-    HIP_CHECK( hipMemcpy( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost ) );
-}
-
-template <typename T>
-static void memcpyDtoHAsync( std::vector<T>& dst, const DeviceSpan<T>& src, hipStream_t stream )
+static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src, hipStream_t stream = nullptr )
 {
     assert( sizeInBytes( dst ) == src.sizeInBytes() );
     HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );
 }
 
 template <typename T, size_t N>
-static void memcpyDtoHAsync( std::array<T, N>& dst, const DeviceSpan<T>& src, hipStream_t stream )
+static void memcpyDtoH( std::array<T, N>& dst, const DeviceSpan<T>& src, hipStream_t stream = nullptr )
 {
     assert( sizeInBytes( dst ) == src.sizeInBytes() );
     HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );
 }
 
 template <typename T>
-static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src, size_t count )
-{
-    size_t bytes = count * sizeof( T );
-    assert( bytes <= sizeInBytes( src ) );
-    assert( bytes <= dst.sizeInBytes() );
-    HIP_CHECK( hipMemcpy( dst.ptr, src.data(), bytes, hipMemcpyHostToDevice ) );
-}
-
-template <typename T>
-static void memcpyHtoDAsync( const DeviceSpan<T>& dst, const std::vector<T>& src, size_t count, hipStream_t stream )
+static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src, size_t count, hipStream_t stream = nullptr )
 {
     size_t bytes = count * sizeof( T );
     assert( bytes <= sizeInBytes( src ) );
@@ -215,16 +192,7 @@ static void memcpyHtoDAsync( const DeviceSpan<T>& dst, const std::vector<T>& src
 }
 
 template <typename T>
-static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src, size_t count )
-{
-    size_t bytes = count * sizeof( T );
-    assert( bytes <= src.sizeInBytes() );
-    assert( bytes <= sizeInBytes( dst ) );
-    HIP_CHECK( hipMemcpy( dst.data(), src.ptr, bytes, hipMemcpyDeviceToHost ) );
-}
-
-template <typename T>
-static void memcpyDtoHAsync( std::vector<T>& dst, const DeviceSpan<T>& src, size_t count, hipStream_t stream )
+static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src, size_t count, hipStream_t stream = nullptr )
 {
     size_t bytes = count * sizeof( T );
     assert( bytes <= src.sizeInBytes() );
@@ -233,15 +201,36 @@ static void memcpyDtoHAsync( std::vector<T>& dst, const DeviceSpan<T>& src, size
 }
 
 template <typename T>
-static void memset( const DeviceSpan<T>& dst, int value )
+static void memset( const DeviceSpan<T>& dst, int value, hipStream_t stream = nullptr )
 {
-    HIP_CHECK( hipMemset( dst.ptr, value, dst.sizeInBytes() ) );
+    HIP_CHECK( hipMemsetAsync( dst.ptr, value, dst.sizeInBytes(), stream ) );
 }
 
 template <typename T>
-static void memsetAsync( const DeviceSpan<T>& dst, int value, hipStream_t stream )
+static DeviceSpan<T> allocArray( size_t count, bool zero = false, hipStream_t stream = nullptr )
 {
-    HIP_CHECK( hipMemsetAsync( dst.ptr, value, dst.sizeInBytes(), stream ) );
+    const size_t size = count * sizeof( T );
+    if( size == 0 )
+        return {};
+
+    T* ptr = nullptr;
+    HIP_CHECK( hipMalloc( &ptr, size ) );
+
+    DeviceSpan<T> result( ptr, count );
+    if( zero )
+        memset( result, 0, stream );
+
+    return result;
+}
+
+template <typename T>
+static void freeArray( DeviceSpan<T>& span )
+{
+    if( span.ptr )
+        HIP_CHECK( hipFree( span.ptr ) );
+
+    span.ptr = nullptr;
+    span.len = 0;
 }
 
 }  // namespace internal

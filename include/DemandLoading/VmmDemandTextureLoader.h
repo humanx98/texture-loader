@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
-
+#include <utility>
 
 namespace hip_demand::vmm {
 
@@ -17,11 +17,21 @@ struct TextureDescriptor
     bool                  normalizedCoords = true;
 };
 
-class DemandTexture
+class Ticket
 {
   public:
-    virtual ~DemandTexture()       = default;
-    virtual uint32_t getId() const = 0;
+    Ticket() {}
+    int  numTasksTotal() const;
+    int  numTasksRemaining() const;
+    void wait( hipEvent_t* event = nullptr );
+
+  private:
+    std::shared_ptr<class TicketImpl> impl_;
+    friend class TicketImpl;
+    Ticket( std::shared_ptr<TicketImpl>&& impl )
+        : impl_( std::move( impl ) )
+    {
+    }
 };
 
 struct Options
@@ -30,9 +40,17 @@ struct Options
     uint32_t maxVirtualPages  = 32 * 1024;
     uint32_t maxPhysicalPages = 1024;  // 64KB * 1024
     uint32_t maxRequests      = 1024;
+    uint32_t maxRequestQueue  = 1024;
+    uint32_t maxThreads       = 0;
     //bool     enableEviction     = true;
-    //uint32_t maxThreads         = 0;
     //uint32_t minResidentFrames  = 3;
+};
+
+class DemandTexture
+{
+  public:
+    virtual ~DemandTexture()       = default;
+    virtual uint32_t getId() const = 0;
 };
 
 class DemandTextureLoader
