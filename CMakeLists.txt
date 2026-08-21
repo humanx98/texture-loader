@@ -59,6 +59,7 @@ endif()
 set(TEXTURE_LOADER_SOURCES
     src/DemandLoading/vmm/DemandTextureLoaderImpl.cpp
     src/DemandLoading/vmm/PageSystem.cpp
+    src/DemandLoading/vmm/RequestProcessor.cpp
     src/DemandLoading/vmm/Ticket.cpp
     src/DemandLoading/DemandTextureLoader.cpp
     src/DemandLoading/DemandTextureLoaderImpl.cpp
@@ -74,8 +75,11 @@ set(TEXTURE_LOADER_HEADERS
     src/DemandLoading/Internal/TextureMetadata.h
     src/DemandLoading/Internal/ThreadPool.h
     src/DemandLoading/Internal/Utils.h
+    src/DemandLoading/vmm/DemandTextureLoaderImpl.h
+    src/DemandLoading/vmm/HipEventPool.h
     src/DemandLoading/vmm/Allocator.h
     src/DemandLoading/vmm/PageSystem.h
+    src/DemandLoading/vmm/RequestProcessor.h
     src/DemandLoading/vmm/TicketImpl.h
     src/DemandLoading/DemandTextureLoaderImpl.h
 )

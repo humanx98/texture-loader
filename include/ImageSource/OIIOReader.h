@@ -5,7 +5,8 @@
 
 #include "ImageSource.h"
 #include "TextureInfo.h"
-#include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <vector>
 
 namespace hip_demand {
@@ -16,7 +17,7 @@ class OIIOReader : public ImageSource
 {
   public:
     /// Constructor
-    explicit OIIOReader(const std::string& filename);
+    explicit OIIOReader( const std::string& filename, std::optional<hipArray_Format> outputFormat = std::nullopt );
     
     /// Destructor
     ~OIIOReader() override;
@@ -44,11 +45,15 @@ class OIIOReader : public ImageSource
     unsigned long long getHash(hipStream_t stream = 0) const override;
 
   private:
+    bool readMipLevelNoLock( char* dest, unsigned int mipLevel, unsigned int expectedWidth, unsigned int expectedHeight );
+    bool readTileNoLock( char* dest, unsigned int mipLevel, const Tile& tile );
+
     std::string filename_;
+    std::optional<hipArray_Format> outputFormat_;
     TextureInfo info_;
     bool isOpen_ = false;
     
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
     unsigned long long bytesRead_ = 0;
     double totalReadTime_ = 0.0;
     
@@ -59,9 +64,8 @@ class OIIOReader : public ImageSource
     bool loadImage();
     
     // Generate mip level from previous level
-    void generateMipLevel(const unsigned char* srcData, int srcWidth, int srcHeight,
-                         unsigned char* dstData, int dstWidth, int dstHeight,
-                         int channels);
+    void generateMipLevel( const unsigned char* srcData, int srcWidth, int srcHeight, unsigned char* dstData, int dstWidth,
+                           int dstHeight, int channels );
 };
 
 }  // namespace hip_demand

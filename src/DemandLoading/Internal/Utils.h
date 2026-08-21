@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "HipCheck.h"
 #include <DemandLoading/DeviceContext.h>
 #include <array>
 #include <cassert>
@@ -14,7 +15,6 @@
 #include <vector>
 
 namespace hip_demand {
-namespace internal {
 
 class NonCopyble
 {
@@ -40,6 +40,8 @@ HIP_DEMAND_INLINE size_t ceilDiv( size_t value, size_t divisor )
 class Bitset : NonCopyble
 {
   public:
+    Bitset( uint32_t count = 0 ) { resize( count ); }
+
     void resize( uint32_t count )
     {
         count_ = count;
@@ -162,51 +164,6 @@ inline uint2 mipDimensions( uint2 dimensions, uint32_t mipLevel )
 }
 
 template <typename T>
-static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src, hipStream_t stream = nullptr )
-{
-    assert( dst.sizeInBytes() == sizeInBytes( src ) );
-    HIP_CHECK( hipMemcpyAsync( dst.ptr, src.data(), dst.sizeInBytes(), hipMemcpyHostToDevice, stream ) );
-}
-
-template <typename T>
-static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src, hipStream_t stream = nullptr )
-{
-    assert( sizeInBytes( dst ) == src.sizeInBytes() );
-    HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );
-}
-
-template <typename T, size_t N>
-static void memcpyDtoH( std::array<T, N>& dst, const DeviceSpan<T>& src, hipStream_t stream = nullptr )
-{
-    assert( sizeInBytes( dst ) == src.sizeInBytes() );
-    HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, sizeInBytes( dst ), hipMemcpyDeviceToHost, stream ) );
-}
-
-template <typename T>
-static void memcpyHtoD( const DeviceSpan<T>& dst, const std::vector<T>& src, size_t count, hipStream_t stream = nullptr )
-{
-    size_t bytes = count * sizeof( T );
-    assert( bytes <= sizeInBytes( src ) );
-    assert( bytes <= dst.sizeInBytes() );
-    HIP_CHECK( hipMemcpyAsync( dst.ptr, src.data(), bytes, hipMemcpyHostToDevice, stream ) );
-}
-
-template <typename T>
-static void memcpyDtoH( std::vector<T>& dst, const DeviceSpan<T>& src, size_t count, hipStream_t stream = nullptr )
-{
-    size_t bytes = count * sizeof( T );
-    assert( bytes <= src.sizeInBytes() );
-    assert( bytes <= sizeInBytes( dst ) );
-    HIP_CHECK( hipMemcpyAsync( dst.data(), src.ptr, bytes, hipMemcpyDeviceToHost, stream ) );
-}
-
-template <typename T>
-static void memset( const DeviceSpan<T>& dst, int value, hipStream_t stream = nullptr )
-{
-    HIP_CHECK( hipMemsetAsync( dst.ptr, value, dst.sizeInBytes(), stream ) );
-}
-
-template <typename T>
 static DeviceSpan<T> allocArray( size_t count, bool zero = false, hipStream_t stream = nullptr )
 {
     const size_t size = count * sizeof( T );
@@ -233,5 +190,112 @@ static void freeArray( DeviceSpan<T>& span )
     span.len = 0;
 }
 
-}  // namespace internal
+template <typename T>
+struct HostSpan
+{
+    T*     ptr = nullptr;
+    size_t len = 0;
+
+    HostSpan() = default;
+
+    explicit HostSpan( T* ptr_, size_t len_ )
+        : ptr( ptr_ )
+        , len( len_ )
+    {
+    }
+
+    HIP_DEMAND_INLINE size_t sizeInBytes() const { return len * sizeof( T ); }
+};
+
+template <typename T>
+static HostSpan<T> hostAllocArray( size_t count )
+{
+    const size_t size = count * sizeof( T );
+    if( size == 0 )
+        return {};
+
+    T* ptr = nullptr;
+    HIP_CHECK( hipHostAlloc( &ptr, size ) );
+
+    HostSpan<T> result( ptr, count );
+    return result;
+}
+
+template <typename T>
+static void hostFreeArray( HostSpan<T>& span )
+{
+    if( span.ptr )
+        HIP_CHECK( hipHostFree( span.ptr ) );
+
+    span.ptr = nullptr;
+    span.len = 0;
+}
+
+class Bitset2 : NonCopyble
+{
+  public:
+    Bitset2( uint32_t count = 0 )
+    {
+        count_ = count;
+        words_ = hostAllocArray<uint32_t>( ceilDiv( count, 32 ) );
+        std::memset( words_.ptr, 0, words_.sizeInBytes() );
+    }
+
+    ~Bitset2()
+    {
+        count_ = 0;
+        hostFreeArray( words_ );
+    }
+
+    void set( uint32_t index, bool value )
+    {
+        validate( index );
+        const uint32_t mask = 1u << ( index % 32u );
+        if( value )
+            words_.ptr[index / 32] |= mask;
+        else
+            words_.ptr[index / 32] &= ~mask;
+    }
+
+    bool test( uint32_t index ) const
+    {
+        validate( index );
+        return ( words_.ptr[index / 32] & ( 1u << ( index % 32u ) ) ) != 0;
+    }
+
+    uint32_t                  bitCount() const { return count_; }
+    uint32_t                  wordCount() const { return static_cast<uint32_t>( words_.len ); }
+    const HostSpan<uint32_t>& words() const { return words_; }
+
+  private:
+    void validate( uint32_t index ) const
+    {
+        if( index >= count_ )
+            throw std::out_of_range( "index is outside the bitset" );
+    }
+
+    uint32_t           count_ = 0;
+    HostSpan<uint32_t> words_;
+};
+
+template <typename T>
+static void memcpyDtoH( HostSpan<T>& dst, const DeviceSpan<T>& src, hipStream_t stream = nullptr )
+{
+    assert( dst.sizeInBytes() == src.sizeInBytes() );
+    HIP_CHECK( hipMemcpyAsync( dst.ptr, src.ptr, dst.sizeInBytes(), hipMemcpyDeviceToHost, stream ) );
+}
+
+template <typename T>
+static void memcpyHtoD( DeviceSpan<T>& dst, const HostSpan<T>& src, hipStream_t stream = nullptr )
+{
+    assert( dst.sizeInBytes() == src.sizeInBytes() );
+    HIP_CHECK( hipMemcpyAsync( dst.ptr, src.ptr, dst.sizeInBytes(), hipMemcpyHostToDevice, stream ) );
+}
+
+template <typename T>
+static void memset( const DeviceSpan<T>& dst, int value, hipStream_t stream = nullptr )
+{
+    HIP_CHECK( hipMemsetAsync( dst.ptr, value, dst.sizeInBytes(), stream ) );
+}
+
 }  // namespace hip_demand

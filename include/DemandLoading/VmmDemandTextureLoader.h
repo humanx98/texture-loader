@@ -59,8 +59,9 @@ class DemandTextureLoader
     virtual ~DemandTextureLoader() = default;
 
     virtual const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) = 0;
-    virtual void launchPrepare( hipStream_t stream, DeviceContext& deviceContext )         = 0;
-    virtual void processRequests( hipStream_t stream, const DeviceContext& deviceContext ) = 0;
+    virtual void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext )         = 0;
+    virtual Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) = 0;
+    virtual void   freeDeviceContext( DeviceContext& deviceContext )                         = 0;
 };
 
 std::unique_ptr<DemandTextureLoader> createDemandTextureLoader( const Options& options );

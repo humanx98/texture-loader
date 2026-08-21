@@ -8,7 +8,6 @@
 
 namespace hip_demand::vmm {
 
-using internal::NonCopyble;
 
 template <typename T>
 class Allocator : NonCopyble

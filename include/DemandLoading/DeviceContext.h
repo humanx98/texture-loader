@@ -158,13 +158,10 @@ enum class CounterIndex : uint32_t
 
 struct DeviceContext
 {
-    // per loader data
     PageTable                      pageTable{};
     DeviceSpan<uint8_t>            pageMemory{};
     DeviceSpan<uint32_t>           residentBits{};
     DeviceSpan<DeviceTextureInfo*> textureInfos{};
-    
-    // per stream data
     DeviceSpan<uint32_t>           requestedBits{};
     DeviceSpan<uint32_t>           requestedResources{};
     DeviceSpan<uint32_t>           counters{};

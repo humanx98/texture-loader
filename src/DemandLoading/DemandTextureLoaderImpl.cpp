@@ -27,8 +27,6 @@ namespace hip_demand {
 
 using internal::TextureMetadata;
 using internal::RequestStats;
-using internal::calculateMipmapMemory;
-using internal::calculateMipLevels;
 
 // -----------------------------------------------------------------------------
 // Constructor / Destructor
@@ -284,7 +282,7 @@ TextureHandle DemandTextureLoader::Impl::createTexture(const std::string& filena
 #ifdef USE_OIIO
     // Try OIIO first for better format support
     try {
-        std::unique_ptr<ImageSource> imgSrc = createImageSource(filename);
+        std::unique_ptr<ImageSource> imgSrc = std::make_unique<OIIOReader>( filename, HIP_AD_FORMAT_UNSIGNED_INT8 );
         if (imgSrc) {
             hip_demand::TextureInfo texInfo;
             imgSrc->open(&texInfo);
@@ -918,7 +916,7 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
 #ifdef USE_OIIO
         bool oiioSuccess = false;
         try {
-            std::unique_ptr<ImageSource> imgSrc = createImageSource(filename);
+            std::unique_ptr<ImageSource> imgSrc = std::make_unique<OIIOReader>( filename, HIP_AD_FORMAT_UNSIGNED_INT8 );
             if (imgSrc) {
                 hip_demand::TextureInfo texInfo;
                 imgSrc->open(&texInfo);

@@ -47,7 +47,8 @@ PageSystem::~PageSystem()
 
 void PageSystem::map( uint32_t pageId )
 {
-    if( mapped( pageId ) )
+    std::lock_guard<std::mutex> lock( mutex_ );
+    if( virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE )
         return;
 
     uint32_t physicalPageId = INVALID_PAGE;
@@ -68,7 +69,7 @@ void PageSystem::map( uint32_t pageId )
         freePhysicalPages_.pop_back();
     }
 
-    PhysicalPage&    physicalPage = physicalPages_.at( physicalPageId );
+    PhysicalPage&       physicalPage = physicalPages_.at( physicalPageId );
     DeviceSpan<uint8_t> virtualPage  = page( pageId );
     HIP_CHECK( hipMemMap( virtualPage.ptr, virtualPage.len, 0, physicalPage.handle, 0 ) );
 
@@ -84,7 +85,8 @@ void PageSystem::map( uint32_t pageId )
 
 void PageSystem::unmap( uint32_t pageId )
 {
-    if( !mapped( pageId ) )
+    std::lock_guard<std::mutex> lock( mutex_ );
+    if( virtualIdToPhysicalId_.at( pageId ) == INVALID_PAGE )
         return;
 
     const uint32_t            physicalPageId = virtualIdToPhysicalId_.at( pageId );
@@ -95,4 +97,4 @@ void PageSystem::unmap( uint32_t pageId )
     freePhysicalPages_.push_back( physicalPageId );
 }
 
-}
+}  // namespace hip_demand::vmm

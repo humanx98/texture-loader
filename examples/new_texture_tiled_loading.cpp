@@ -1,6 +1,7 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <DemandLoading/VmmTextureSampling.h>
 #include <ImageSource/TextureInfo.h>
+#include <ImageSource/OIIOReader.h>
 
 #include "hip_check.h"
 
@@ -65,7 +66,7 @@ std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path )
     if( !fs::exists( path ) )
         throw std::runtime_error( "Texture not found: " + path.string() );
 
-    std::unique_ptr<hip_demand::ImageSource> image = hip_demand::createImageSource( path.string() );
+    std::unique_ptr<hip_demand::ImageSource> image = std::make_unique<hip_demand::OIIOReader>( path.string(), HIP_AD_FORMAT_UNSIGNED_INT8 );
     if( !image )
         throw std::runtime_error( "Failed to create an image source for: " + path.string() );
 

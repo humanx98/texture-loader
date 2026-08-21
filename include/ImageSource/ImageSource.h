@@ -76,7 +76,4 @@ inline unsigned int calculateNumMipLevels( unsigned int width, unsigned int heig
     return 1 + static_cast<unsigned int>( std::log2f( static_cast<float>( dim ) ) );
 }
 
-/// Factory function to create image source from file
-std::unique_ptr<ImageSource> createImageSource( const std::string& filename );
-
 }  // namespace hip_demand

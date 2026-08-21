@@ -17,71 +17,62 @@ class TicketImpl
     static std::shared_ptr<TicketImpl>& getImpl( Ticket& ticket ) { return ticket.impl_; }
 
     TicketImpl( hipStream_t stream )
-        : m_stream( stream )
+        : stream_( stream )
     {
     }
 
-    void update( unsigned int numTasks )
+    void initialize( unsigned int numTasks )
     {
         {
-            std::unique_lock<std::mutex> lock( m_mutex );
-            m_numTasksTotal     = numTasks;
-            m_numTasksRemaining = numTasks;
+            std::unique_lock<std::mutex> lock( mutex_ );
+            numTasksTotal_     = numTasks;
+            numTasksRemaining_ = numTasks;
         }
         if( numTasks == 0 )
-            m_isDone.notify_all();
+            isDone_.notify_all();
     }
 
-    hipStream_t getStream() const { return m_stream; }
+    hipStream_t getStream() const { return stream_; }
+
     int numTasksTotal() const
     {
-        std::unique_lock<std::mutex> lock( m_mutex );
-        return m_numTasksTotal;
+        std::unique_lock<std::mutex> lock( mutex_ );
+        return numTasksTotal_;
     }
 
-    int         numTasksRemaining() const
+    int numTasksRemaining() const
     {
-        std::unique_lock<std::mutex> lock( m_mutex );
-        return m_numTasksRemaining;
+        std::unique_lock<std::mutex> lock( mutex_ );
+        return numTasksRemaining_;
     }
 
     void wait( hipEvent_t* event = nullptr )
     {
-        std::unique_lock<std::mutex> lock( m_mutex );
-        m_isDone.wait( lock, [this] { return m_numTasksRemaining == 0; } );
-
-        const std::exception_ptr exception = m_exception;
-        lock.unlock();
-
-        if( exception )
-            std::rethrow_exception( exception );
-
+        std::unique_lock<std::mutex> lock( mutex_ );
+        isDone_.wait( lock, [this] { return numTasksRemaining_ == 0; } );
         if( event )
         {
-            HIP_CHECK( hipEventRecord( *event, m_stream ) );
+            HIP_CHECK( hipEventRecord( *event, stream_ ) );
         }
     }
 
-    void notify( std::exception_ptr exception = {} )
+    void notify( )
     {
-        std::unique_lock<std::mutex> lock( m_mutex );
+        std::unique_lock<std::mutex> lock( mutex_ );
 
-        assert( m_numTasksRemaining > 0 );
-        if( exception && !m_exception )
-            m_exception = std::move( exception );
-        --m_numTasksRemaining;
+        assert( numTasksRemaining_ > 0 );
+        --numTasksRemaining_;
 
-        if( m_numTasksRemaining == 0 )
-            m_isDone.notify_all();
+        if( numTasksRemaining_ == 0 )
+            isDone_.notify_all();
     }
 
   private:
-    const hipStream_t       m_stream{};
-    int                     m_numTasksTotal{ -1 };
-    int                     m_numTasksRemaining{ -1 };
-    mutable std::mutex      m_mutex;
-    std::condition_variable m_isDone;
-    std::exception_ptr      m_exception;
+    const hipStream_t       stream_            = nullptr;
+    int                     numTasksTotal_     = -1;
+    int                     numTasksRemaining_ = -1;
+    mutable std::mutex      mutex_;
+    std::condition_variable isDone_;
 };
 
 }  // namespace hip_demand::vmm
