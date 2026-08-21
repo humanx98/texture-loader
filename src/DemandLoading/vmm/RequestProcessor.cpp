@@ -58,8 +58,8 @@ void RequestProcessor::stop()
             worker.join();
     }
 
-    std::lock_guard<std::mutex> lock( mutex_ );
-    HIP_WARN( waitForResidentBitsUploadLocked() );
+    std::unique_lock<std::mutex> lock( mutex_ );
+    waitForResidentBitsUploadLocked( lock );
 }
 
 void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket )
@@ -76,25 +76,33 @@ void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Tick
 
 void RequestProcessor::uploadResidentBits( DeviceSpan<uint32_t>& destination, hipStream_t stream )
 {
-    std::lock_guard<std::mutex> lock( mutex_ );
+    std::unique_lock<std::mutex> lock( mutex_ );
     if( !residentBitsDirty_ )
         return;
 
-    HIP_CHECK( waitForResidentBitsUploadLocked() );
+    waitForResidentBitsUploadLocked( lock );
     memcpyHtoD( destination, residentBits_.words(), stream );
     HIP_CHECK( hipEventRecord( residentBitsUploadDone_, stream ) );
     residentBitsUploadInFlight_ = true;
     residentBitsDirty_          = false;
 }
 
-hipError_t RequestProcessor::waitForResidentBitsUploadLocked()
+void RequestProcessor::waitForResidentBitsUploadLocked( std::unique_lock<std::mutex>& lock )
 {
-    if( !residentBitsUploadInFlight_ )
-        return hipSuccess;
+    assert( lock.owns_lock() );
 
-    const hipError_t result     = hipEventSynchronize( residentBitsUploadDone_ );
+    residentBitsUploadFinished_.wait( lock, [this] { return !residentBitsUploadWaiting_; } );
+    if( !residentBitsUploadInFlight_ )
+        return;
+
+    residentBitsUploadWaiting_ = true;
+    lock.unlock();
+    HIP_WARN(hipEventSynchronize( residentBitsUploadDone_ ));
+    lock.lock();
+
     residentBitsUploadInFlight_ = false;
-    return result;
+    residentBitsUploadWaiting_  = false;
+    residentBitsUploadFinished_.notify_all();
 }
 
 void RequestProcessor::workerLoop()
@@ -137,19 +145,12 @@ void RequestProcessor::workerLoop()
                     std::cerr << "Error: " << e.what() << std::endl;
                 }
 
-                std::lock_guard<std::mutex> lock( mutex_ );
+                std::unique_lock<std::mutex> lock( mutex_ );
                 if( success )
                 {
-                    const hipError_t uploadResult = waitForResidentBitsUploadLocked();
-                    if( uploadResult == hipSuccess )
-                    {
-                        residentBits_.set( resourceId, true );
-                        residentBitsDirty_ = true;
-                    }
-                    else
-                    {
-                        HIP_WARN( uploadResult );
-                    }
+                    waitForResidentBitsUploadLocked( lock );
+                    residentBits_.set( resourceId, true );
+                    residentBitsDirty_ = true;
                 }
                 loadingBits_.set( resourceId, false );
                 loading_.notify_all();

@@ -1,14 +1,16 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <DemandLoading/VmmTextureSampling.h>
-#include <ImageSource/TextureInfo.h>
 #include <ImageSource/OIIOReader.h>
+#include <ImageSource/TextureInfo.h>
 
 #include "hip_check.h"
 
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -66,7 +68,8 @@ std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path )
     if( !fs::exists( path ) )
         throw std::runtime_error( "Texture not found: " + path.string() );
 
-    std::unique_ptr<hip_demand::ImageSource> image = std::make_unique<hip_demand::OIIOReader>( path.string(), HIP_AD_FORMAT_UNSIGNED_INT8 );
+    std::unique_ptr<hip_demand::ImageSource> image =
+        std::make_unique<hip_demand::OIIOReader>( path.string(), HIP_AD_FORMAT_UNSIGNED_INT8 );
     if( !image )
         throw std::runtime_error( "Failed to create an image source for: " + path.string() );
 
@@ -83,7 +86,7 @@ static void memcpyDtoH( std::vector<T>& dst, const hip_demand::DeviceSpan<T>& sr
 {
     size_t bytes = count * sizeof( T );
     assert( bytes <= src.sizeInBytes() );
-    assert( bytes <= dst.size() * sizeof(T) );
+    assert( bytes <= dst.size() * sizeof( T ) );
     HIP_CHECK( hipMemcpy( dst.data(), src.ptr, bytes, hipMemcpyDeviceToHost ) );
 }
 
@@ -119,16 +122,16 @@ void test( const fs::path& executableDir )
 
 
     TextureDescriptor descriptor{};
-    descriptor.addressMode[0]                = hipAddressModeMirror;
-    descriptor.addressMode[1]                = hipAddressModeMirror;
-    descriptor.filterMode                    = hipFilterModeLinear;
-    descriptor.mipmapFilterMode              = hipFilterModeLinear;
-    descriptor.normalizedCoords              = true;
+    descriptor.addressMode[0]                            = hipAddressModeMirror;
+    descriptor.addressMode[1]                            = hipAddressModeMirror;
+    descriptor.filterMode                                = hipFilterModeLinear;
+    descriptor.mipmapFilterMode                          = hipFilterModeLinear;
+    descriptor.normalizedCoords                          = true;
     std::shared_ptr<hip_demand::ImageSource> imageSource = readImage( inputPath );
     assert( imageSource->isOpen() );
-    const hip_demand::TextureInfo&           imageInfo   = imageSource->getInfo();
-    uint32_t                                 width       = imageInfo.width;
-    uint32_t                                 height      = imageInfo.height;
+    const hip_demand::TextureInfo& imageInfo = imageSource->getInfo();
+    uint32_t                       width     = imageInfo.width;
+    uint32_t                       height    = imageInfo.height;
 
 
     const DemandTexture& texture   = loader->createTexture( imageSource, descriptor );
@@ -159,26 +162,17 @@ void test( const fs::path& executableDir )
     };
 
     // First launch requests every missing mip-0 VMM tile.
-    DeviceContext context{};
-    loader->launchPrepare( stream, context );
-    launchKernel( context );
-    loader->processRequests( stream, context );
+    while( true )
+    {
+        DeviceContext context{};
+        loader->launchPrepare( stream, context );
+        launchKernel( context );
+        Ticket ticket = loader->processRequests( stream, context );
 
-    // Second launch reads the now-resident VMM tiles into the RGBA8 output.
-    loader->launchPrepare( stream, context );
-    launchKernel( context );
-    loader->processRequests( stream, context );
-
-    loader->launchPrepare( stream, context );
-    launchKernel( context );
-    loader->processRequests( stream, context );
-
-    loader->launchPrepare( stream, context );
-    launchKernel( context );
-    loader->processRequests( stream, context );
-
-    loader->launchPrepare( stream, context );
-    launchKernel( context );
+        ticket.wait();
+        if( ticket.numTasksTotal() == 0 )
+            break;
+    }
 
     HIP_CHECK( hipMemcpyAsync( hostOutput.data(), deviceOutput, byteCount, hipMemcpyDeviceToHost, stream ) );
     HIP_CHECK( hipStreamSynchronize( stream ) );
@@ -264,7 +258,6 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
     uint32_t           outputHeight = 2160;
     constexpr uint32_t blockWidth   = 16;
     constexpr uint32_t blockHeight  = 16;
-    constexpr uint32_t maxPasses    = 128;
 
     const fs::path inputDirectory = fs::path{ TEST_IMAGES_DIR } / "png";
     const fs::path kernelPath     = executableDir / "new_texture_tiled_loading_kernel.co";
@@ -299,9 +292,13 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
     KernelModule module;
     module.load( kernelPath );
 
+    constexpr uint32_t IN_FLIGHT_COUNT = 5;
+
     Options options{};
-    options.maxPhysicalPages = renderMipmaps ? 4096 : 1024;
-    options.maxRequests      = 4096;
+    options.maxPhysicalPages = 4096;
+    options.maxRequests      = 100;
+    options.maxRequestQueue  = options.maxRequests * IN_FLIGHT_COUNT;
+
     std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
 
     TextureDescriptor descriptor{};
@@ -324,7 +321,7 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
     uint32_t columnCount  = static_cast<uint32_t>( std::ceil( std::sqrt( static_cast<double>( textureCount ) ) ) );
     uint32_t rowCount     = ( textureCount + columnCount - 1 ) / columnCount;
 
-    const size_t byteCount = static_cast<size_t>( outputWidth ) * outputHeight * 4;
+    const size_t         byteCount = static_cast<size_t>( outputWidth ) * outputHeight * 4;
     std::vector<uint8_t> hostOutput( byteCount, 0 );
     for( size_t offset = 3; offset < hostOutput.size(); offset += 4 )
         hostOutput[offset] = 255;
@@ -338,38 +335,62 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
 
     const uint32_t gridWidth  = ( outputWidth + blockWidth - 1 ) / blockWidth;
     const uint32_t gridHeight = ( outputHeight + blockHeight - 1 ) / blockHeight;
-    const auto launchGrid = [&]( const DeviceContext& context ) {
+    const auto     launchGrid = [&]( const DeviceContext& context ) {
         DeviceContext mutableContext = context;
-        void* arguments[] = { &mutableContext, &deviceOutput, &outputWidth, &outputHeight,
-                              &textureCount,    &columnCount,  &rowCount };
+        void*         arguments[]    = { &mutableContext, &deviceOutput, &outputWidth, &outputHeight,
+                                         &textureCount,   &columnCount,  &rowCount };
 
         const hipFunction_t kernel = renderMipmaps ? module.mipGridKernel() : module.gridKernel();
-        HIP_CHECK( hipModuleLaunchKernel( kernel, gridWidth, gridHeight, 1, blockWidth, blockHeight, 1, 0, stream,
-                                          arguments, nullptr ) );
+        HIP_CHECK( hipModuleLaunchKernel( kernel, gridWidth, gridHeight, 1, blockWidth, blockHeight, 1, 0, stream, arguments, nullptr ) );
     };
 
-    DeviceContext context{};
-    bool          complete = false;
-    for( uint32_t pass = 0; pass < maxPasses; ++pass )
+    struct InFlightFrame
     {
-        loader->launchPrepare( stream, context );
-        launchGrid( context );
+        uint32_t pass = 0;
+        Ticket   ticket;
+        bool     active = false;
+    };
 
-        uint32_t requestCount = 0;
-        HIP_CHECK( hipMemcpyAsync( &requestCount, context.counters.ptr, sizeof( requestCount ),
-                                   hipMemcpyDeviceToHost, stream ) );
-        loader->processRequests( stream, context );
-
-        std::cout << "Pass " << pass + 1 << ": " << requestCount << " resource requests\n";
-        if( requestCount == 0 )
+    std::array<InFlightFrame, IN_FLIGHT_COUNT> inFlightFrames{};
+    uint32_t                                   nextPass          = 0;
+    bool                                       submitMoreFrames  = true;
+    const auto renderStart = std::chrono::steady_clock::now();
+    while (true)
+    {
+        uint32_t activeFrameCount = IN_FLIGHT_COUNT;
+        for (auto& frame : inFlightFrames)
         {
-            complete = true;
-            break;
-        }
-    }
+            if( frame.active )
+            {
+                frame.ticket.wait();
+                const int requestCount = frame.ticket.numTasksTotal();
+                frame.active           = false;
 
-    if( !complete )
-        throw std::runtime_error( "Rendering did not converge after " + std::to_string( maxPasses ) + " passes" );
+                if (requestCount > 0)
+                {
+                    std::cout << "Pass " << frame.pass << ": " << requestCount << " resource requests\n";
+                }
+                else
+                {
+                    activeFrameCount--;
+                }                 
+            }
+
+            DeviceContext context{};
+            loader->launchPrepare( stream, context );
+            launchGrid( context );
+
+            frame.pass   = nextPass++;
+            frame.ticket = loader->processRequests( stream, context );
+            frame.active = true;
+        }
+
+        if( activeFrameCount == 0 )
+            break;
+    }
+    const auto renderEnd = std::chrono::steady_clock::now();
+    const auto renderTime = std::chrono::duration_cast<std::chrono::milliseconds>( renderEnd - renderStart );
+    std::cout << "Rendering loop time: " << renderTime.count() << " ms\n";
 
     HIP_CHECK( hipMemcpyAsync( hostOutput.data(), deviceOutput, byteCount, hipMemcpyDeviceToHost, stream ) );
     HIP_CHECK( hipStreamSynchronize( stream ) );

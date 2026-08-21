@@ -3,6 +3,7 @@
 #include "../Internal/Utils.h"
 #include "HipEventPool.h"
 #include "TicketImpl.h"
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <queue>
@@ -99,8 +100,8 @@ class RequestProcessor : NonCopyble
     void     uploadResidentBits( DeviceSpan<uint32_t>& destination, hipStream_t stream );
 
   private:
-    void       workerLoop();
-    hipError_t waitForResidentBitsUploadLocked();
+    void workerLoop();
+    void waitForResidentBitsUploadLocked( std::unique_lock<std::mutex>& lock );
 
     mutable std::mutex       mutex_;
     RequestQueue             queue_;
@@ -111,9 +112,11 @@ class RequestProcessor : NonCopyble
     HipEventPool&            eventPool_;
     hipEvent_t               residentBitsUploadDone_     = nullptr;
     bool                     residentBitsUploadInFlight_ = false;
-    bool                     residentBitsDirty_          = false;
-    bool                     stopped_                    = false;
-    DemandTextureLoaderImpl* loader_                     = nullptr;
+    bool                     residentBitsUploadWaiting_  = false;
+    std::condition_variable  residentBitsUploadFinished_;
+    bool                     residentBitsDirty_ = false;
+    bool                     stopped_           = false;
+    DemandTextureLoaderImpl* loader_            = nullptr;
 };
 
 }  // namespace hip_demand::vmm

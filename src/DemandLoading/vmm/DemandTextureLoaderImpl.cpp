@@ -129,17 +129,19 @@ const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<Ima
 
 void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& deviceContext )
 {
-    std::scoped_lock lock( mutex_, metadataMutex_ );
-
-    initDeviceContext( deviceContext, stream );
-
-    if( !textures_.empty() )
     {
-        memset( deviceContext.requestedBits, 0, stream );
-        memset( deviceContext.counters, 0, stream );
-        requestProcessor_.uploadResidentBits( deviceContext.residentBits, stream );
+        std::scoped_lock lock( mutex_, metadataMutex_ );
+
+        initDeviceContext( deviceContext, stream );
+        if( textures_.empty() )
+            return;
+
         deviceContext.textureInfos.len = static_cast<uint32_t>( textures_.size() );
     }
+
+    memset( deviceContext.requestedBits, 0, stream );
+    memset( deviceContext.counters, 0, stream );
+    requestProcessor_.uploadResidentBits( deviceContext.residentBits, stream );
 }
 
 void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, hipStream_t stream )
