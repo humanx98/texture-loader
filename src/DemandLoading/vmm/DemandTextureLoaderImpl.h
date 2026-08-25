@@ -185,10 +185,10 @@ class PinnedAllocator : NonCopyble
 
         void reset() { allocation_.reset(); }
 
-        T*       get() noexcept { return reinterpret_cast<T*>( allocation_.get() ); }
-        const T* get() const noexcept { return reinterpret_cast<const T*>( allocation_.get() ); }
-        T*       operator->() noexcept { return get(); }
-        const T* operator->() const noexcept { return get(); }
+        T*          get() noexcept { return reinterpret_cast<T*>( allocation_.get() ); }
+        const T*    get() const noexcept { return reinterpret_cast<const T*>( allocation_.get() ); }
+        T*          operator->() noexcept { return get(); }
+        const T*    operator->() const noexcept { return get(); }
         HostSpan<T> span() noexcept { return HostSpan<T>( get(), 1 ); }
 
         T& operator*() noexcept
@@ -340,7 +340,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     DeviceSpan<uint32_t>           residentBits_{};
     DeviceSpan<DeviceTextureInfo*> textureInfos_{};
 
-    std::vector<std::unique_ptr<InFlight>>          inFlight_{};
+    std::vector<InFlight>                           inFlight_{};
     std::vector<size_t>                             freeDeviceContextList_{};
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
 

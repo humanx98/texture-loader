@@ -102,13 +102,19 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
         freeArray( textureInfos_ );
         for( auto& f : inFlight_ )
         {
-            freeArray( f->deviceContext.requestedBits );
-            freeArray( f->deviceContext.requestedResources );
-            freeArray( f->deviceContext.counters );
+            freeArray( f.deviceContext.requestedBits );
+            freeArray( f.deviceContext.requestedResources );
+            freeArray( f.deviceContext.counters );
 
-            hostFreeArray( f->requestedResources );
-            hostFreeArray( f->counters );
+            hostFreeArray( f.requestedResources );
+            hostFreeArray( f.counters );
         }
+    }
+
+    if( transferStream_ )
+    {
+        HIP_WARN( hipStreamDestroy( transferStream_ ) );
+        transferStream_ = nullptr;
     }
 }
 
@@ -148,7 +154,7 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
 {
     if( !freeDeviceContextList_.empty() )
     {
-        deviceContext = inFlight_.at( freeDeviceContextList_.back() ).get()->deviceContext;
+        deviceContext = inFlight_.at( freeDeviceContextList_.back() ).deviceContext;
         freeDeviceContextList_.pop_back();
         return;
     }
@@ -159,8 +165,8 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
         textureInfos_ = allocArray<DeviceTextureInfo*>( options_.maxTextures, true, stream );
     }
 
-    inFlight_.push_back( std::make_unique<InFlight>() );
-    InFlight& flight = *inFlight_.back().get();
+    inFlight_.push_back( {} );
+    InFlight& flight = inFlight_.back();
 
     // set data per stream
     flight.deviceContext.poolIndex     = inFlight_.size() - 1;
@@ -206,9 +212,9 @@ Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const Devic
         return ticket;
     }
 
-    InFlight* flight = inFlight_.at( deviceContext.poolIndex ).get();
-    memcpyDtoH( flight->requestedResources, deviceContext.requestedResources, stream );
-    memcpyDtoH( flight->counters, deviceContext.counters, stream );
+    InFlight& flight = inFlight_.at( deviceContext.poolIndex );
+    memcpyDtoH( flight.requestedResources, deviceContext.requestedResources, stream );
+    memcpyDtoH( flight.counters, deviceContext.counters, stream );
     ProcessRequestCallback::enqueue( stream, new ProcessRequestCallback( *this, deviceContext, ticket ) );
     return ticket;
 }
@@ -216,9 +222,10 @@ Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const Devic
 void DemandTextureLoaderImpl::processRequestsCallback( DeviceContext& deviceContext, Ticket ticket )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
-    InFlight*                   flight = inFlight_.at( deviceContext.poolIndex ).get();
-    uint32_t requestCount = flight->counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
-    requestProcessor_.submit( flight->requestedResources.ptr, requestCount, std::move( ticket ) );
+
+    InFlight& flight       = inFlight_.at( deviceContext.poolIndex );
+    uint32_t  requestCount = flight.counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
+    requestProcessor_.submit( flight.requestedResources.ptr, requestCount, std::move( ticket ) );
     freeDeviceContext( deviceContext, false );
 }
 
