@@ -78,12 +78,10 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     : options_( options )
     , eventPool_( 10 )
     , pageSystem_( options_.maxVirtualPages, options_.maxPhysicalPages )
-    , pageBufferPinnedAllocator_( pageSystem_.pageBytes(), eventPool_ )
     , textureInfoAllocator_( pageSystem_ )
-    , textureInfoPinnedAllocator_( eventPool_ )
-    , ptrTextureInfoPinnedAllocator_( eventPool_ )
     , pageTable_( createPageTable( options, pageSystem_.pageBytes() ) )
-    , requestProcessor_( this, eventPool_, getResourceCount( pageTable_ ), options.maxThreads, options_.maxRequestQueue )
+    , requestProcessor_( this, eventPool_, getResourceCount( pageTable_ ), options_.maxThreads, options_.maxRequestQueue )
+    , hostAllocator_( requestProcessor_.threadCount() * 3, eventPool_ )
 {
     if( options_.maxRequests == 0 )
         throw std::invalid_argument( "maxRequests cannot be 0" );
@@ -97,7 +95,6 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
 
     if( !inFlight_.empty() )
     {
-
         freeArray( residentBits_ );
         freeArray( textureInfos_ );
         for( auto& f : inFlight_ )
@@ -109,12 +106,6 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
             hostFreeArray( f.requestedResources );
             hostFreeArray( f.counters );
         }
-    }
-
-    if( transferStream_ )
-    {
-        HIP_WARN( hipStreamDestroy( transferStream_ ) );
-        transferStream_ = nullptr;
     }
 }
 
@@ -307,7 +298,8 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     }
     size_t mipTailSize = mipTailOffset;
 
-    auto h_info              = textureInfoPinnedAllocator_.allocScoped( stream );
+    auto h_info              = hostAllocator_.allocScopedArray<DeviceTextureInfo>( 1, stream );
+    *h_info                  = {};
     h_info->textureId        = textureId;
     h_info->addressMode[0]   = texture->descriptor.addressMode[0];
     h_info->addressMode[1]   = texture->descriptor.addressMode[1];
@@ -364,10 +356,10 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
 
         // copy struct pinned memory to device memory
         DevicePtr<DeviceTextureInfo> d_info = textureInfoAllocator_.alloc();
-        memcpyHtoD( DeviceSpan<DeviceTextureInfo>( d_info, 1 ), HostSpan<DeviceTextureInfo>( h_info.get(), 1 ), stream );
+        memcpyHtoD( DeviceSpan<DeviceTextureInfo>( d_info, 1 ), h_info.span(), stream );
 
         // copy device pointer to deivce pointers
-        auto stagedTextureInfoPointer = ptrTextureInfoPinnedAllocator_.allocScoped( stream );
+        auto stagedTextureInfoPointer = hostAllocator_.allocScopedArray<DeviceTextureInfo*>( 1, stream );
         *stagedTextureInfoPointer     = d_info;
         memcpyHtoD( DeviceSpan<DeviceTextureInfo*>( textureInfos_.ptr + textureId, 1 ), stagedTextureInfoPointer.span(), stream );
     }
@@ -389,9 +381,9 @@ void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::T
     t.y      = tile.tileY;
     t.width  = info.tileWidth;
     t.height = info.tileHeight;
-    assert( static_cast<size_t>( t.width ) * t.height * info.bytesPerTexel <= pageBufferPinnedAllocator_.bufferSize() );
-    auto pageBuffer = pageBufferPinnedAllocator_.allocScoped( stream );
-    if( !image->readTile( reinterpret_cast<char*>( pageBuffer.get() ), tile.mipLevel, t, stream ) )
+    assert( static_cast<size_t>( t.width ) * t.height * info.bytesPerTexel <= pageSystem_.pageBytes() );
+    auto pageBuffer = hostAllocator_.allocScopedArray<uint8_t>( pageSystem_.pageBytes(), stream );
+    if( !image->readTile( reinterpret_cast<char*>( pageBuffer.span().ptr ), tile.mipLevel, t, stream ) )
     {
         throw std::runtime_error( "Failed to read texture tile for texture " + std::to_string( tile.textureId )
                                   + ", mip " + std::to_string( tile.mipLevel ) + ", tile ("
@@ -417,12 +409,12 @@ void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource
 
     assert( info.mipTailFirstLevel < info.mipCount );
 
-    auto pageBuffer = pageBufferPinnedAllocator_.allocScoped( stream );
-    std::memset( pageBuffer.get(), 0, pageBufferPinnedAllocator_.bufferSize() );
+    auto pageBuffer = hostAllocator_.allocScopedArray<uint8_t>( pageSystem_.pageBytes(), stream );
+    std::memset( pageBuffer.span().ptr, 0, pageBuffer.span().sizeInBytes() );
     for( uint32_t mipLevel = info.mipTailFirstLevel; mipLevel < info.mipCount; ++mipLevel )
     {
         const DeviceMipLevel mip = info.getMipLevel( mipLevel );
-        char*                dst = reinterpret_cast<char*>( pageBuffer.get() + mip.mipTailOffset );
+        char*                dst = reinterpret_cast<char*>( pageBuffer.span().ptr + mip.mipTailOffset );
         if( !image->readMipLevel( dst, mipLevel, mip.width, mip.height, stream ) )
         {
             throw std::runtime_error( "Failed to read mip tail level " + std::to_string( mipLevel ) + " for texture "

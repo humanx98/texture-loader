@@ -96,6 +96,7 @@ class RequestProcessor : NonCopyble
     void submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket );
     void stop();
 
+    uint32_t threadCount() const noexcept { return workers_.size(); }
     uint32_t residentWordCount() const noexcept { return residentBits_.wordCount(); }
     void     uploadResidentBits( DeviceSpan<uint32_t>& destination, hipStream_t stream );
 
