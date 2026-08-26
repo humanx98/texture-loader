@@ -102,7 +102,7 @@ class RequestProcessor : NonCopyble
 
   private:
     void workerLoop();
-    void waitForResidentBitsUploadLocked( std::unique_lock<std::mutex>& lock );
+    void waitForResidentBitsUpload();
 
     mutable std::mutex       mutex_;
     RequestQueue             queue_;
@@ -113,11 +113,9 @@ class RequestProcessor : NonCopyble
     HipEventPool&            eventPool_;
     hipEvent_t               residentBitsUploadDone_     = nullptr;
     bool                     residentBitsUploadInFlight_ = false;
-    bool                     residentBitsUploadWaiting_  = false;
-    std::condition_variable  residentBitsUploadFinished_;
-    bool                     residentBitsDirty_ = false;
-    bool                     stopped_           = false;
-    DemandTextureLoaderImpl* loader_            = nullptr;
+    bool                     residentBitsDirty_          = false;
+    bool                     stopped_                    = false;
+    DemandTextureLoaderImpl* loader_                     = nullptr;
 };
 
 }  // namespace hip_demand::vmm

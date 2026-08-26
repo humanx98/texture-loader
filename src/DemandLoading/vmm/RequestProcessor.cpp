@@ -59,7 +59,7 @@ void RequestProcessor::stop()
     }
 
     std::unique_lock<std::mutex> lock( mutex_ );
-    waitForResidentBitsUploadLocked( lock );
+    waitForResidentBitsUpload();
 }
 
 void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket )
@@ -80,29 +80,20 @@ void RequestProcessor::uploadResidentBits( DeviceSpan<uint32_t>& destination, hi
     if( !residentBitsDirty_ )
         return;
 
-    waitForResidentBitsUploadLocked( lock );
+    waitForResidentBitsUpload();
     memcpyHtoD( destination, residentBits_.words(), stream );
     HIP_CHECK( hipEventRecord( residentBitsUploadDone_, stream ) );
     residentBitsUploadInFlight_ = true;
     residentBitsDirty_          = false;
 }
 
-void RequestProcessor::waitForResidentBitsUploadLocked( std::unique_lock<std::mutex>& lock )
+void RequestProcessor::waitForResidentBitsUpload()
 {
-    assert( lock.owns_lock() );
-
-    residentBitsUploadFinished_.wait( lock, [this] { return !residentBitsUploadWaiting_; } );
     if( !residentBitsUploadInFlight_ )
         return;
 
-    residentBitsUploadWaiting_ = true;
-    lock.unlock();
-    HIP_WARN(hipEventSynchronize( residentBitsUploadDone_ ));
-    lock.lock();
-
+    HIP_WARN( hipEventSynchronize( residentBitsUploadDone_ ) );
     residentBitsUploadInFlight_ = false;
-    residentBitsUploadWaiting_  = false;
-    residentBitsUploadFinished_.notify_all();
 }
 
 void RequestProcessor::workerLoop()
@@ -148,7 +139,7 @@ void RequestProcessor::workerLoop()
                 std::unique_lock<std::mutex> lock( mutex_ );
                 if( success )
                 {
-                    waitForResidentBitsUploadLocked( lock );
+                    waitForResidentBitsUpload();
                     residentBits_.set( resourceId, true );
                     residentBitsDirty_ = true;
                 }
