@@ -312,12 +312,17 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     mutable std::mutex           metadataMutex_;
     Allocator<DeviceTextureInfo> textureInfoAllocator_;
     PageTable                    pageTable_{};
+    uint32_t                     maxResources_ = 0;
     // note that this list should be accessed by texture.loadedTextureInfoId
     // and it's ordered by startPage in order to use std::upper_bound
     std::vector<DeviceTextureInfo> loadedTextureInfos_{};
 
     RequestProcessor requestProcessor_;
     HostAllocator    hostAllocator_;
+    struct {
+        hipModule_t module;
+        hipFunction_t collectRequests;
+    } kernels_{};
 };
 
 }  // namespace hip_demand::vmm

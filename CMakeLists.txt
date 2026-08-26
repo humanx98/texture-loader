@@ -84,6 +84,16 @@ set(TEXTURE_LOADER_HEADERS
     src/DemandLoading/DemandTextureLoaderImpl.h
 )
 
+hip_add_executable(
+    TARGET hip_demand_texture_kernels
+    SOURCES src/DemandLoading/vmm/VmmTextureLoaderKernels.hip
+    ARCHITECTURES ${HIP_ARCHITECTURES}
+    OPTIONS -O3 --std=c++17
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
+    DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
+)
+
 if(USE_OIIO)
     list(APPEND TEXTURE_LOADER_SOURCES
         src/ImageSource/OIIOReader.cpp
@@ -120,6 +130,16 @@ target_include_directories(hip_demand_texture
 target_link_libraries(hip_demand_texture
     PUBLIC
         hip::host
+)
+
+add_dependencies(hip_demand_texture hip_demand_texture_kernels)
+
+add_custom_command(TARGET hip_demand_texture POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_PROPERTY:hip_demand_texture_kernels,HIP_CODE_OBJECT>
+        $<TARGET_FILE_DIR:hip_demand_texture>/hip_demand_texture_kernels.co
+    COMMENT "Copying request compaction HIP kernel code object"
+    VERBATIM
 )
 
 target_compile_definitions(hip_demand_texture PRIVATE __HIP_PLATFORM_AMD__)
@@ -590,6 +610,20 @@ install(TARGETS hip_demand_texture
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
 )
+
+if(WIN32)
+    install(FILES
+        $<TARGET_PROPERTY:hip_demand_texture_kernels,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME hip_demand_texture_kernels.co
+    )
+else()
+    install(FILES
+        $<TARGET_PROPERTY:hip_demand_texture_kernels,HIP_CODE_OBJECT>
+        DESTINATION lib
+        RENAME hip_demand_texture_kernels.co
+    )
+endif()
 
 install(DIRECTORY include/
     DESTINATION include

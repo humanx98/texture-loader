@@ -1,7 +1,47 @@
 #include "DemandTextureLoaderImpl.h"
 #include <ImageSource/TextureInfo.h>
 
+#include <filesystem>
+
+#if defined( _WIN32 )
+#define NOMINMAX
+#include <Windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 namespace hip_demand::vmm {
+
+static std::filesystem::path getLibraryDirectory()
+{
+#if defined( _WIN32 )
+    HMODULE module = nullptr;
+    if( !GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>( &getLibraryDirectory ), &module ) )
+    {
+        throw std::runtime_error( "Failed to locate hip_demand_texture library" );
+    }
+
+    std::vector<wchar_t> path( MAX_PATH );
+    DWORD                pathLength = GetModuleFileNameW( module, path.data(), static_cast<DWORD>( path.size() ) );
+    if( pathLength == path.size() )
+    {
+        path.resize( 32768 );
+        pathLength = GetModuleFileNameW( module, path.data(), static_cast<DWORD>( path.size() ) );
+    }
+
+    if( pathLength == 0 || pathLength == path.size() )
+        throw std::runtime_error( "Failed to get hip_demand_texture library path" );
+
+    return std::filesystem::path( path.data(), path.data() + pathLength ).parent_path();
+#else
+    Dl_info libraryInfo{};
+    if( dladdr( reinterpret_cast<const void*>( &getLibraryDirectory ), &libraryInfo ) == 0 || !libraryInfo.dli_fname )
+        throw std::runtime_error( "Failed to locate hip_demand_texture library" );
+
+    return std::filesystem::path( libraryInfo.dli_fname ).parent_path();
+#endif
+}
 
 class HipCallback
 {
@@ -80,18 +120,29 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     , pageSystem_( options_.maxVirtualPages, options_.maxPhysicalPages )
     , textureInfoAllocator_( pageSystem_ )
     , pageTable_( createPageTable( options, pageSystem_.pageBytes() ) )
-    , requestProcessor_( this, eventPool_, getResourceCount( pageTable_ ), options_.maxThreads, options_.maxRequestQueue )
+    , maxResources_( getResourceCount( pageTable_ ) )
+    , requestProcessor_( this, eventPool_, maxResources_, options_.maxThreads, options_.maxRequestQueue )
     , hostAllocator_( requestProcessor_.threadCount() * 3, eventPool_ )
 {
     if( options_.maxRequests == 0 )
         throw std::invalid_argument( "maxRequests cannot be 0" );
 
     textureInfoAllocator_.setRange( pageTable_.textureInfos );
+
+    const std::filesystem::path kernelsPath = getLibraryDirectory() / "hip_demand_texture_kernels.co";
+    HIP_CHECK( hipModuleLoad( &kernels_.module, kernelsPath.string().c_str() ) );
+    HIP_CHECK( hipModuleGetFunction( &kernels_.collectRequests, kernels_.module, "collectRequests" ) );
 }
 
 DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
 {
     requestProcessor_.stop();
+
+    if( kernels_.module )
+    {
+        HIP_WARN( hipModuleUnload( kernels_.module ) );
+        kernels_ = {};
+    }
 
     if( !inFlight_.empty() )
     {
@@ -188,6 +239,11 @@ void DemandTextureLoaderImpl::freeDeviceContext( DeviceContext& deviceContext, b
     freeDeviceContextList_.push_back( deviceContext.poolIndex );
 }
 
+inline uint32_t roundNearest32( uint32_t value )
+{
+    return ( value + 31 ) & 0xFFFFFFE0;  // Round to nearest multiple of 32
+}
+
 Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceContext& deviceContext )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
@@ -203,7 +259,13 @@ Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const Devic
         return ticket;
     }
 
-    InFlight& flight = inFlight_.at( deviceContext.poolIndex );
+    InFlight&      flight             = inFlight_.at( deviceContext.poolIndex );
+    const uint32_t resourcesPerThread = std::max( 32U, roundNearest32( maxResources_ / 65536U ) );
+    const uint32_t blockSize          = 256;
+    const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
+    const uint32_t gridSize           = ( maxResources_ + resourcesPerBlock - 1 ) / resourcesPerBlock;
+    void*          arguments[]        = { &flight.deviceContext };
+    HIP_CHECK( hipModuleLaunchKernel( kernels_.collectRequests, gridSize, 1, 1, blockSize, 1, 1, 0, stream, arguments, nullptr ) );
     memcpyDtoH( flight.requestedResources, deviceContext.requestedResources, stream );
     memcpyDtoH( flight.counters, deviceContext.counters, stream );
     ProcessRequestCallback::enqueue( stream, new ProcessRequestCallback( *this, deviceContext, ticket ) );
@@ -216,6 +278,10 @@ void DemandTextureLoaderImpl::processRequestsCallback( DeviceContext& deviceCont
 
     InFlight& flight       = inFlight_.at( deviceContext.poolIndex );
     uint32_t  requestCount = flight.counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
+
+    // clamp here in order to avoid atomicMin on gpu
+    requestCount = std::min( static_cast<uint32_t>( flight.requestedResources.len ), requestCount );
+
     requestProcessor_.submit( flight.requestedResources.ptr, requestCount, std::move( ticket ) );
     freeDeviceContext( deviceContext, false );
 }

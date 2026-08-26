@@ -12,24 +12,6 @@ namespace hip_demand::vmm {
 
 #if !defined( __HIPCC__ )
 
-#if !defined( __ATOMIC_RELAXED )
-#define __ATOMIC_RELAXED 0
-#endif
-
-template <typename T>
-HIP_DEMAND_INLINE T __atomic_load_n( const T* address, int )
-{
-    return *address;
-}
-
-HIP_DEMAND_INLINE uint32_t atomicCAS( uint32_t* address, uint32_t compare, uint32_t value )
-{
-    const uint32_t oldValue = *address;
-    if( oldValue == compare )
-        *address = value;
-    return oldValue;
-}
-
 HIP_DEMAND_INLINE uint32_t atomicOr( uint32_t* address, uint32_t value )
 {
     const uint32_t oldValue = *address;
@@ -98,49 +80,10 @@ HIP_DEMAND_INLINE void getWordIdxAndBitIdx( uint32_t idx, uint32_t& wordIdx, uin
 
 HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId )
 {
-    // TODO_BS: create a kernel that will collect all requested resource ids and remove atomics here
-    uint32_t  maxRequests    = static_cast<uint32_t>( context.requestedResources.len );
-    uint32_t* requestCounter = &context.counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
-    // Use __atomic_load_n for a true atomic load (no read-modify-write overhead).
-    uint32_t requestCount = __atomic_load_n( requestCounter, __ATOMIC_RELAXED );
-    if( requestCount >= maxRequests )
-        return;
-
-#if defined( HIP_ENABLE_WARP_SYNC_BUILTINS )
-    // Wave-level deduplication: only one lane per unique resourceId writes to global memory.
-    // __match_any_sync returns a mask of lanes that have the same value.
-    const uint64_t active = __activemask();
-    const uint64_t match  = __match_any_sync( active, resourceId );
-
-    // Find the leader lane (lowest active lane with this texId)
-    const int leader = __ffsll( static_cast<long long>( match ) ) - 1;
-    const int lane   = __lane_id();
-
-    // Only the leader lane issues the atomic
-    if( lane != leader )
-        return;
-#endif
-
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
     getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
-    const uint32_t mask = 1u << bitIdx;
-
-    uint32_t old = atomicOr( &context.requestedBits.ptr[wordIdx], mask );
-    if( ( old & mask ) != 0u )
-        return;
-
-    while( requestCount < maxRequests )
-    {
-        const uint32_t observed = atomicCAS( requestCounter, requestCount, requestCount + 1u );
-        if( observed == requestCount )
-        {
-            context.requestedResources.ptr[requestCount] = resourceId;
-            return;
-        }
-
-        requestCount = observed;
-    }
+    atomicOr( &context.requestedBits.ptr[wordIdx], 1u << bitIdx );
 }
 
 HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId )
@@ -253,8 +196,8 @@ template <class Sample>
 HIP_DEMAND_INLINE Sample
 fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, const DeviceMipLevel& mip, int x, int y, bool& resident )
 {
-    resident = false;
-    bool        valid = true;
+    resident   = false;
+    bool valid = true;
 
     x = applyAddressMode( x, static_cast<int>( mip.width ), texture.addressMode[0], valid );
     y = applyAddressMode( y, static_cast<int>( mip.height ), texture.addressMode[1], valid );
@@ -277,10 +220,10 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, cons
     {
         const uint32_t tileX = static_cast<uint32_t>( x ) / texture.tileWidth;
         const uint32_t tileY = static_cast<uint32_t>( y ) / texture.tileHeight;
-        pageId              = mip.startPage + tileY * mip.tilesX + tileX;
-        const size_t localX = static_cast<size_t>( x ) % texture.tileWidth;
-        const size_t localY = static_cast<size_t>( y ) % texture.tileHeight;
-        pageByteOffset      = ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+        pageId               = mip.startPage + tileY * mip.tilesX + tileX;
+        const size_t localX  = static_cast<size_t>( x ) % texture.tileWidth;
+        const size_t localY  = static_cast<size_t>( y ) % texture.tileHeight;
+        pageByteOffset       = ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
     }
 
     const uint32_t resourceId = context.pageTable.getResourceIdByTextureTilePage( pageId );
@@ -299,7 +242,7 @@ template <class Sample>
 HIP_DEMAND_INLINE Sample
 sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, float x, float y, bool& isResident )
 {
-    isResident = false;
+    isResident               = false;
     const DeviceMipLevel mip = texture.getMipLevel( mipLevel );
     if( texture.normalizedCoords )
     {
@@ -402,7 +345,7 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
     const DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
     if( texture.normalizedCoords )
     {
-        const DeviceMipLevel baseMip = texture.getMipLevel(0);
+        const DeviceMipLevel baseMip = texture.getMipLevel( 0 );
         ddx.x *= static_cast<float>( baseMip.width );
         ddx.y *= static_cast<float>( baseMip.height );
         ddy.x *= static_cast<float>( baseMip.width );

@@ -139,7 +139,7 @@ void test( const fs::path& executableDir )
     const size_t         byteCount = width * height * 4;
 
     hipStream_t stream = nullptr;
-    HIP_CHECK( hipStreamCreate( &stream ) );
+    HIP_CHECK( hipStreamCreateWithFlags( &stream, hipStreamNonBlocking ) );
 
     std::vector<uint8_t> hostOutput( byteCount );
     uint8_t*             deviceOutput = nullptr;
@@ -292,7 +292,7 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
     KernelModule module;
     module.load( kernelPath );
 
-    constexpr uint32_t IN_FLIGHT_COUNT = 5;
+    constexpr uint32_t IN_FLIGHT_COUNT = 4;
 
     Options options{};
     options.maxPhysicalPages = 4096;
