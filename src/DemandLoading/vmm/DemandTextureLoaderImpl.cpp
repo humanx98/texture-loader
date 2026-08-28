@@ -88,30 +88,39 @@ struct DeviceContextImpl : DeviceContext
     uint32_t* h_counters           = nullptr;
 };
 
-static PageTable createPageTable( const Options& options, size_t pageSize )
+inline ResourceTable createResourceTable( const Options& options, size_t pageSize )
 {
-    PageTable pageTable{};
-    pageTable.pageSize    = pageSize;
-    pageTable.maxTextures = options.maxTextures;
+    const size_t   maxTextureInfoSize  = options.maxTextures * sizeof( DeviceTextureInfo );
+    const uint32_t maxTextureInfoPages = static_cast<uint32_t>( ceilDiv( maxTextureInfoSize, pageSize ) );
+    if( maxTextureInfoPages > options.maxVirtualPages )
+        throw std::invalid_argument( "maxVirtualPages is too small to store texture metadata" );
 
-    const size_t   maxTextureInfoSize  = pageTable.maxTextures * sizeof( DeviceTextureInfo );
-    const uint32_t maxTextureInfoPages = static_cast<uint32_t>( ceilDiv( maxTextureInfoSize, pageTable.pageSize ) );
+    const uint32_t maxTextureTilePages = options.maxVirtualPages - maxTextureInfoPages;
+
+    ResourceTable table{};
+    table.textureTiles = ResourceTable::Range( 0, maxTextureTilePages );
+    table.textureInfos = ResourceTable::Range( table.textureTiles.end(), options.maxTextures );
+
+    uint32_t resourceCount = 0;
+    if( !safeAdd( table.textureTiles.count, table.textureInfos.count, resourceCount ) )
+        throw std::overflow_error(
+            "Cannot create demand texture loader: total resource count exceeds the uint32_t limit" );
+
+    return table;
+}
+
+inline PageTable createPageTable( const ResourceTable& resourceTable, const Options& options, size_t pageSize )
+{
+    const size_t   maxTextureInfoSize  = resourceTable.textureInfos.count * sizeof( DeviceTextureInfo );
+    const uint32_t maxTextureInfoPages = static_cast<uint32_t>( ceilDiv( maxTextureInfoSize, pageSize ) );
     if( maxTextureInfoPages > options.maxVirtualPages )
         throw std::invalid_argument( "maxVirtualPages is too small to store texture metadata" );
     const uint32_t maxTextureTilePages = options.maxVirtualPages - maxTextureInfoPages;
 
-    pageTable.textureInfos = PageTable::Range( 0, maxTextureInfoPages );
-    pageTable.textureTiles = PageTable::Range( pageTable.textureInfos.pageCount, maxTextureTilePages );
+    PageTable pageTable{};
+    pageTable.textureTiles = PageTable::Range( 0, maxTextureTilePages );
+    pageTable.textureInfos = PageTable::Range( pageTable.textureTiles.pageCount, maxTextureInfoPages );
     return pageTable;
-}
-
-static uint32_t getResourceCount( const PageTable& pageTable )
-{
-    uint32_t resourceCount = 0;
-    if( !safeAdd( pageTable.maxTextures, pageTable.textureTiles.pageCount, resourceCount ) )
-        throw std::overflow_error(
-            "Cannot create demand texture loader: total resource count exceeds the uint32_t limit" );
-    return resourceCount;
 }
 
 DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
@@ -119,9 +128,9 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     , eventPool_( 10 )
     , pageSystem_( options_.maxVirtualPages, options_.maxPhysicalPages )
     , textureInfoAllocator_( pageSystem_ )
-    , pageTable_( createPageTable( options, pageSystem_.pageBytes() ) )
-    , maxResources_( getResourceCount( pageTable_ ) )
-    , requestProcessor_( this, eventPool_, maxResources_, options_.maxThreads, options_.maxRequestQueue )
+    , resourceTable_( createResourceTable( options_, pageSystem_.pageBytes() ) )
+    , pageTable_( createPageTable( resourceTable_, options_, pageSystem_.pageBytes() ) )
+    , requestProcessor_( this, eventPool_, resourceTable_.count(), options_.maxThreads, options_.maxRequestQueue )
     , hostAllocator_( requestProcessor_.threadCount() * 3, eventPool_ )
 {
     if( options_.maxRequests == 0 )
@@ -221,10 +230,11 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
     flight.counters           = hostAllocArray<uint32_t>( flight.deviceContext.counters.len );
 
     // set data per loader
-    flight.deviceContext.pageTable    = pageTable_;
-    flight.deviceContext.pageMemory   = pageSystem_.virtualAddressSpace();
-    flight.deviceContext.residentBits = residentBits_;
-    flight.deviceContext.textureInfos = textureInfos_;
+    flight.deviceContext.resourceTable = resourceTable_;
+    flight.deviceContext.pageSize      = pageSystem_.pageBytes();
+    flight.deviceContext.pageMemory    = pageSystem_.virtualAddressSpace();
+    flight.deviceContext.residentBits  = residentBits_;
+    flight.deviceContext.textureInfos  = textureInfos_;
 
     deviceContext = flight.deviceContext;
 }
@@ -261,10 +271,10 @@ Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const Devic
     }
 
     InFlight&      flight             = inFlight_.at( deviceContext.poolIndex );
-    const uint32_t resourcesPerThread = std::max( 32U, roundNearest32( maxResources_ / 65536U ) );
+    const uint32_t resourcesPerThread = std::max( 32U, roundNearest32( resourceTable_.count() / 65536U ) );
     const uint32_t blockSize          = 256;
     const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
-    const uint32_t gridSize           = ( maxResources_ + resourcesPerBlock - 1 ) / resourcesPerBlock;
+    const uint32_t gridSize           = ( resourceTable_.count() + resourcesPerBlock - 1 ) / resourcesPerBlock;
     void*          arguments[]        = { &flight.deviceContext };
     HIP_CHECK( hipModuleLaunchKernel( kernels_.collectRequests, gridSize, 1, 1, blockSize, 1, 1, 0, stream, arguments, nullptr ) );
     memcpyDtoH( flight.requestedResources, deviceContext.requestedResources, stream );
@@ -413,7 +423,8 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
         }
 
         // TODO_BS: how to handle it?
-        if( pageTable_.textureTiles.nextAvailablePage + pageCount > options_.maxVirtualPages )
+        const uint32_t end = pageTable_.textureTiles.startPage + pageTable_.textureTiles.pageCount;
+        if( pageTable_.textureTiles.nextAvailablePage > end || pageCount > end - pageTable_.textureTiles.nextAvailablePage )
             throw std::runtime_error( "Maximum demand virtual page count exceeded" );
 
         texture->loadedTextureInfoId = static_cast<uint32_t>( loadedTextureInfos_.size() );
@@ -499,13 +510,13 @@ Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
 {
     std::lock_guard<std::mutex> lock( metadataMutex_ );
 
-    if( resourceId < options_.maxTextures )
+    if( resourceTable_.textureInfos.contains( resourceId ) )
     {
-        return Resource( pageTable_.getTextureIdByResourceId( resourceId ) );
+        return Resource( resourceId - resourceTable_.textureInfos.start );
     }
     else
     {
-        const uint32_t pageId = pageTable_.getTextureTilePageByResourceId( resourceId );
+        const uint32_t pageId = resourceId - resourceTable_.textureTiles.start;
         const auto     it =
             std::upper_bound( loadedTextureInfos_.cbegin(), loadedTextureInfos_.cend(), pageId,
                               []( uint32_t page, const DeviceTextureInfo& info ) { return page < info.startPage; } );

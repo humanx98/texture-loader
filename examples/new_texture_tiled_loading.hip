@@ -126,7 +126,7 @@ extern "C" __global__ void renderVmmTextureMipGrid( hip_demand::vmm::DeviceConte
     const size_t   outputOffset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
 
     // The texture metadata must be resident before the mip count can be inspected.
-    const uint32_t textureResourceId = context.pageTable.getResourceIdByTextureId( textureId );
+    const uint32_t textureResourceId = context.resourceTable.textureInfos.getResourceId( textureId );
     if( !hip_demand::vmm::isResourceResident( context, textureResourceId ) )
     {
         bool resident = false;

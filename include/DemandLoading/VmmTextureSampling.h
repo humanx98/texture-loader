@@ -226,14 +226,14 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, cons
         pageByteOffset       = ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
     }
 
-    const uint32_t resourceId = context.pageTable.getResourceIdByTextureTilePage( pageId );
+    const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
     if( !isResourceResident( context, resourceId ) )
     {
         recordRequest( context, resourceId );
         return Sample{};
     }
 
-    const size_t byteOffset = static_cast<size_t>( pageId ) * context.pageTable.pageSize + pageByteOffset;
+    const size_t byteOffset = static_cast<size_t>( pageId ) * context.pageSize + pageByteOffset;
     resident                = true;
     return decodeTexel<Sample>( context.pageMemory.ptr + byteOffset, texture.format, texture.numChannels );
 }
@@ -289,7 +289,7 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
         return Sample{};
     }
 
-    const uint32_t resourceId = context.pageTable.getResourceIdByTextureId( textureId );
+    const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
     if( !isResourceResident( context, resourceId ) )
     {
         recordRequest( context, resourceId );
@@ -335,7 +335,7 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
         return Sample{};
     }
 
-    const uint32_t resourceId = context.pageTable.getResourceIdByTextureId( textureId );
+    const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
     if( !isResourceResident( context, resourceId ) )
     {
         recordRequest( context, resourceId );

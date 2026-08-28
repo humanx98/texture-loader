@@ -311,8 +311,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     // metadata
     mutable std::mutex           metadataMutex_;
     Allocator<DeviceTextureInfo> textureInfoAllocator_;
+    ResourceTable                resourceTable_{};
     PageTable                    pageTable_{};
-    uint32_t                     maxResources_ = 0;
     // note that this list should be accessed by texture.loadedTextureInfoId
     // and it's ordered by startPage in order to use std::upper_bound
     std::vector<DeviceTextureInfo> loadedTextureInfos_{};

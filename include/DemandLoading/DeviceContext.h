@@ -113,41 +113,29 @@ struct DeviceTextureInfo
     }
 };
 
-struct PageTable
+struct ResourceTable
 {
     struct Range
     {
-        uint32_t startPage         = 0;
-        uint32_t pageCount         = 0;
-        uint32_t nextAvailablePage = 0;
+        uint32_t start = 0;
+        uint32_t count = 0;
 
         HIP_DEMAND_INLINE Range() {}
-        HIP_DEMAND_INLINE Range( uint32_t start, uint32_t count )
-            : startPage( start )
-            , pageCount( count )
-            , nextAvailablePage( start )
+        HIP_DEMAND_INLINE Range( uint32_t start_, uint32_t count_ )
+            : start( start_ )
+            , count( count_ )
         {
         }
+
+        HIP_DEMAND_INLINE bool     contains( uint32_t id ) const { return start <= id && id < end(); }
+        HIP_DEMAND_INLINE uint32_t end() const { return start + count; }
+        HIP_DEMAND_INLINE uint32_t getResourceId( uint32_t id ) const { return start + id; }
     };
 
-    size_t   pageSize = 0;
-    Range    textureInfos{};
-    uint32_t maxTextures = 0;
-    Range    textureTiles{};
+    Range textureTiles{};
+    Range textureInfos{};
 
-    HIP_DEMAND_INLINE uint32_t getTextureIdByResourceId( uint32_t resourceId ) const { return resourceId; }
-
-    HIP_DEMAND_INLINE uint32_t getTextureTilePageByResourceId( uint32_t resourceId ) const
-    {
-        return textureTiles.startPage + resourceId - maxTextures;
-    }
-
-
-    HIP_DEMAND_INLINE uint32_t getResourceIdByTextureId( uint32_t textureId ) const { return textureId; }
-    HIP_DEMAND_INLINE uint32_t getResourceIdByTextureTilePage( uint32_t pageId ) const
-    {
-        return pageId - textureTiles.startPage + maxTextures;
-    }
+    HIP_DEMAND_INLINE uint32_t count() const { return textureTiles.count + textureInfos.count; }
 };
 
 enum class CounterIndex : uint32_t
@@ -158,14 +146,15 @@ enum class CounterIndex : uint32_t
 
 struct DeviceContext
 {
-    PageTable                      pageTable{};
+    ResourceTable                  resourceTable{};
     DeviceSpan<uint8_t>            pageMemory{};
     DeviceSpan<uint32_t>           residentBits{};
     DeviceSpan<DeviceTextureInfo*> textureInfos{};
     DeviceSpan<uint32_t>           requestedBits{};
     DeviceSpan<uint32_t>           requestedResources{};
     DeviceSpan<uint32_t>           counters{};
-    size_t                         poolIndex = 0;
+    size_t                         pageSize          = 0;
+    size_t                         poolIndex         = 0;
     bool                           requestIfResident = false;
 };
 

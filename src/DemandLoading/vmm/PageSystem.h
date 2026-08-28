@@ -8,6 +8,27 @@
 
 namespace hip_demand::vmm {
 
+struct PageTable
+{
+    struct Range
+    {
+        uint32_t startPage         = 0;
+        uint32_t pageCount         = 0;
+        uint32_t nextAvailablePage = 0;
+
+        Range() {}
+        Range( uint32_t start, uint32_t count )
+            : startPage( start )
+            , pageCount( count )
+            , nextAvailablePage( start )
+        {
+        }
+    };
+
+    Range    textureInfos{};
+    Range    textureTiles{};
+};
+
 class PageSystem : NonCopyble
 {
   public:
