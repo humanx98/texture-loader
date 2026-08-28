@@ -42,7 +42,7 @@ struct Options
     uint32_t maxRequests      = 1024;
     uint32_t maxRequestQueue  = 1024;
     uint32_t maxThreads       = 0;
-    //bool     enableEviction     = true;
+    bool     enableEviction   = true;
     //uint32_t minResidentFrames  = 3;
 };
 

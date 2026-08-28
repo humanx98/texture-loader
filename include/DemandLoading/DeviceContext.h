@@ -166,6 +166,7 @@ struct DeviceContext
     DeviceSpan<uint32_t>           requestedResources{};
     DeviceSpan<uint32_t>           counters{};
     size_t                         poolIndex = 0;
+    bool                           requestIfResident = false;
 };
 
 }  // namespace hip_demand::vmm
