@@ -37,49 +37,6 @@ HIP_DEMAND_INLINE size_t ceilDiv( size_t value, size_t divisor )
     return value / divisor + static_cast<size_t>( value % divisor != 0 );
 }
 
-class Bitset : NonCopyble
-{
-  public:
-    Bitset( uint32_t count = 0 ) { resize( count ); }
-
-    void resize( uint32_t count )
-    {
-        count_ = count;
-        words_.resize( ceilDiv( count, 32 ), 0 );
-    }
-
-    void set( uint32_t index, bool value )
-    {
-        validate( index );
-        const uint32_t mask = 1u << ( index % 32u );
-        if( value )
-            words_[index / 32] |= mask;
-        else
-            words_[index / 32] &= ~mask;
-    }
-
-    bool test( uint32_t index ) const
-    {
-        validate( index );
-        return ( words_[index / 32] & ( 1u << ( index % 32u ) ) ) != 0;
-    }
-
-    uint32_t                     bitCount() const { return count_; }
-    uint32_t                     wordCount() const { return static_cast<uint32_t>( words_.size() ); }
-    const std::vector<uint32_t>& words() const { return words_; }
-    std::vector<uint32_t>&       words() { return words_; }
-
-  private:
-    void validate( uint32_t index ) const
-    {
-        if( index >= count_ )
-            throw std::out_of_range( "index is outside the bitset" );
-    }
-
-    uint32_t              count_ = 0;
-    std::vector<uint32_t> words_;
-};
-
 /// Calculate total memory needed for mipmaps
 inline size_t calculateMipmapMemory( int width, int height, int bytesPerPixel )
 {
@@ -231,20 +188,37 @@ static void hostFreeArray( HostSpan<T>& span )
     span.len = 0;
 }
 
-class Bitset2 : NonCopyble
+template <bool PinnedMemory>
+class Bitset : NonCopyble
 {
   public:
-    Bitset2( uint32_t count = 0 )
+    Bitset( uint32_t count = 0 )
     {
         count_ = count;
-        words_ = hostAllocArray<uint32_t>( ceilDiv( count, 32 ) );
+        if constexpr( PinnedMemory )
+        {
+            words_ = hostAllocArray<uint32_t>( ceilDiv( count, 32u ) );
+        }
+        else
+        {
+            words_.ptr = new uint32_t[count];
+            words_.len = count;
+        }
         std::memset( words_.ptr, 0, words_.sizeInBytes() );
     }
 
-    ~Bitset2()
+    ~Bitset()
     {
         count_ = 0;
-        hostFreeArray( words_ );
+        if constexpr( PinnedMemory )
+        {
+            hostFreeArray( words_ );
+        }
+        else
+        {
+            delete[] words_.ptr;
+            words_.ptr = nullptr;
+        }
     }
 
     void set( uint32_t index, bool value )

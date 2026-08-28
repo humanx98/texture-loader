@@ -107,8 +107,8 @@ class RequestProcessor : NonCopyble
     mutable std::mutex       mutex_;
     RequestQueue             queue_;
     std::vector<std::thread> workers_;
-    Bitset2                  residenceBits_;
-    Bitset                   loadingBits_;
+    Bitset<true>            residenceBits_;
+    Bitset<false>           loadingBits_;
     std::condition_variable  loading_;
     HipEventPool&            eventPool_;
     hipEvent_t               residenceBitsUploadDone_     = nullptr;
