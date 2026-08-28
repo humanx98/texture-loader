@@ -7,12 +7,12 @@ namespace hip_demand::vmm {
 
 RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, HipEventPool& eventPool, uint32_t resourceCount, uint32_t maxThreads, uint32_t maxQueueSize )
     : queue_( maxQueueSize )
-    , residentBits_( resourceCount )
+    , residenceBits_( resourceCount )
     , loadingBits_( resourceCount )
     , eventPool_( eventPool )
     , loader_( loader )
 {
-    residentBitsUploadDone_ = eventPool_.acquire();
+    residenceBitsUploadDone_ = eventPool_.acquire();
 
     if( maxThreads == 0 )
         maxThreads = std::thread::hardware_concurrency();
@@ -29,9 +29,9 @@ RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, HipEventPoo
         queue_.close();
         for( std::thread& worker : workers_ )
             worker.join();
-        if( residentBitsUploadDone_ )
-            eventPool_.release( residentBitsUploadDone_ );
-        residentBitsUploadDone_ = nullptr;
+        if( residenceBitsUploadDone_ )
+            eventPool_.release( residenceBitsUploadDone_ );
+        residenceBitsUploadDone_ = nullptr;
         throw;
     }
 }
@@ -40,8 +40,8 @@ RequestProcessor::~RequestProcessor()
 {
     stop();
 
-    if( residentBitsUploadDone_ )
-        eventPool_.release( residentBitsUploadDone_ );
+    if( residenceBitsUploadDone_ )
+        eventPool_.release( residenceBitsUploadDone_ );
 }
 
 void RequestProcessor::stop()
@@ -59,7 +59,7 @@ void RequestProcessor::stop()
     }
 
     std::unique_lock<std::mutex> lock( mutex_ );
-    waitForResidentBitsUpload();
+    waitForResidenceBitsUpload();
 }
 
 void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket )
@@ -74,26 +74,26 @@ void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Tick
     queue_.push( resourceIds, count, ticket );
 }
 
-void RequestProcessor::uploadResidentBits( DeviceSpan<uint32_t>& destination, hipStream_t stream )
+void RequestProcessor::uploadResidenceBits( DeviceSpan<uint32_t>& destination, hipStream_t stream )
 {
     std::unique_lock<std::mutex> lock( mutex_ );
-    if( !residentBitsDirty_ )
+    if( !residenceBitsDirty_ )
         return;
 
-    waitForResidentBitsUpload();
-    memcpyHtoD( destination, residentBits_.words(), stream );
-    HIP_CHECK( hipEventRecord( residentBitsUploadDone_, stream ) );
-    residentBitsUploadInFlight_ = true;
-    residentBitsDirty_          = false;
+    waitForResidenceBitsUpload();
+    memcpyHtoD( destination, residenceBits_.words(), stream );
+    HIP_CHECK( hipEventRecord( residenceBitsUploadDone_, stream ) );
+    residenceBitsUploadInFlight_ = true;
+    residenceBitsDirty_          = false;
 }
 
-void RequestProcessor::waitForResidentBitsUpload()
+void RequestProcessor::waitForResidenceBitsUpload()
 {
-    if( !residentBitsUploadInFlight_ )
+    if( !residenceBitsUploadInFlight_ )
         return;
 
-    HIP_WARN( hipEventSynchronize( residentBitsUploadDone_ ) );
-    residentBitsUploadInFlight_ = false;
+    HIP_WARN( hipEventSynchronize( residenceBitsUploadDone_ ) );
+    residenceBitsUploadInFlight_ = false;
 }
 
 void RequestProcessor::workerLoop()
@@ -116,7 +116,7 @@ void RequestProcessor::workerLoop()
 
                 loading_.wait( lock, [this, resourceId] { return !loadingBits_.test( resourceId ); } );
 
-                if( !stopped_ && !residentBits_.test( resourceId ) )
+                if( !stopped_ && !residenceBits_.test( resourceId ) )
                 {
                     loadingBits_.set( resourceId, true );
                     shouldLoad = true;
@@ -139,9 +139,9 @@ void RequestProcessor::workerLoop()
                 std::unique_lock<std::mutex> lock( mutex_ );
                 if( success )
                 {
-                    waitForResidentBitsUpload();
-                    residentBits_.set( resourceId, true );
-                    residentBitsDirty_ = true;
+                    waitForResidenceBitsUpload();
+                    residenceBits_.set( resourceId, true );
+                    residenceBitsDirty_ = true;
                 }
                 loadingBits_.set( resourceId, false );
                 loading_.notify_all();

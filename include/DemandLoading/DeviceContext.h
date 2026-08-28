@@ -148,9 +148,9 @@ struct DeviceContext
 {
     ResourceTable                  resourceTable{};
     DeviceSpan<uint8_t>            pageMemory{};
-    DeviceSpan<uint32_t>           residentBits{};
+    DeviceSpan<uint32_t>           residenceBits{};
     DeviceSpan<DeviceTextureInfo*> textureInfos{};
-    DeviceSpan<uint32_t>           requestedBits{};
+    DeviceSpan<uint32_t>           referenceBits{};
     DeviceSpan<uint32_t>           requestedResources{};
     DeviceSpan<uint32_t>           counters{};
     size_t                         pageSize          = 0;

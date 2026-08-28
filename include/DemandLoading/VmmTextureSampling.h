@@ -83,7 +83,7 @@ HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t res
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
     getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
-    atomicOr( &context.requestedBits.ptr[wordIdx], 1u << bitIdx );
+    atomicOr( &context.referenceBits.ptr[wordIdx], 1u << bitIdx );
 }
 
 HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId )
@@ -91,7 +91,7 @@ HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
     getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
-    return ( context.residentBits.ptr[wordIdx] & ( 1u << bitIdx ) ) != 0;
+    return ( context.residenceBits.ptr[wordIdx] & ( 1u << bitIdx ) ) != 0;
 }
 
 HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mode, bool& valid )

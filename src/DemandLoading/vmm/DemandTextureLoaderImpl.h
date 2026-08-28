@@ -301,7 +301,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     HipEventPool       eventPool_;
     PageSystem         pageSystem_;
 
-    DeviceSpan<uint32_t>           residentBits_{};
+    DeviceSpan<uint32_t>           residenceBits_{};
     DeviceSpan<DeviceTextureInfo*> textureInfos_{};
 
     std::vector<InFlight>                           inFlight_{};

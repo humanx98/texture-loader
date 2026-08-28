@@ -178,18 +178,18 @@ void test( const fs::path& executableDir )
     HIP_CHECK( hipStreamSynchronize( stream ) );
     //{
     //    std::vector<uint8_t>  pageMemory{};
-    //    std::vector<uint32_t> requestedBits{};
-    //    std::vector<uint32_t> residentBits{};
+    //    std::vector<uint32_t> referenceBits{};
+    //    std::vector<uint32_t> residenceBits{};
     //    std::vector<uint32_t> requestedResources{};
     //    std::vector<uint32_t> counters{};
 
-    //    residentBits.resize( context.residentBits.len );
-    //    requestedBits.resize( context.requestedBits.len );
+    //    residenceBits.resize( context.residenceBits.len );
+    //    referenceBits.resize( context.referenceBits.len );
     //    requestedResources.resize( context.requestedResources.len );
     //    counters.resize( context.counters.len );
 
-    //    memcpyDtoH( residentBits, context.requestedBits );
-    //    memcpyDtoH( requestedBits, context.requestedBits );
+    //    memcpyDtoH( residenceBits, context.referenceBits );
+    //    memcpyDtoH( referenceBits, context.referenceBits );
     //    memcpyDtoH( requestedResources, context.requestedResources );
     //    memcpyDtoH( counters, context.counters );
 
@@ -199,8 +199,8 @@ void test( const fs::path& executableDir )
 
     //    DeviceContext hostContext{};
     //    hostContext.pageMemory    = hip_demand::DeviceSpan<uint8_t>( pageMemory.data(), pageMemory.size() );
-    //    hostContext.requestedBits = hip_demand::DeviceSpan<uint32_t>( requestedBits.data(), requestedBits.size() );
-    //    hostContext.residentBits  = hip_demand::DeviceSpan<uint32_t>( residentBits.data(), residentBits.size() );
+    //    hostContext.referenceBits = hip_demand::DeviceSpan<uint32_t>( referenceBits.data(), referenceBits.size() );
+    //    hostContext.residenceBits  = hip_demand::DeviceSpan<uint32_t>( residenceBits.data(), residenceBits.size() );
     //    hostContext.requestedResources =
     //        hip_demand::DeviceSpan<uint32_t>( requestedResources.data(), requestedResources.size() );
     //    hostContext.counters     = hip_demand::DeviceSpan<uint32_t>( counters.data(), counters.size() );

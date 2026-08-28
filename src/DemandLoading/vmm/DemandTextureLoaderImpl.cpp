@@ -155,11 +155,11 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
 
     if( !inFlight_.empty() )
     {
-        freeArray( residentBits_ );
+        freeArray( residenceBits_ );
         freeArray( textureInfos_ );
         for( auto& f : inFlight_ )
         {
-            freeArray( f.deviceContext.requestedBits );
+            freeArray( f.deviceContext.referenceBits );
             freeArray( f.deviceContext.requestedResources );
             freeArray( f.deviceContext.counters );
 
@@ -196,9 +196,9 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
         deviceContext.textureInfos.len = static_cast<uint32_t>( textures_.size() );
     }
 
-    memset( deviceContext.requestedBits, 0, stream );
+    memset( deviceContext.referenceBits, 0, stream );
     memset( deviceContext.counters, 0, stream );
-    requestProcessor_.uploadResidentBits( deviceContext.residentBits, stream );
+    requestProcessor_.uploadResidenceBits( deviceContext.residenceBits, stream );
 }
 
 void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, hipStream_t stream )
@@ -212,7 +212,7 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
 
     if( inFlight_.empty() )
     {
-        residentBits_ = allocArray<uint32_t>( requestProcessor_.residentWordCount(), true, stream );
+        residenceBits_ = allocArray<uint32_t>( requestProcessor_.residentWordCount(), true, stream );
         textureInfos_ = allocArray<DeviceTextureInfo*>( options_.maxTextures, true, stream );
     }
 
@@ -222,7 +222,7 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
     // set data per stream
     flight.deviceContext.requestIfResident = options_.enableEviction;
     flight.deviceContext.poolIndex         = inFlight_.size() - 1;
-    flight.deviceContext.requestedBits = allocArray<uint32_t>( requestProcessor_.residentWordCount(), true, stream );
+    flight.deviceContext.referenceBits = allocArray<uint32_t>( requestProcessor_.residentWordCount(), true, stream );
     flight.deviceContext.requestedResources = allocArray<uint32_t>( options_.maxRequests, true, stream );
     flight.deviceContext.counters = allocArray<uint32_t>( static_cast<size_t>( CounterIndex::NumCounters ), true, stream );
 
@@ -233,7 +233,7 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
     flight.deviceContext.resourceTable = resourceTable_;
     flight.deviceContext.pageSize      = pageSystem_.pageBytes();
     flight.deviceContext.pageMemory    = pageSystem_.virtualAddressSpace();
-    flight.deviceContext.residentBits  = residentBits_;
+    flight.deviceContext.residenceBits  = residenceBits_;
     flight.deviceContext.textureInfos  = textureInfos_;
 
     deviceContext = flight.deviceContext;

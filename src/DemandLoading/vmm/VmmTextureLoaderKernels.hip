@@ -35,15 +35,15 @@ __device__ __forceinline__ uint32_t calcListStartIndex( const uint32_t laneId, u
 extern "C" __global__ void collectRequests( DeviceContext context )
 {
     const uint32_t startIndex = 0;
-    const uint32_t endIndex = context.requestedBits.len;
+    const uint32_t endIndex = context.referenceBits.len;
 
     uint32_t wordIdx = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t laneId = __lane_id();
 
     while( wordIdx < endIndex )
     {
-        const uint32_t referenceWord = context.requestedBits.ptr[wordIdx];
-        const uint32_t residenceWord = context.residentBits.ptr[wordIdx];
+        const uint32_t referenceWord = context.referenceBits.ptr[wordIdx];
+        const uint32_t residenceWord = context.residenceBits.ptr[wordIdx];
         uint32_t requestBits = referenceWord & ~residenceWord;
         const uint32_t numRequestBits = __popc( requestBits );
 
