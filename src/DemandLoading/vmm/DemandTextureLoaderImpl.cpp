@@ -212,7 +212,7 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
 
     if( inFlight_.empty() )
     {
-        residenceBits_ = allocArray<uint32_t>( requestProcessor_.residentWordCount(), true, stream );
+        residenceBits_ = allocArray<uint32_t>( requestProcessor_.residenceWordCount(), true, stream );
         textureInfos_ = allocArray<DeviceTextureInfo*>( options_.maxTextures, true, stream );
     }
 
@@ -222,7 +222,7 @@ void DemandTextureLoaderImpl::initDeviceContext( DeviceContext& deviceContext, h
     // set data per stream
     flight.deviceContext.requestIfResident = options_.enableEviction;
     flight.deviceContext.poolIndex         = inFlight_.size() - 1;
-    flight.deviceContext.referenceBits = allocArray<uint32_t>( requestProcessor_.residentWordCount(), true, stream );
+    flight.deviceContext.referenceBits = allocArray<uint32_t>( requestProcessor_.residenceWordCount(), true, stream );
     flight.deviceContext.requestedResources = allocArray<uint32_t>( options_.maxRequests, true, stream );
     flight.deviceContext.counters = allocArray<uint32_t>( static_cast<size_t>( CounterIndex::NumCounters ), true, stream );
 

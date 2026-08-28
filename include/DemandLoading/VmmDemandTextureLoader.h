@@ -43,7 +43,6 @@ struct Options
     uint32_t maxRequestQueue  = 1024;
     uint32_t maxThreads       = 0;
     bool     enableEviction   = true;
-    //uint32_t minResidentFrames  = 3;
 };
 
 class DemandTexture
