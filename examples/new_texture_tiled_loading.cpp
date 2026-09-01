@@ -292,12 +292,10 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
     KernelModule module;
     module.load( kernelPath );
 
-    constexpr uint32_t IN_FLIGHT_COUNT = 4;
-
     Options options{};
     options.maxPhysicalPages = 4096;
     options.maxRequests      = 100;
-    options.maxRequestQueue  = options.maxRequests * IN_FLIGHT_COUNT;
+    options.maxRequestQueue  = options.maxRequests;
 
     std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
 
@@ -344,51 +342,30 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
         HIP_CHECK( hipModuleLaunchKernel( kernel, gridWidth, gridHeight, 1, blockWidth, blockHeight, 1, 0, stream, arguments, nullptr ) );
     };
 
-    struct InFlightFrame
-    {
-        uint32_t pass = 0;
-        Ticket   ticket;
-        bool     active = false;
-    };
-
-    std::array<InFlightFrame, IN_FLIGHT_COUNT> inFlightFrames{};
-    uint32_t                                   nextPass          = 0;
-    bool                                       submitMoreFrames  = true;
+    uint32_t   nextPass    = 0;
     const auto renderStart = std::chrono::steady_clock::now();
-    while (true)
+    while( true )
     {
-        uint32_t activeFrameCount = IN_FLIGHT_COUNT;
-        for (auto& frame : inFlightFrames)
+        DeviceContext context{};
+        loader->launchPrepare( stream, context );
+        launchGrid( context );
+
+        Ticket ticket = loader->processRequests( stream, context );
+
+        ticket.wait();
+        const int requestCount = ticket.numTasksTotal();
+        if( requestCount == 0 )
         {
-            if( frame.active )
-            {
-                frame.ticket.wait();
-                const int requestCount = frame.ticket.numTasksTotal();
-                frame.active           = false;
-
-                if (requestCount > 0)
-                {
-                    std::cout << "Pass " << frame.pass << ": " << requestCount << " resource requests\n";
-                }
-                else
-                {
-                    activeFrameCount--;
-                }                 
-            }
-
-            DeviceContext context{};
-            loader->launchPrepare( stream, context );
-            launchGrid( context );
-
-            frame.pass   = nextPass++;
-            frame.ticket = loader->processRequests( stream, context );
-            frame.active = true;
+            break;
+        }
+        else
+        {
+            std::cout << "Pass " << nextPass << ": " << requestCount << " resource requests\n";
         }
 
-        if( activeFrameCount == 0 )
-            break;
+        nextPass++;
     }
-    const auto renderEnd = std::chrono::steady_clock::now();
+    const auto renderEnd  = std::chrono::steady_clock::now();
     const auto renderTime = std::chrono::duration_cast<std::chrono::milliseconds>( renderEnd - renderStart );
     std::cout << "Rendering loop time: " << renderTime.count() << " ms\n";
 

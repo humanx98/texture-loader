@@ -163,7 +163,6 @@ struct DeviceContext
     DeviceSpan<uint32_t>           lru{};
     DeviceSpan<uint32_t>           counters{};
     size_t                         pageSize          = 0;
-    size_t                         poolIndex         = 0;
     bool                           requestIfResident = false;
 };
 

@@ -5,15 +5,12 @@
 
 namespace hip_demand::vmm {
 
-RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, HipEventPool& eventPool, uint32_t resourceCount, uint32_t maxThreads, uint32_t maxQueueSize )
+RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, uint32_t resourceCount, uint32_t maxThreads, uint32_t maxQueueSize )
     : queue_( maxQueueSize )
     , residenceBits_( resourceCount )
     , loadingBits_( resourceCount )
-    , eventPool_( eventPool )
     , loader_( loader )
 {
-    residenceBitsUploadDone_ = eventPool_.acquire();
-
     if( maxThreads == 0 )
         maxThreads = std::thread::hardware_concurrency();
 
@@ -29,9 +26,6 @@ RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, HipEventPoo
         queue_.close();
         for( std::thread& worker : workers_ )
             worker.join();
-        if( residenceBitsUploadDone_ )
-            eventPool_.release( residenceBitsUploadDone_ );
-        residenceBitsUploadDone_ = nullptr;
         throw;
     }
 }
@@ -39,9 +33,6 @@ RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, HipEventPoo
 RequestProcessor::~RequestProcessor()
 {
     stop();
-
-    if( residenceBitsUploadDone_ )
-        eventPool_.release( residenceBitsUploadDone_ );
 }
 
 void RequestProcessor::stop()
@@ -57,9 +48,6 @@ void RequestProcessor::stop()
         if( worker.joinable() )
             worker.join();
     }
-
-    std::unique_lock<std::mutex> lock( mutex_ );
-    waitForResidenceBitsUpload();
 }
 
 void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket )
@@ -77,23 +65,7 @@ void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Tick
 void RequestProcessor::uploadResidenceBits( DeviceSpan<uint32_t>& destination, hipStream_t stream )
 {
     std::unique_lock<std::mutex> lock( mutex_ );
-    if( !residenceBitsDirty_ )
-        return;
-
-    waitForResidenceBitsUpload();
     memcpyHtoD( destination, residenceBits_.words(), stream );
-    HIP_CHECK( hipEventRecord( residenceBitsUploadDone_, stream ) );
-    residenceBitsUploadInFlight_ = true;
-    residenceBitsDirty_          = false;
-}
-
-void RequestProcessor::waitForResidenceBitsUpload()
-{
-    if( !residenceBitsUploadInFlight_ )
-        return;
-
-    HIP_WARN( hipEventSynchronize( residenceBitsUploadDone_ ) );
-    residenceBitsUploadInFlight_ = false;
 }
 
 void RequestProcessor::workerLoop()
@@ -139,9 +111,7 @@ void RequestProcessor::workerLoop()
                 std::unique_lock<std::mutex> lock( mutex_ );
                 if( success )
                 {
-                    waitForResidenceBitsUpload();
                     residenceBits_.set( resourceId, true );
-                    residenceBitsDirty_ = true;
                 }
                 loadingBits_.set( resourceId, false );
                 loading_.notify_all();

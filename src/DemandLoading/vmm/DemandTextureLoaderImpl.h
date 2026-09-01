@@ -277,38 +277,21 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) override;
     void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
-    void   processRequestsCallback( DeviceContext& deviceContext, Ticket ticket );
+    void   processRequestsCallback( Ticket ticket );
     void   processRequest( hipStream_t stream, uint32_t resourceId );
-    void   freeDeviceContext( DeviceContext& deviceContext ) override { freeDeviceContext( deviceContext, true ); }
     int    device() const { return pageSystem_.device(); }
 
   private:
-    void     initDeviceContext( DeviceContext& deviceContext, hipStream_t stream );
-    void     freeDeviceContext( DeviceContext& deviceContext, bool needLock );
     Resource decode( uint32_t resourceId );
     void     processTextureInfo( hipStream_t stream, uint32_t textureId );
     void     processTile( hipStream_t stream, const Resource::Tile& tile );
     void     processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
-
-    struct InFlight
-    {
-        DeviceContext                deviceContext{};
-        HostSpan<uint32_t>           requestedResources{};
-        HostSpan<EvictionCandidate>  evictionCandidates{};
-        HostSpan<uint32_t>           counters{};
-    };
 
     mutable std::mutex mutex_;
     Options            options_{};
     HipEventPool       eventPool_;
     PageSystem         pageSystem_;
 
-    DeviceSpan<uint32_t>           residenceBits_{};
-    DeviceSpan<uint32_t>           lru_{};
-    DeviceSpan<DeviceTextureInfo*> textureInfos_{};
-
-    std::vector<InFlight>                           inFlight_{};
-    std::vector<size_t>                             freeDeviceContextList_{};
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
 
     // metadata
@@ -329,6 +312,11 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     } kernels_{};
     uint32_t launchNum_    = 0;
     uint32_t lruThreshold_ = lruThresholdMin;
+
+    DeviceContext               deviceContext_{};
+    HostSpan<uint32_t>          requestedResources_{};
+    HostSpan<EvictionCandidate> evictionCandidates_{};
+    HostSpan<uint32_t>          counters_{};
 };
 
 }  // namespace hip_demand::vmm
