@@ -53,11 +53,7 @@ class Allocator : NonCopyble
             throw std::bad_alloc{};
 
         for( size_t pageOffset = 0; pageOffset < additionalPages + 1; ++pageOffset )
-        {
-            const uint32_t page = static_cast<uint32_t>( pageRange_.nextAvailablePage + pageOffset );
-            if( !pageSystem_.mapped( page ) )
-                pageSystem_.map( page );
-        }
+            pageSystem_.map( static_cast<uint32_t>( pageRange_.nextAvailablePage + pageOffset ) );
 
         hipDeviceptr_t result = pageSystem_.page( pageRange_.nextAvailablePage ).ptr + pageBytes - availablePageBytes_;
 

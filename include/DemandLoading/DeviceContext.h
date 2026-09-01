@@ -141,7 +141,14 @@ struct ResourceTable
 enum class CounterIndex : uint32_t
 {
     RequestedResources = 0,
+    EvictionCandidates,
     NumCounters
+};
+
+struct EvictionCandidate
+{
+    uint32_t resourceId = 0;
+    uint32_t lru        = 0;
 };
 
 struct DeviceContext
@@ -152,6 +159,8 @@ struct DeviceContext
     DeviceSpan<DeviceTextureInfo*> textureInfos{};
     DeviceSpan<uint32_t>           referenceBits{};
     DeviceSpan<uint32_t>           requestedResources{};
+    DeviceSpan<EvictionCandidate>  evictionCandidates{};
+    DeviceSpan<uint32_t>           lru{};
     DeviceSpan<uint32_t>           counters{};
     size_t                         pageSize          = 0;
     size_t                         poolIndex         = 0;

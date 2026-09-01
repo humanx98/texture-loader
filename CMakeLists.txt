@@ -77,6 +77,7 @@ set(TEXTURE_LOADER_HEADERS
     src/DemandLoading/Internal/Utils.h
     src/DemandLoading/vmm/DemandTextureLoaderImpl.h
     src/DemandLoading/vmm/HipEventPool.h
+    src/DemandLoading/vmm/Lru.h
     src/DemandLoading/vmm/Allocator.h
     src/DemandLoading/vmm/PageSystem.h
     src/DemandLoading/vmm/RequestProcessor.h
@@ -92,6 +93,7 @@ hip_add_executable(
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
+        src/DemandLoading/vmm/Lru.h
 )
 
 if(USE_OIIO)

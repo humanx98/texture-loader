@@ -4,6 +4,7 @@
 #include "../Internal/Utils.h"
 #include "Allocator.h"
 #include "HipEventPool.h"
+#include "Lru.h"
 #include "PageSystem.h"
 #include "RequestProcessor.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
@@ -291,9 +292,10 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     struct InFlight
     {
-        DeviceContext      deviceContext{};
-        HostSpan<uint32_t> requestedResources{};
-        HostSpan<uint32_t> counters{};
+        DeviceContext                deviceContext{};
+        HostSpan<uint32_t>           requestedResources{};
+        HostSpan<EvictionCandidate>  evictionCandidates{};
+        HostSpan<uint32_t>           counters{};
     };
 
     mutable std::mutex mutex_;
@@ -302,6 +304,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     PageSystem         pageSystem_;
 
     DeviceSpan<uint32_t>           residenceBits_{};
+    DeviceSpan<uint32_t>           lru_{};
     DeviceSpan<DeviceTextureInfo*> textureInfos_{};
 
     std::vector<InFlight>                           inFlight_{};
@@ -319,10 +322,13 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     RequestProcessor requestProcessor_;
     HostAllocator    hostAllocator_;
-    struct {
-        hipModule_t module;
-        hipFunction_t collectRequests;
+    struct
+    {
+        hipModule_t   module;
+        hipFunction_t collectRequestsAndEvictionCandidates;
     } kernels_{};
+    uint32_t launchNum_    = 0;
+    uint32_t lruThreshold_ = lruThresholdMin;
 };
 
 }  // namespace hip_demand::vmm

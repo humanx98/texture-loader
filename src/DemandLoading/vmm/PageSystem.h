@@ -25,8 +25,8 @@ struct PageTable
         }
     };
 
-    Range    textureInfos{};
-    Range    textureTiles{};
+    Range textureInfos{};
+    Range textureTiles{};
 };
 
 class PageSystem : NonCopyble
@@ -35,13 +35,7 @@ class PageSystem : NonCopyble
     explicit PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages );
     ~PageSystem();
     void map( uint32_t pageId );
-    void unmap( uint32_t pageId );
-
-    bool mapped( uint32_t pageId ) const
-    {
-        std::lock_guard<std::mutex> lock( mutex_ );
-        return virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE;
-    }
+    void enqueueEvictedPages( const EvictionCandidate* evictedPages, uint32_t count );
 
     DeviceSpan<uint8_t> page( uint32_t pageId ) const
     {
@@ -53,6 +47,8 @@ class PageSystem : NonCopyble
     int                 device() const { return device_; }
 
   private:
+    void processPendingEvictedPages();
+
     struct PhysicalPage
     {
         hipMemGenericAllocationHandle_t handle        = nullptr;
@@ -68,6 +64,7 @@ class PageSystem : NonCopyble
     std::vector<uint32_t>     virtualIdToPhysicalId_{};
     std::vector<PhysicalPage> physicalPages_{};
     std::vector<uint32_t>     freePhysicalPages_{};
+    std::vector<uint32_t>     pendingEvictedPages_{};
     DeviceSpan<uint8_t>       virtualAddressSpace_{};
     mutable std::mutex        mutex_;
 };

@@ -51,6 +51,8 @@ void PageSystem::map( uint32_t pageId )
     if( virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE )
         return;
 
+    processPendingEvictedPages();
+
     uint32_t physicalPageId = INVALID_PAGE;
     if( freePhysicalPages_.empty() )
     {
@@ -83,18 +85,56 @@ void PageSystem::map( uint32_t pageId )
     physicalPage.virtualPageId          = pageId;
 }
 
-void PageSystem::unmap( uint32_t pageId )
+void PageSystem::enqueueEvictedPages( const EvictionCandidate* evictedPages, uint32_t count )
 {
-    std::lock_guard<std::mutex> lock( mutex_ );
-    if( virtualIdToPhysicalId_.at( pageId ) == INVALID_PAGE )
-        return;
+    if( count > 0 )
+    {
+        std::lock_guard<std::mutex> lock( mutex_ );
 
-    const uint32_t            physicalPageId = virtualIdToPhysicalId_.at( pageId );
-    const DeviceSpan<uint8_t> virtualPage    = page( pageId );
-    HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
-    virtualIdToPhysicalId_.at( pageId )               = INVALID_PAGE;
-    physicalPages_.at( physicalPageId ).virtualPageId = INVALID_PAGE;
-    freePhysicalPages_.push_back( physicalPageId );
+        pendingEvictedPages_.reserve( pendingEvictedPages_.size() + count );
+        for( uint32_t i = 0; i < count; i++ )
+            pendingEvictedPages_.push_back( evictedPages[i].resourceId );
+    }
+}
+
+void PageSystem::processPendingEvictedPages()
+{
+    if( !pendingEvictedPages_.empty() )
+    {
+        for( size_t i = 0; i < pendingEvictedPages_.size(); i++ )
+        {
+            const uint32_t virtualPageId  = pendingEvictedPages_.at( i );
+            const uint32_t physicalPageId = virtualIdToPhysicalId_.at( virtualPageId );
+            if( physicalPageId == INVALID_PAGE )
+                continue;
+
+            const DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
+            HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
+            virtualIdToPhysicalId_.at( virtualPageId ) = INVALID_PAGE;
+
+            if( freePhysicalPages_.size() < pendingEvictedPages_.size() / 2 )
+            {
+                physicalPages_.at( physicalPageId ).virtualPageId = INVALID_PAGE;
+                freePhysicalPages_.push_back( physicalPageId );
+            }
+            else
+            {
+                if( physicalPageId != physicalPages_.size() - 1 )
+                {
+                    if( physicalPages_.back().virtualPageId != INVALID_PAGE )
+                        virtualIdToPhysicalId_[physicalPages_.back().virtualPageId] = physicalPageId;
+
+                    std::swap( physicalPages_.at( physicalPageId ), physicalPages_.back() );
+                }
+
+                PhysicalPage physicalPage = physicalPages_.back();
+                physicalPages_.pop_back();
+                HIP_CHECK( hipMemRelease( physicalPage.handle ) );
+            }
+        }
+
+        pendingEvictedPages_.clear();
+    }
 }
 
 }  // namespace hip_demand::vmm

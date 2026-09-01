@@ -12,4 +12,4 @@ cmake -S "$root_dir" -B ./build \
     -DBUILD_EXAMPLES=ON \
     -DCMAKE_TOOLCHAIN_FILE=C:/my_space/code/vcpkg/scripts/buildsystems/vcpkg.cmake \
     -DUSE_OIIO=ON \
-    -DHIP_ARCHITECTURES=gfx1201
+    -DHIP_ARCHITECTURES=gfx1031
