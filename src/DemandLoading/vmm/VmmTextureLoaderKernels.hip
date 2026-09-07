@@ -1,9 +1,18 @@
 #include <DemandLoading/DeviceContext.h>
+#include <DemandLoading/VmmDeviceUtils.h>
 #include "Lru.h"
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
 namespace hip_demand::vmm {
+
+HIP_DEMAND_INLINE void atomicSetBit( uint32_t bitIndex, uint32_t* bitVector )
+{
+    const unsigned int wordIndex = bitIndex / 32;
+    const unsigned int bitOffset = bitIndex % 32;
+    const unsigned int mask      = 1U << bitOffset;
+    atomicOr( bitVector + wordIndex, mask );
+}
 
 HIP_DEMAND_INLINE uint32_t incrementLru( const uint32_t count, const uint32_t launchNum, const uint32_t resourceId )
 {
@@ -77,7 +86,7 @@ HIP_DEMAND_INLINE void collectRequests( DeviceContext& context, uint32_t request
     }
 }
 
-HIP_DEMAND_INLINE void collectLruEvictionCandidates( DeviceContext& context,
+HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
     const uint32_t launchNum,
     const uint32_t lruThreshold,
     const uint32_t referenceWord,
@@ -91,10 +100,16 @@ HIP_DEMAND_INLINE void collectLruEvictionCandidates( DeviceContext& context,
         {
             const uint32_t bitIndex = __ffs( resetLruBits ) - 1;
             resetLruBits ^= ( 1U << bitIndex );
+            
+            // eviction logic should be applied only to texture tiles
             const uint32_t resourceId = resourceBitOffset + bitIndex;
-            const uint32_t lruVal = getLru( resourceId, context.lru.ptr );
+            if( !context.resourceTable.textureTiles.contains(resourceId) )
+                continue;
+
+            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
+            const uint32_t lruVal = getUint4( context.lru, pageId );
             if( lruVal != 0 && lruVal != lruNonEvictable )
-                clearLru( resourceId, context.lru.ptr );
+                atomicClearUint4( context.lru, pageId );
         }
     }
 
@@ -107,12 +122,17 @@ HIP_DEMAND_INLINE void collectLruEvictionCandidates( DeviceContext& context,
         {
             const uint32_t bitIndex = __ffs( bits ) - 1;
             bits ^= ( 1U << bitIndex );
-            const uint32_t resourceId = resourceBitOffset + bitIndex;
 
-            const uint32_t oldVal = getLru( resourceId, context.lru.ptr );
-            const uint32_t newVal = incrementLru( oldVal, launchNum, resourceId );
+            // eviction logic should be applied only to texture tiles
+            const uint32_t resourceId = resourceBitOffset + bitIndex;
+            if( !context.resourceTable.textureTiles.contains(resourceId) )
+                continue;
+
+            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
+            const uint32_t oldVal = getUint4( context.lru, pageId );
+            const uint32_t newVal = incrementLru( oldVal, launchNum, pageId );
             if( newVal != oldVal )
-                addLru( resourceId, 1, context.lru.ptr );
+                atomicAddUint4( context.lru, pageId, 1 );
             if( newVal >= lruThreshold && newVal < lruNonEvictable )
                 numEvictionBits++;
         }
@@ -123,35 +143,73 @@ HIP_DEMAND_INLINE void collectLruEvictionCandidates( DeviceContext& context,
         {
             const uint32_t bitIndex = __ffs( bits ) - 1;
             bits ^= ( 1U << bitIndex );
-            const uint32_t resourceId = resourceBitOffset + bitIndex;
 
-            const uint32_t lruVal = getLru( resourceId, context.lru.ptr );
+            // eviction logic should be applied only to texture tiles
+            const uint32_t resourceId = resourceBitOffset + bitIndex;
+            if( !context.resourceTable.textureTiles.contains(resourceId) )
+                continue;
+
+            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
+            const uint32_t lruVal = getUint4( context.lru, pageId );
             if( lruVal >= lruThreshold && lruVal != lruNonEvictable )
-                context.evictionCandidates.ptr[candidateIndex++] = { resourceId, lruVal };
+                context.evictionCandidates.ptr[candidateIndex++] = { pageId, lruVal };
         }
     }
 }
 
-template<bool enableEviction>
 HIP_DEMAND_INLINE void collectRequestsAndEvictionCandidates( DeviceContext& context, uint32_t launchNum, uint32_t lruThreshold )
 {
-    const uint32_t startIndex = 0;
-    const uint32_t endIndex = context.referenceBits.len;
-
     uint32_t wordIdx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    while( wordIdx < endIndex )
+    while( wordIdx < context.referenceBits.len )
     {
         const uint32_t resourceBitOffset = wordIdx * 32;
         const uint32_t referenceWord = context.referenceBits.ptr[wordIdx];
         const uint32_t residenceWord = context.residenceBits.ptr[wordIdx];
         collectRequests(context, referenceWord & ~residenceWord, resourceBitOffset);
-        if constexpr (enableEviction)
+        if( context.lru.ptr )
         {
-            collectLruEvictionCandidates(context, launchNum, lruThreshold, referenceWord, residenceWord, resourceBitOffset);
+            collectEvictionCandidates(context, launchNum, lruThreshold, referenceWord, residenceWord, resourceBitOffset);
         }
 
         wordIdx += gridDim.x * blockDim.x;
+    }
+}
+
+HIP_DEMAND_INLINE void updateProcessedResources( DeviceContext& context, uint32_t processedCount )
+{
+    uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    while( globalIdx < processedCount )
+    {
+        ProcessedResource resource = context.processedResources.ptr[globalIdx];
+        if( context.resourceTable.textureTiles.contains( resource.resourceId ) )
+        {
+            if (context.lru.ptr)
+            {
+                const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resource.resourceId);
+                atomicClearUint4(context.lru, pageId);
+            }
+        }
+        else
+        {
+            const uint32_t textureId = context.resourceTable.textureInfos.getLocalId(resource.resourceId);
+            context.textureInfos.ptr[textureId] = resource.textureInfo.ptr;
+        }
+
+        atomicSetBit(context.residenceBits, resource.resourceId);
+        globalIdx += gridDim.x * blockDim.x;
+    }
+}
+
+HIP_DEMAND_INLINE void updateEvictedPagesKernel( DeviceContext& context, uint32_t evictionCount )
+{
+    uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    while( globalIdx < evictionCount )
+    {
+        const uint32_t pageId = context.evictionCandidates.ptr[globalIdx].pageId;
+        const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId(pageId);
+        atomicUnsetBit(context.residenceBits, resourceId);
+        globalIdx += gridDim.x * blockDim.x;
     }
 }
 
@@ -159,10 +217,15 @@ HIP_DEMAND_INLINE void collectRequestsAndEvictionCandidates( DeviceContext& cont
 
 extern "C" __global__ void collectRequestsKernel( hip_demand::vmm::DeviceContext context, uint32_t launchNum, uint32_t lruThreshold )
 {
-    hip_demand::vmm::collectRequestsAndEvictionCandidates<false>(context, launchNum, lruThreshold);
+    hip_demand::vmm::collectRequestsAndEvictionCandidates(context, launchNum, lruThreshold);
 }
 
-extern "C" __global__ void collectRequestsAndEvictionCandidatesKernel( hip_demand::vmm::DeviceContext context, uint32_t launchNum, uint32_t lruThreshold )
+extern "C" __global__ void updateProcessedResourcesKernel( hip_demand::vmm::DeviceContext context, uint32_t processedCount )
 {
-    hip_demand::vmm::collectRequestsAndEvictionCandidates<true>(context, launchNum, lruThreshold);
+    hip_demand::vmm::updateProcessedResources(context, processedCount);
+}
+
+extern "C" __global__ void updateEvictedPagesKernel( hip_demand::vmm::DeviceContext context, uint32_t evictionCount )
+{
+    hip_demand::vmm::updateEvictedPagesKernel(context, evictionCount);
 }

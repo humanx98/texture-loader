@@ -93,6 +93,7 @@ hip_add_executable(
     INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
     DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/VmmDeviceUtils.h
         src/DemandLoading/vmm/Lru.h
 )
 
@@ -476,6 +477,7 @@ if(BUILD_EXAMPLES)
             INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include
             DEPENDS
                 ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
+                ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/VmmDeviceUtils.h
                 ${CMAKE_CURRENT_SOURCE_DIR}/include/DemandLoading/VmmTextureSampling.h
         )
 

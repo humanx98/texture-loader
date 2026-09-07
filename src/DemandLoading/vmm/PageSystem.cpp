@@ -4,9 +4,10 @@
 namespace hip_demand::vmm {
 
 PageSystem::PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
-    : maxVirtualPages_( maxVirtualPages )
-    , maxPhysicalPages_( maxPhysicalPages )
 {
+    virtual_.maxPages  = maxVirtualPages;
+    physical_.maxPages = maxPhysicalPages;
+
     HIP_CHECK( hipGetDevice( &device_ ) );
     int vmmSupported = 0;
     HIP_CHECK( hipDeviceGetAttribute( &vmmSupported, hipDeviceAttributeVirtualMemoryManagementSupported, device_ ) );
@@ -20,17 +21,17 @@ PageSystem::PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
     if( granularity_ == 0 )
         throw std::runtime_error( "hipMemAllocationGranularityMinimum is zero" );
 
-    pageBytes_               = granularity_;
-    virtualAddressSpace_.len = maxVirtualPages_ * pageBytes_;
-    HIP_CHECK( hipMemAddressReserve( reinterpret_cast<void**>( &virtualAddressSpace_.ptr ), virtualAddressSpace_.len,
+    pageBytes_                = granularity_;
+    virtual_.addressSpace.len = virtual_.maxPages * pageBytes_;
+    HIP_CHECK( hipMemAddressReserve( reinterpret_cast<void**>( &virtual_.addressSpace.ptr ), virtual_.addressSpace.len,
                                      granularity_, nullptr, 0 ) );
 
-    virtualIdToPhysicalId_.assign( maxVirtualPages_, INVALID_PAGE );
+    virtualIdToPhysicalId_.assign( virtual_.maxPages, INVALID_PAGE );
 }
 
 PageSystem::~PageSystem()
 {
-    for( PhysicalPage& physicalPage : physicalPages_ )
+    for( PhysicalPage& physicalPage : physical_.pages )
     {
         if( physicalPage.virtualPageId != INVALID_PAGE )
         {
@@ -38,40 +39,49 @@ PageSystem::~PageSystem()
             HIP_WARN( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
         }
 
-        HIP_WARN( hipMemRelease( physicalPage.handle ) );
+        if( physicalPage.handle )
+            HIP_WARN( hipMemRelease( physicalPage.handle ) );
     }
 
-    if( virtualAddressSpace_.ptr )
-        HIP_WARN( hipMemAddressFree( virtualAddressSpace_.ptr, virtualAddressSpace_.len ) );
+    if( virtual_.addressSpace.ptr )
+        HIP_WARN( hipMemAddressFree( virtual_.addressSpace.ptr, virtual_.addressSpace.len ) );
 }
 
 void PageSystem::map( uint32_t pageId )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
-    if( virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE )
-        return;
 
     processPendingEvictedPages();
 
-    uint32_t physicalPageId = INVALID_PAGE;
-    if( freePhysicalPages_.empty() )
-    {
-        // TODO_BS: handle max physical pages
-        if( physicalPages_.size() >= maxPhysicalPages_ )
-            throw std::runtime_error( "Maximum demand physical page count exceeded" );
+    if( virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE )
+        return;
 
-        physicalPageId                         = static_cast<uint32_t>( physicalPages_.size() );
-        hipMemGenericAllocationHandle_t handle = nullptr;
-        HIP_CHECK( hipMemCreate( &handle, pageBytes_, &allocationProp_, 0 ) );
-        physicalPages_.push_back( PhysicalPage{ handle, INVALID_PAGE } );
+    uint32_t physicalPageId = INVALID_PAGE;
+    if( !physical_.reusablePages.empty() )
+    {
+        physicalPageId = physical_.reusablePages.back();
+        physical_.reusablePages.pop_back();
     }
     else
     {
-        physicalPageId = freePhysicalPages_.back();
-        freePhysicalPages_.pop_back();
+        if( !physical_.unallocatedPages.empty() )
+        {
+            physicalPageId = physical_.unallocatedPages.back();
+            physical_.unallocatedPages.pop_back();
+        }
+        else
+        {
+            if( physical_.pages.size() >= physical_.maxPages )
+                throw std::runtime_error( "Maximum demand physical page count exceeded" );
+
+            physicalPageId = static_cast<uint32_t>( physical_.pages.size() );
+            physical_.pages.push_back( { nullptr, INVALID_PAGE } );
+        }
+
+        HIP_CHECK( hipMemCreate( &physical_.pages.at( physicalPageId ).handle, pageBytes_, &allocationProp_, 0 ) );
     }
 
-    PhysicalPage&       physicalPage = physicalPages_.at( physicalPageId );
+    PhysicalPage&       physicalPage = physical_.pages.at( physicalPageId );
     DeviceSpan<uint8_t> virtualPage  = page( pageId );
     HIP_CHECK( hipMemMap( virtualPage.ptr, virtualPage.len, 0, physicalPage.handle, 0 ) );
 
@@ -85,25 +95,19 @@ void PageSystem::map( uint32_t pageId )
     physicalPage.virtualPageId          = pageId;
 }
 
-void PageSystem::enqueueEvictedPages( const EvictionCandidate* evictedPages, uint32_t count )
+void PageSystem::enqueueEvictedPage( uint32_t pageId )
 {
-    if( count > 0 )
-    {
-        std::lock_guard<std::mutex> lock( mutex_ );
-
-        pendingEvictedPages_.reserve( pendingEvictedPages_.size() + count );
-        for( uint32_t i = 0; i < count; i++ )
-            pendingEvictedPages_.push_back( evictedPages[i].resourceId );
-    }
+    std::lock_guard<std::mutex> lock( mutex_ );
+    virtual_.pendingEvictedPages.push_back( pageId );
 }
 
 void PageSystem::processPendingEvictedPages()
 {
-    if( !pendingEvictedPages_.empty() )
+    if( !virtual_.pendingEvictedPages.empty() )
     {
-        for( size_t i = 0; i < pendingEvictedPages_.size(); i++ )
+        for( size_t i = 0; i < virtual_.pendingEvictedPages.size(); i++ )
         {
-            const uint32_t virtualPageId  = pendingEvictedPages_.at( i );
+            const uint32_t virtualPageId  = virtual_.pendingEvictedPages.at( i );
             const uint32_t physicalPageId = virtualIdToPhysicalId_.at( virtualPageId );
             if( physicalPageId == INVALID_PAGE )
                 continue;
@@ -112,28 +116,21 @@ void PageSystem::processPendingEvictedPages()
             HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
             virtualIdToPhysicalId_.at( virtualPageId ) = INVALID_PAGE;
 
-            if( freePhysicalPages_.size() < pendingEvictedPages_.size() / 2 )
+            PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );
+            physicalPage.virtualPageId = INVALID_PAGE;
+            if( physical_.reusablePages.size() < virtual_.pendingEvictedPages.size() / 2 )
             {
-                physicalPages_.at( physicalPageId ).virtualPageId = INVALID_PAGE;
-                freePhysicalPages_.push_back( physicalPageId );
+                physical_.reusablePages.push_back( physicalPageId );
             }
             else
             {
-                if( physicalPageId != physicalPages_.size() - 1 )
-                {
-                    if( physicalPages_.back().virtualPageId != INVALID_PAGE )
-                        virtualIdToPhysicalId_[physicalPages_.back().virtualPageId] = physicalPageId;
-
-                    std::swap( physicalPages_.at( physicalPageId ), physicalPages_.back() );
-                }
-
-                PhysicalPage physicalPage = physicalPages_.back();
-                physicalPages_.pop_back();
                 HIP_CHECK( hipMemRelease( physicalPage.handle ) );
+                physicalPage.handle = nullptr;
+                physical_.unallocatedPages.push_back( physicalPageId );
             }
         }
 
-        pendingEvictedPages_.clear();
+        virtual_.pendingEvictedPages.clear();
     }
 }
 

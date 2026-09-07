@@ -1,5 +1,5 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
-#include <DemandLoading/VmmTextureSampling.h>
+//#include <DemandLoading/VmmTextureSampling.h>
 #include <ImageSource/OIIOReader.h>
 #include <ImageSource/TextureInfo.h>
 

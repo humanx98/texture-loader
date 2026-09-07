@@ -130,6 +130,7 @@ struct ResourceTable
         HIP_DEMAND_INLINE bool     contains( uint32_t id ) const { return start <= id && id < end(); }
         HIP_DEMAND_INLINE uint32_t end() const { return start + count; }
         HIP_DEMAND_INLINE uint32_t getResourceId( uint32_t id ) const { return start + id; }
+        HIP_DEMAND_INLINE uint32_t getLocalId( uint32_t id ) const { return id - start; }
     };
 
     Range textureTiles{};
@@ -147,8 +148,20 @@ enum class CounterIndex : uint32_t
 
 struct EvictionCandidate
 {
+    uint32_t pageId = 0;
+    uint32_t lru    = 0;
+};
+
+struct ProcessedResource
+{
     uint32_t resourceId = 0;
-    uint32_t lru        = 0;
+    union
+    {
+        struct
+        {
+            DevicePtr<DeviceTextureInfo> ptr;
+        } textureInfo;
+    };
 };
 
 struct DeviceContext
@@ -160,6 +173,7 @@ struct DeviceContext
     DeviceSpan<uint32_t>           referenceBits{};
     DeviceSpan<uint32_t>           requestedResources{};
     DeviceSpan<EvictionCandidate>  evictionCandidates{};
+    DeviceSpan<ProcessedResource>  processedResources{};
     DeviceSpan<uint32_t>           lru{};
     DeviceSpan<uint32_t>           counters{};
     size_t                         pageSize          = 0;

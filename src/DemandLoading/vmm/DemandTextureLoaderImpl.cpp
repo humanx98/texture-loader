@@ -121,20 +121,28 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     , textureInfoAllocator_( pageSystem_ )
     , resourceTable_( createResourceTable( options_, pageSystem_.pageBytes() ) )
     , pageTable_( createPageTable( resourceTable_, options_, pageSystem_.pageBytes() ) )
-    , requestProcessor_( this, resourceTable_.count(), options_.maxThreads, options_.maxRequestQueue )
+    , requestProcessor_( this, options_.maxThreads, options_.maxRequestQueue )
     , hostAllocator_( requestProcessor_.threadCount() * 3, eventPool_ )
+    , bits_( resourceTable_.count() )
 {
     if( options_.maxRequests == 0 )
         throw std::invalid_argument( "maxRequests cannot be 0" );
 
+    if( options_.maxProcessedResources == 0 )
+        throw std::invalid_argument( "maxStagingProcessedResources cannot be 0" );
+
     textureInfoAllocator_.setRange( pageTable_.textureInfos );
+
+    processed_.resources = hostAllocArray<ProcessedResource>( options_.maxProcessedResources );
 
     const std::filesystem::path kernelsPath = getLibraryDirectory() / "hip_demand_texture_kernels.co";
     HIP_CHECK( hipModuleLoad( &kernels_.module, kernelsPath.string().c_str() ) );
 
-    options_.enableEviction = options_.enableEviction && options_.maxEvictablePages > 0;
-    const char* kernelName = options_.enableEviction ? "collectRequestsAndEvictionCandidatesKernel" : "collectRequestsKernel";
-    HIP_CHECK( hipModuleGetFunction( &kernels_.collectRequestsAndEvictionCandidates, kernels_.module, kernelName ) );
+    options_.enableEviction = options_.enableEviction && options_.maxEvictedPages > 0;
+    HIP_CHECK( hipModuleGetFunction( &kernels_.collectRequests, kernels_.module, "collectRequestsKernel" ) );
+    HIP_CHECK(
+        hipModuleGetFunction( &kernels_.updateProcessedResources, kernels_.module, "updateProcessedResourcesKernel" ) );
+    HIP_CHECK( hipModuleGetFunction( &kernels_.updateEvictedPages, kernels_.module, "updateEvictedPagesKernel" ) );
 }
 
 DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
@@ -156,11 +164,15 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
         freeArray( deviceContext_.requestedResources );
         freeArray( deviceContext_.evictionCandidates );
         freeArray( deviceContext_.counters );
+        freeArray( deviceContext_.processedResources );
 
         hostFreeArray( requestedResources_ );
-        hostFreeArray( evictionCandidates_ );
+        hostFreeArray( evictionCandidates_.previous );
+        hostFreeArray( evictionCandidates_.current );
         hostFreeArray( counters_ );
     }
+
+    hostFreeArray( processed_.resources );
 }
 
 const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& descriptor )
@@ -185,38 +197,55 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
 
         if( !deviceContext_.residenceBits.ptr )
         {
-            deviceContext_.resourceTable = resourceTable_;
-            deviceContext_.pageSize      = pageSystem_.pageBytes();
-            deviceContext_.pageMemory    = pageSystem_.virtualAddressSpace();
-            deviceContext_.residenceBits = allocArray<uint32_t>( requestProcessor_.residenceWordCount(), true, stream );
-            deviceContext_.textureInfos  = allocArray<DeviceTextureInfo*>( options_.maxTextures, true, stream );
-            deviceContext_.referenceBits = allocArray<uint32_t>( requestProcessor_.residenceWordCount(), true, stream );
+            deviceContext_.resourceTable      = resourceTable_;
+            deviceContext_.pageSize           = pageSystem_.pageBytes();
+            deviceContext_.pageMemory         = pageSystem_.virtualAddressSpace();
+            deviceContext_.residenceBits      = allocArray<uint32_t>( bits_.wordCount(), true, stream );
+            deviceContext_.textureInfos       = allocArray<DeviceTextureInfo*>( options_.maxTextures, false, stream );
+            deviceContext_.referenceBits      = allocArray<uint32_t>( bits_.wordCount(), true, stream );
             deviceContext_.requestedResources = allocArray<uint32_t>( options_.maxRequests, false, stream );
             deviceContext_.counters = allocArray<uint32_t>( static_cast<size_t>( CounterIndex::NumCounters ), true, stream );
+            deviceContext_.processedResources = allocArray<ProcessedResource>( options_.maxProcessedResources, false, stream );
             if( options_.enableEviction )
             {
                 deviceContext_.requestIfResident = true;
-                deviceContext_.evictionCandidates = allocArray<EvictionCandidate>( options_.maxEvictablePages, false, stream );
+                deviceContext_.evictionCandidates = allocArray<EvictionCandidate>( options_.maxEvictedPages, false, stream );
                 // 4 bits per resource, 8 values per uint32_t
-                deviceContext_.lru = allocArray<uint32_t>( ceilDiv( resourceTable_.count(), 8u ), true, stream );
+                deviceContext_.lru = allocArray<uint32_t>( ceilDiv( resourceTable_.textureTiles.count, 8u ), true, stream );
             }
 
             // set host transfer buffers
-            requestedResources_ = hostAllocArray<uint32_t>( deviceContext_.requestedResources.len );
-            evictionCandidates_ = hostAllocArray<EvictionCandidate>( deviceContext_.evictionCandidates.len );
-            counters_           = hostAllocArray<uint32_t>( deviceContext_.counters.len );
+            requestedResources_          = hostAllocArray<uint32_t>( deviceContext_.requestedResources.len );
+            evictionCandidates_.previous = hostAllocArray<EvictionCandidate>( deviceContext_.evictionCandidates.len );
+            evictionCandidates_.current  = hostAllocArray<EvictionCandidate>( deviceContext_.evictionCandidates.len );
+            counters_                    = hostAllocArray<uint32_t>( deviceContext_.counters.len, true );
         }
 
-        deviceContext.textureInfos.len = static_cast<uint32_t>( textures_.size() );
-        deviceContext                  = deviceContext_;
+        deviceContext_.textureInfos.len = static_cast<uint32_t>( textures_.size() );
+        deviceContext                   = deviceContext_;
 
         if( textures_.empty() )
             return;
     }
+    {
+        std::lock_guard<std::mutex> lock( processed_.mutex );
+        updateProcessedResources( deviceContext, stream );
+    }
 
+    if( options_.enableEviction )
+    {
+        if( evictionCandidates_.previousCount > 0 )
+        {
+            const uint32_t resourcesPerThread = 2;
+            const uint32_t blockSize          = 256;
+            const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
+            const uint32_t gridSize           = ceilDiv( evictionCandidates_.previousCount, resourcesPerBlock );
+            void*          args[]             = { &deviceContext, &evictionCandidates_.previousCount };
+            HIP_CHECK( hipModuleLaunchKernel( kernels_.updateEvictedPages, gridSize, 1, 1, blockSize, 1, 1, 0, stream, args, nullptr ) );
+        }
+    }
     memset( deviceContext.referenceBits, 0, stream );
     memset( deviceContext.counters, 0, stream );
-    requestProcessor_.uploadResidenceBits( deviceContext.residenceBits, stream );
 }
 
 inline uint32_t roundNearest32( uint32_t value )
@@ -239,14 +268,13 @@ Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const Devic
     const uint32_t resourcesPerThread = std::max( 32U, roundNearest32( resourceTable_.count() / 65536U ) );
     const uint32_t blockSize          = 256;
     const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
-    const uint32_t gridSize           = ( resourceTable_.count() + resourcesPerBlock - 1 ) / resourcesPerBlock;
+    const uint32_t gridSize           = ceilDiv( resourceTable_.count(), resourcesPerBlock );
 
     launchNum_++;
     void* arguments[] = { &deviceContext_, &launchNum_, &lruThreshold_ };
-    HIP_CHECK( hipModuleLaunchKernel( kernels_.collectRequestsAndEvictionCandidates, gridSize, 1, 1, blockSize, 1, 1, 0,
-                                      stream, arguments, nullptr ) );
+    HIP_CHECK( hipModuleLaunchKernel( kernels_.collectRequests, gridSize, 1, 1, blockSize, 1, 1, 0, stream, arguments, nullptr ) );
     memcpyDtoH( requestedResources_, deviceContext.requestedResources, stream );
-    memcpyDtoH( evictionCandidates_, deviceContext.evictionCandidates, stream );
+    memcpyDtoH( evictionCandidates_.current, deviceContext.evictionCandidates, stream );
     memcpyDtoH( counters_, deviceContext.counters, stream );
     ProcessRequestCallback::enqueue( stream, new ProcessRequestCallback( *this, ticket ) );
     return ticket;
@@ -256,31 +284,47 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
 
-    uint32_t requestCount           = counters_.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
-    uint32_t evictionCandidateCount = counters_.ptr[static_cast<uint32_t>( CounterIndex::EvictionCandidates )];
+    uint32_t requestCount  = counters_.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
+    uint32_t evictionCount = counters_.ptr[static_cast<uint32_t>( CounterIndex::EvictionCandidates )];
 
     // clamp here in order to avoid atomicMin on gpu
-    requestCount           = std::min( static_cast<uint32_t>( requestedResources_.len ), requestCount );
-    evictionCandidateCount = std::min( static_cast<uint32_t>( evictionCandidates_.len ), evictionCandidateCount );
+    requestCount = std::min( static_cast<uint32_t>( requestedResources_.len ), requestCount );
+    evictionCandidates_.currentCount = std::min( static_cast<uint32_t>( evictionCandidates_.current.len ), evictionCount );
 
     if( options_.enableEviction )
     {
-        std::sort( evictionCandidates_.ptr, evictionCandidates_.ptr + evictionCandidateCount,
-                   []( EvictionCandidate a, EvictionCandidate b ) { return a.lru < b.lru; } );
-        const uint32_t medianLruVal = evictionCandidateCount > 0 ? evictionCandidates_.ptr[evictionCandidateCount / 2].lru : 0;
+        // here we are sure that residence bits are cleared on device for candidates from previous run
+        // so we can safely start unmapping them
+        if( evictionCandidates_.previousCount > 0 )
+        {
+            std::lock_guard<std::mutex> lock( bits_.mutex );
+            for (uint32_t i = 0; i < evictionCandidates_.previousCount; i++)
+            {
+                const uint32_t pageId = evictionCandidates_.previous.ptr[i].pageId;
+                const uint32_t resourceId = resourceTable_.textureTiles.getResourceId( pageId );
+                bits_.residence.set( resourceId, false );
+                pageSystem_.enqueueEvictedPage( pageId );
+            }
+        }
 
-        if( evictionCandidateCount < evictionCandidates_.len / 2 )
+        if( evictionCandidates_.currentCount < options_.maxEvictedPages / 2 )
             lruThreshold_ -= std::min( lruThreshold_ - lruThresholdMin, 4u );
-        else if( evictionCandidateCount < evictionCandidates_.len )
+        else if( evictionCandidates_.currentCount < options_.maxEvictedPages )
             lruThreshold_ -= std::min( lruThreshold_ - lruThresholdMin, 2u );
-        else if( medianLruVal > lruThreshold_ )
-            lruThreshold_++;
+        else if( evictionCandidates_.currentCount > 0 )
+        {
+            auto pred = []( EvictionCandidate a, EvictionCandidate b ) { return a.lru < b.lru; };
+            std::sort( evictionCandidates_.current.ptr, evictionCandidates_.current.ptr + evictionCandidates_.currentCount, pred );
 
-        // eviction logic should be applied only to texture tiles
-        assert( std::all_of( evictionCandidates_.ptr, evictionCandidates_.ptr + evictionCandidateCount, [this]( EvictionCandidate c ) {
-            return resourceTable_.textureTiles.contains( c.resourceId );
-        } ) );
-        pageSystem_.enqueueEvictedPages( evictionCandidates_.ptr, evictionCandidateCount );
+            const uint32_t medianLru = evictionCandidates_.current.ptr[evictionCandidates_.currentCount / 2].lru;
+            if( medianLru > lruThreshold_ )
+            {
+                lruThreshold_++;
+            }
+        }
+
+        std::swap( evictionCandidates_.previous, evictionCandidates_.current );
+        std::swap( evictionCandidates_.previousCount, evictionCandidates_.currentCount );
     }
 
     requestProcessor_.submit( requestedResources_.ptr, requestCount, std::move( ticket ) );
@@ -288,28 +332,56 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket )
 
 void DemandTextureLoaderImpl::processRequest( hipStream_t stream, uint32_t resourceId )
 {
-    const Resource resource = decode( resourceId );
-    switch( resource.type )
     {
-        case Resource::Type::TextureId: {
-            processTextureInfo( stream, resource.textureId );
-            break;
+        std::lock_guard<std::mutex> lock( bits_.mutex );
+        if( bits_.residence.test( resourceId ) || bits_.loading.test( resourceId ) )
+            return;
+
+        bits_.loading.set( resourceId, true );
+    }
+
+    bool success = false;
+    try
+    {
+        ProcessedResource processed{};
+        processed.resourceId = resourceId;
+
+        const Resource resource = decode( resourceId );
+        switch( resource.type )
+        {
+            case Resource::Type::TextureId: {
+                processed.textureInfo.ptr = processTextureInfo( stream, resource.textureId );
+                break;
+            }
+            case Resource::Type::Tile: {
+                processTile( stream, resource.tile );
+                break;
+            }
+            case Resource::Type::MipTail: {
+                processMipTail( stream, resource.mipTail );
+                break;
+            }
+            default: {
+                throw std::logic_error( "Unhandled resource type: " + std::to_string( static_cast<uint32_t>( resource.type ) ) );
+            }
         }
-        case Resource::Type::Tile: {
-            processTile( stream, resource.tile );
-            break;
-        }
-        case Resource::Type::MipTail: {
-            processMipTail( stream, resource.mipTail );
-            break;
-        }
-        default: {
-            throw std::logic_error( "Unhandled resource type: " + std::to_string( static_cast<uint32_t>( resource.type ) ) );
-        }
+
+        completeProcessingResource( stream, processed );
+        success = true;
+    }
+    catch( const std::exception& e )
+    {
+        std::cerr << "Error: " << e.what() << std::endl;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock( bits_.mutex );
+        bits_.residence.set( resourceId, success );
+        bits_.loading.set( resourceId, false );
     }
 }
 
-void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t textureId )
+DevicePtr<DeviceTextureInfo> DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, const uint32_t textureId )
 {
     DemandTextureImpl* texture = nullptr;
     {
@@ -421,15 +493,9 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
 
         pageTable_.textureTiles.nextAvailablePage += pageCount;
 
-        // copy struct pinned memory to device memory
         DevicePtr<DeviceTextureInfo> d_info = textureInfoAllocator_.alloc();
         memcpyHtoD( DeviceSpan<DeviceTextureInfo>( d_info, 1 ), h_info.span(), stream );
-
-        // copy device pointer to deivce pointers
-        auto stagedTextureInfoPointer = hostAllocator_.allocScopedArray<DeviceTextureInfo*>( 1, stream );
-        *stagedTextureInfoPointer     = d_info;
-        memcpyHtoD( DeviceSpan<DeviceTextureInfo*>( deviceContext_.textureInfos.ptr + textureId, 1 ),
-                    stagedTextureInfoPointer.span(), stream );
+        return d_info;
     }
 }
 
@@ -492,17 +558,46 @@ void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource
     memcpyHtoD( pageSystem_.page( mipTail.pageId ), pageBuffer.span(), stream );
 }
 
+void DemandTextureLoaderImpl::completeProcessingResource( hipStream_t stream, ProcessedResource resource )
+{
+    std::lock_guard<std::mutex> lock( processed_.mutex );
+
+    if( processed_.count == options_.maxProcessedResources )
+    {
+        updateProcessedResources( deviceContext_, stream );
+        HIP_CHECK( hipStreamSynchronize( stream ) );
+    }
+
+    processed_.resources.ptr[processed_.count++] = resource;
+}
+
+void DemandTextureLoaderImpl::updateProcessedResources( DeviceContext& context, hipStream_t stream )
+{
+    if( processed_.count == 0 )
+        return;
+
+    const uint32_t resourcesPerThread = 2;
+    const uint32_t blockSize          = 256;
+    const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
+    const uint32_t gridSize           = ceilDiv( processed_.count, resourcesPerBlock );
+    void*          args[]             = { &context, &processed_.count };
+
+    memcpyHtoD( context.processedResources, processed_.resources, processed_.count, stream );
+    HIP_CHECK( hipModuleLaunchKernel( kernels_.updateProcessedResources, gridSize, 1, 1, blockSize, 1, 1, 0, stream, args, nullptr ) );
+    processed_.count = 0;
+}
+
 Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
 {
     std::lock_guard<std::mutex> lock( metadataMutex_ );
 
     if( resourceTable_.textureInfos.contains( resourceId ) )
     {
-        return Resource( resourceId - resourceTable_.textureInfos.start );
+        return Resource( resourceTable_.textureInfos.getLocalId(resourceId) );
     }
     else
     {
-        const uint32_t pageId = resourceId - resourceTable_.textureTiles.start;
+        const uint32_t pageId = resourceTable_.textureTiles.getLocalId(resourceId);
         const auto     it =
             std::upper_bound( loadedTextureInfos_.cbegin(), loadedTextureInfos_.cend(), pageId,
                               []( uint32_t page, const DeviceTextureInfo& info ) { return page < info.startPage; } );

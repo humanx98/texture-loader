@@ -90,15 +90,13 @@ class DemandTextureLoaderImpl;
 class RequestProcessor : NonCopyble
 {
   public:
-    explicit RequestProcessor( DemandTextureLoaderImpl* loader, uint32_t resourceCount, uint32_t maxThreads, uint32_t maxQueueSize );
+    explicit RequestProcessor( DemandTextureLoaderImpl* loader, uint32_t maxThreads, uint32_t maxQueueSize );
     ~RequestProcessor();
 
     void submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket );
     void stop();
 
     uint32_t threadCount() const noexcept { return workers_.size(); }
-    uint32_t residenceWordCount() const noexcept { return residenceBits_.wordCount(); }
-    void     uploadResidenceBits( DeviceSpan<uint32_t>& destination, hipStream_t stream );
 
   private:
     void workerLoop();
@@ -106,9 +104,6 @@ class RequestProcessor : NonCopyble
     mutable std::mutex       mutex_;
     RequestQueue             queue_;
     std::vector<std::thread> workers_;
-    Bitset<true>            residenceBits_;
-    Bitset<false>           loadingBits_;
-    std::condition_variable  loading_;
     bool                     stopped_                    = false;
     DemandTextureLoaderImpl* loader_                     = nullptr;
 };

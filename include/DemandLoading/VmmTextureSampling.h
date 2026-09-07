@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DeviceContext.h"
+#include "VmmDeviceUtils.h"
 #include <algorithm>
 #include <cmath>
 #include <hip/hip_fp16.h>
@@ -10,89 +11,8 @@
 
 namespace hip_demand::vmm {
 
-#if !defined( __HIPCC__ )
-
-HIP_DEMAND_INLINE uint32_t atomicOr( uint32_t* address, uint32_t value )
-{
-    const uint32_t oldValue = *address;
-    *address                = oldValue | value;
-    return oldValue;
-}
-
-// float4 operators for cpu debugging
-
-HIP_DEMAND_INLINE float4 operator+( const float4& a, const float4& b )
-{
-    return make_float4( a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w );
-}
-
-HIP_DEMAND_INLINE float4 operator*( const float4& value, float scalar )
-{
-    return make_float4( value.x * scalar, value.y * scalar, value.z * scalar, value.w * scalar );
-}
-
-HIP_DEMAND_INLINE float4 operator*( float scalar, const float4& value )
-{
-    return value * scalar;
-}
-
-// float3 operators for cpu debugging
-
-HIP_DEMAND_INLINE float3 operator+( const float3& a, const float3& b )
-{
-    return make_float3( a.x + b.x, a.y + b.y, a.z + b.z );
-}
-
-HIP_DEMAND_INLINE float3 operator*( const float3& value, float scalar )
-{
-    return make_float3( value.x * scalar, value.y * scalar, value.z * scalar );
-}
-
-HIP_DEMAND_INLINE float3 operator*( float scalar, const float3& value )
-{
-    return value * scalar;
-}
-
-// float2 operators for cpu debugging
-
-HIP_DEMAND_INLINE float2 operator+( const float2& a, const float2& b )
-{
-    return make_float2( a.x + b.x, a.y + b.y );
-}
-
-HIP_DEMAND_INLINE float2 operator*( const float2& value, float scalar )
-{
-    return make_float2( value.x * scalar, value.y * scalar );
-}
-
-HIP_DEMAND_INLINE float2 operator*( float scalar, const float2& value )
-{
-    return value * scalar;
-}
-
-#endif
-
-HIP_DEMAND_INLINE void getWordIdxAndBitIdx( uint32_t idx, uint32_t& wordIdx, uint32_t& bitIdx )
-{
-    wordIdx = idx >> 5;   // idx / 32
-    bitIdx  = idx & 31u;  // idx % 32
-}
-
-HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId )
-{
-    uint32_t wordIdx = 0;
-    uint32_t bitIdx  = 0;
-    getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
-    atomicOr( &context.referenceBits.ptr[wordIdx], 1u << bitIdx );
-}
-
-HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId )
-{
-    uint32_t wordIdx = 0;
-    uint32_t bitIdx  = 0;
-    getWordIdxAndBitIdx( resourceId, wordIdx, bitIdx );
-    return ( context.residenceBits.ptr[wordIdx] & ( 1u << bitIdx ) ) != 0;
-}
+HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId ) { atomicSetBit(context.referenceBits, resourceId); }
+HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId ) { return checkBitSet(context.residenceBits, resourceId); }
 
 HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mode, bool& valid )
 {

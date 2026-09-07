@@ -251,6 +251,22 @@ struct Resource
     }
 };
 
+struct ResourceBits
+{
+    mutable std::mutex mutex;
+    Bitset             residence;
+    Bitset             loading;
+
+    explicit ResourceBits( uint32_t resourceCount )
+        : residence( resourceCount )
+        , loading( resourceCount )
+    {
+    }
+
+    uint32_t wordCount() const { return residence.wordCount(); }
+    uint32_t bitCount() const { return residence.bitCount(); }
+};
+
 class DemandTextureImpl : public DemandTexture, NonCopyble
 {
   public:
@@ -282,10 +298,12 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     int    device() const { return pageSystem_.device(); }
 
   private:
-    Resource decode( uint32_t resourceId );
-    void     processTextureInfo( hipStream_t stream, uint32_t textureId );
-    void     processTile( hipStream_t stream, const Resource::Tile& tile );
-    void     processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
+    Resource                     decode( uint32_t resourceId );
+    DevicePtr<DeviceTextureInfo> processTextureInfo( hipStream_t stream, const uint32_t textureId );
+    void                         processTile( hipStream_t stream, const Resource::Tile& tile );
+    void                         processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
+    void                         completeProcessingResource( hipStream_t stream, ProcessedResource resource );
+    void                         updateProcessedResources( DeviceContext& context, hipStream_t stream );
 
     mutable std::mutex mutex_;
     Options            options_{};
@@ -308,15 +326,32 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     struct
     {
         hipModule_t   module;
-        hipFunction_t collectRequestsAndEvictionCandidates;
+        hipFunction_t collectRequests;
+        hipFunction_t updateProcessedResources;
+        hipFunction_t updateEvictedPages;
     } kernels_{};
     uint32_t launchNum_    = 0;
     uint32_t lruThreshold_ = lruThresholdMin;
 
-    DeviceContext               deviceContext_{};
-    HostSpan<uint32_t>          requestedResources_{};
-    HostSpan<EvictionCandidate> evictionCandidates_{};
-    HostSpan<uint32_t>          counters_{};
+    DeviceContext      deviceContext_{};
+    HostSpan<uint32_t> requestedResources_{};
+    HostSpan<uint32_t> counters_{};
+    struct
+    {
+        HostSpan<EvictionCandidate> previous;
+        uint32_t                    previousCount;
+        HostSpan<EvictionCandidate> current;
+        uint32_t                    currentCount;
+    } evictionCandidates_{};
+
+    ResourceBits bits_;
+
+    struct
+    {
+        mutable std::mutex          mutex;
+        HostSpan<ProcessedResource> resources;
+        uint32_t                    count;
+    } processed_{};
 };
 
 }  // namespace hip_demand::vmm
