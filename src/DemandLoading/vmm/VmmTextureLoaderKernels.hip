@@ -176,27 +176,27 @@ HIP_DEMAND_INLINE void collectRequestsAndEvictionCandidates( DeviceContext& cont
     }
 }
 
-HIP_DEMAND_INLINE void updateProcessedResources( DeviceContext& context, uint32_t processedCount )
+HIP_DEMAND_INLINE void updateProcessedResources( const ResourceTable& resourceTable, const DeviceSpan<uint32_t>& residenceBits, const DeviceSpan<DeviceTextureInfo*>& textureInfos, const DeviceSpan<uint32_t>& lru, const DeviceSpan<ProcessedResource>& processedResources )
 {
     uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    while( globalIdx < processedCount )
+    while( globalIdx < processedResources.len )
     {
-        ProcessedResource resource = context.processedResources.ptr[globalIdx];
-        if( context.resourceTable.textureTiles.contains( resource.resourceId ) )
+        ProcessedResource resource = processedResources.ptr[globalIdx];
+        if( resourceTable.textureTiles.contains( resource.resourceId ) )
         {
-            if (context.lru.ptr)
+            if( lru.len > 0 )
             {
-                const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resource.resourceId);
-                atomicClearUint4(context.lru, pageId);
+                const uint32_t pageId = resourceTable.textureTiles.getLocalId(resource.resourceId);
+                atomicClearUint4(lru, pageId);
             }
         }
         else
         {
-            const uint32_t textureId = context.resourceTable.textureInfos.getLocalId(resource.resourceId);
-            context.textureInfos.ptr[textureId] = resource.textureInfo.ptr;
+            const uint32_t textureId = resourceTable.textureInfos.getLocalId(resource.resourceId);
+            textureInfos.ptr[textureId] = resource.textureInfo.ptr;
         }
 
-        atomicSetBit(context.residenceBits, resource.resourceId);
+        atomicSetBit(residenceBits, resource.resourceId);
         globalIdx += gridDim.x * blockDim.x;
     }
 }
@@ -220,9 +220,15 @@ extern "C" __global__ void collectRequestsKernel( hip_demand::vmm::DeviceContext
     hip_demand::vmm::collectRequestsAndEvictionCandidates(context, launchNum, lruThreshold);
 }
 
-extern "C" __global__ void updateProcessedResourcesKernel( hip_demand::vmm::DeviceContext context, uint32_t processedCount )
+extern "C" __global__ void updateProcessedResourcesKernel(
+    hip_demand::vmm::ResourceTable resourceTable,
+    hip_demand::DeviceSpan<uint32_t> residenceBits,
+    hip_demand::DeviceSpan<hip_demand::vmm::DeviceTextureInfo*> textureInfos,
+    hip_demand::DeviceSpan<uint32_t> lru,
+    hip_demand::DeviceSpan<hip_demand::vmm::ProcessedResource> processedResources
+)
 {
-    hip_demand::vmm::updateProcessedResources(context, processedCount);
+    hip_demand::vmm::updateProcessedResources(resourceTable, residenceBits, textureInfos, lru, processedResources);
 }
 
 extern "C" __global__ void updateEvictedPagesKernel( hip_demand::vmm::DeviceContext context, uint32_t evictionCount )

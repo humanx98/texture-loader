@@ -50,6 +50,10 @@ struct DeviceSpan
     }
 
     HIP_DEMAND_INLINE size_t sizeInBytes() const { return len * sizeof( T ); }
+    HIP_DEMAND_INLINE DeviceSpan<T> subspan( size_t offset, size_t newLen ) const
+    {
+        return DeviceSpan<T>{ ptr + offset, newLen };
+    }
 };
 
 }  // namespace hip_demand
@@ -173,10 +177,10 @@ struct DeviceContext
     DeviceSpan<uint32_t>           referenceBits{};
     DeviceSpan<uint32_t>           requestedResources{};
     DeviceSpan<EvictionCandidate>  evictionCandidates{};
-    DeviceSpan<ProcessedResource>  processedResources{};
     DeviceSpan<uint32_t>           lru{};
     DeviceSpan<uint32_t>           counters{};
     size_t                         pageSize          = 0;
+    size_t                         poolIndex         = 0;
     bool                           requestIfResident = false;
 };
 

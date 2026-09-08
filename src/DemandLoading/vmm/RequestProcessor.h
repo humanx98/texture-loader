@@ -2,6 +2,7 @@
 
 #include "../Internal/Utils.h"
 #include "HipEventPool.h"
+#include "ProcessedBatchPool.h"
 #include "TicketImpl.h"
 #include <condition_variable>
 #include <cstdint>
@@ -12,11 +13,13 @@ namespace hip_demand::vmm {
 
 struct ResourceRequest
 {
-    uint32_t resourceId = 0;
-    Ticket   ticket;
+    uint32_t                    resourceId = 0;
+    ProcessedBatch* batch = nullptr;
+    Ticket          ticket{};
 
-    explicit ResourceRequest( uint32_t resourceId_, Ticket ticket_ )
+    explicit ResourceRequest( uint32_t resourceId_, ProcessedBatch* batch_, Ticket ticket_ )
         : resourceId( resourceId_ )
+        , batch( batch_ )
         , ticket( ticket_ )
     {
     }
@@ -34,26 +37,28 @@ class RequestQueue : NonCopyble
             throw std::invalid_argument( "RequestQueue maxQueueSize must be greater than zero" );
     }
 
-    void push( const uint32_t* resourceIds, uint32_t count, Ticket ticket )
+    size_t push( const HostSpan<uint32_t>& resourceIds, ProcessedBatch* batch, Ticket ticket )
     {
         std::unique_lock<std::mutex> lock( mutex_ );
 
-        if( requests_.size() >= maxQueueSize_ )
+        size_t count = resourceIds.len;
+
+        if( closed_ )
+            count = 0;
+        else if( requests_.size() >= maxQueueSize_ )
             count = 0;
         else if( count + requests_.size() > maxQueueSize_ )
             count = static_cast<uint32_t>( maxQueueSize_ - requests_.size() );
 
         TicketImpl::getImpl( ticket )->initialize( count );
-        if( count == 0 )
-            return;
-
-        if( closed_ )
-            return;
+        if (count == 0)
+            return 0;
 
         for( uint32_t i = 0; i < count; i++ )
-            requests_.emplace( resourceIds[i], ticket );
+            requests_.emplace( resourceIds.ptr[i], batch, ticket );
 
         notEmpty_.notify_all();
+        return count;
     }
 
     bool pop( ResourceRequest& value )
@@ -93,8 +98,8 @@ class RequestProcessor : NonCopyble
     explicit RequestProcessor( DemandTextureLoaderImpl* loader, uint32_t maxThreads, uint32_t maxQueueSize );
     ~RequestProcessor();
 
-    void submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket );
-    void stop();
+    size_t submit( const HostSpan<uint32_t>& resourceIds, ProcessedBatch* batch, Ticket ticket );
+    void   stop();
 
     uint32_t threadCount() const noexcept { return workers_.size(); }
 
@@ -104,8 +109,8 @@ class RequestProcessor : NonCopyble
     mutable std::mutex       mutex_;
     RequestQueue             queue_;
     std::vector<std::thread> workers_;
-    bool                     stopped_                    = false;
-    DemandTextureLoaderImpl* loader_                     = nullptr;
+    bool                     stopped_ = false;
+    DemandTextureLoaderImpl* loader_  = nullptr;
 };
 
 }  // namespace hip_demand::vmm

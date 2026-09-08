@@ -42,7 +42,6 @@ struct Options
 
     uint32_t maxRequests     = 1024;
     uint32_t maxRequestQueue = 1024;
-    uint32_t maxProcessedResources = 1024;
 
     uint32_t maxThreads = 0;
 

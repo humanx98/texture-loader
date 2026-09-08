@@ -4,8 +4,10 @@
 #include "../Internal/Utils.h"
 #include "Allocator.h"
 #include "HipEventPool.h"
+#include "InFlightContextPool.h"
 #include "Lru.h"
 #include "PageSystem.h"
+#include "ProcessedBatchPool.h"
 #include "RequestProcessor.h"
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <cassert>
@@ -293,8 +295,10 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) override;
     void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
-    void   processRequestsCallback( Ticket ticket );
-    void   processRequest( hipStream_t stream, uint32_t resourceId );
+    void   processRequestsCallback( Ticket ticket, size_t inFlightIndex );
+    void   recycleProcessedBatch( ProcessedBatch* batch );
+    void   processRequest( hipStream_t stream, ProcessedBatch* batch, uint32_t resourceId );
+    void   publishProcessedBatch( hipStream_t stream, ProcessedBatch* batch );
     int    device() const { return pageSystem_.device(); }
 
   private:
@@ -302,8 +306,6 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     DevicePtr<DeviceTextureInfo> processTextureInfo( hipStream_t stream, const uint32_t textureId );
     void                         processTile( hipStream_t stream, const Resource::Tile& tile );
     void                         processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
-    void                         completeProcessingResource( hipStream_t stream, ProcessedResource resource );
-    void                         updateProcessedResources( DeviceContext& context, hipStream_t stream );
 
     mutable std::mutex mutex_;
     Options            options_{};
@@ -333,25 +335,12 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     uint32_t launchNum_    = 0;
     uint32_t lruThreshold_ = lruThresholdMin;
 
-    DeviceContext      deviceContext_{};
-    HostSpan<uint32_t> requestedResources_{};
-    HostSpan<uint32_t> counters_{};
-    struct
-    {
-        HostSpan<EvictionCandidate> previous;
-        uint32_t                    previousCount;
-        HostSpan<EvictionCandidate> current;
-        uint32_t                    currentCount;
-    } evictionCandidates_{};
-
     ResourceBits bits_;
 
-    struct
-    {
-        mutable std::mutex          mutex;
-        HostSpan<ProcessedResource> resources;
-        uint32_t                    count;
-    } processed_{};
+    ProcessedBatchPool processedBatchPool_;
+
+    InFlightContextPool inFlightContextPool_{};
+    friend class InFlightContextPool;
 };
 
 }  // namespace hip_demand::vmm

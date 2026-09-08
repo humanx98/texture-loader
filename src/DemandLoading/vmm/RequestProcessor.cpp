@@ -1,6 +1,7 @@
 #pragma once
 
 #include "RequestProcessor.h"
+#include "Callbacks.h"
 #include "DemandTextureLoaderImpl.h"
 
 namespace hip_demand::vmm {
@@ -48,16 +49,16 @@ void RequestProcessor::stop()
     }
 }
 
-void RequestProcessor::submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket )
+size_t RequestProcessor::submit( const HostSpan<uint32_t>& resourceIds, ProcessedBatch* batch, Ticket ticket )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
     if( stopped_ )
     {
         TicketImpl::getImpl( ticket )->initialize( 0 );
-        return;
+        return 0;
     }
 
-    queue_.push( resourceIds, count, ticket );
+    return queue_.push( resourceIds, batch, ticket );
 }
 
 void RequestProcessor::workerLoop()
@@ -71,9 +72,11 @@ void RequestProcessor::workerLoop()
             if( !queue_.pop( request ) )
                 break;
 
-            std::shared_ptr<TicketImpl>& ticket     = TicketImpl::getImpl( request.ticket );
-            loader_->processRequest( ticket->getStream(), request.resourceId );
-            ticket->notify();
+            std::shared_ptr<TicketImpl>& ticket = TicketImpl::getImpl( request.ticket );
+
+            hipStream_t stream = ticket->getStream();
+            loader_->processRequest( stream, request.batch, request.resourceId );
+            ticket->notify( [this, stream, batch = request.batch]() { loader_->publishProcessedBatch( stream, batch ); } );
         }
     }
     catch( const std::exception& e )
