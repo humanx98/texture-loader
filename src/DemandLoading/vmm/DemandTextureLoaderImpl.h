@@ -333,7 +333,11 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
         hipFunction_t updateEvictedPages;
     } kernels_{};
     uint32_t launchNum_    = 0;
-    uint32_t lruThreshold_ = lruThresholdMin;
+    struct
+    {
+        mutable std::mutex mutex;
+        uint32_t value = lruThresholdMin;
+    } lruThreshold_{};
 
     ResourceBits bits_;
 

@@ -7,7 +7,6 @@
 #include <exception>
 #include <mutex>
 #include <utility>
-#include <functional>
 
 namespace hip_demand::vmm {
 
@@ -57,19 +56,26 @@ class TicketImpl
         }
     }
 
-    void notify( std::function<void()> onLast )
+    bool finishTaskAndClaimFinalization()
     {
-        std::unique_lock<std::mutex> lock( mutex_ );
-
+        std::lock_guard lock( mutex_ );
         assert( numTasksRemaining_ > 0 );
 
-        if (numTasksRemaining_ == 1)
-            onLast();
+        if( numTasksRemaining_ > 1 )
+        {
+            --numTasksRemaining_;
+            return false;
+        }
 
-        --numTasksRemaining_;
+        return true;
+    }
 
-        if( numTasksRemaining_ == 0 )
-            isDone_.notify_all();
+    void publishCompletion()
+    {
+        std::lock_guard lock( mutex_ );
+        assert( numTasksRemaining_ == 1 );
+        numTasksRemaining_ = 0;
+        isDone_.notify_all();
     }
 
   private:

@@ -76,7 +76,11 @@ void RequestProcessor::workerLoop()
 
             hipStream_t stream = ticket->getStream();
             loader_->processRequest( stream, request.batch, request.resourceId );
-            ticket->notify( [this, stream, batch = request.batch]() { loader_->publishProcessedBatch( stream, batch ); } );
+            if( ticket->finishTaskAndClaimFinalization() )
+            {
+                loader_->publishProcessedBatch( stream, request.batch );
+                ticket->publishCompletion();
+            }
         }
     }
     catch( const std::exception& e )

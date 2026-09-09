@@ -119,7 +119,7 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
 
 const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& descriptor )
 {
-    std::lock_guard<std::mutex> lock( mutex_ );
+    std::lock_guard lock( mutex_ );
 
     if( !imageSource )
         throw std::invalid_argument( "Image source is null" );
@@ -134,15 +134,11 @@ const DemandTexture& DemandTextureLoaderImpl::createTexture( std::shared_ptr<Ima
 
 void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& deviceContext )
 {
-    std::lock_guard<std::mutex> lock( mutex_ );
+    std::lock_guard lock( mutex_ );
 
-    InFlightContext* context = inFlightContextPool_.alloc( stream, *this );
-    {
-        std::lock_guard<std::mutex> lock2( metadataMutex_ );
-
-        deviceContext              = context->deviceContext;
-        deviceContext.textureInfos = deviceContext.textureInfos.subspan( 0, static_cast<uint32_t>( textures_.size() ) );
-    }
+    InFlightContext* context   = inFlightContextPool_.alloc( stream, *this );
+    deviceContext              = context->deviceContext;
+    deviceContext.textureInfos = deviceContext.textureInfos.subspan( 0, static_cast<uint32_t>( textures_.size() ) );
 
     if( options_.enableEviction )
     {
@@ -157,7 +153,6 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
         }
     }
     memset( context->deviceContext.referenceBits, 0, stream );
-    memset( context->deviceContext.counters, 0, stream );
 }
 
 inline uint32_t roundNearest32( uint32_t value )
@@ -167,20 +162,25 @@ inline uint32_t roundNearest32( uint32_t value )
 
 Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceContext& deviceContext )
 {
-    std::lock_guard<std::mutex> lock( mutex_ );
+    std::lock_guard lock( mutex_ );
 
     Ticket ticket = TicketImpl::create( stream );
 
     InFlightContext* context = inFlightContextPool_.get( deviceContext.poolIndex );
+    memset( context->deviceContext.counters, 0, stream );
 
-    const uint32_t resourcesPerThread = std::max( 32U, roundNearest32( resourceTable_.count() / 65536U ) );
-    const uint32_t blockSize          = 256;
-    const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
-    const uint32_t gridSize           = ceilDiv( resourceTable_.count(), resourcesPerBlock );
+    {
+        std::lock_guard lock( lruThreshold_.mutex );
+        const uint32_t  resourcesPerThread = std::max( 32U, roundNearest32( resourceTable_.count() / 65536U ) );
+        const uint32_t  blockSize          = 256;
+        const uint32_t  resourcesPerBlock  = resourcesPerThread * blockSize;
+        const uint32_t  gridSize           = ceilDiv( resourceTable_.count(), resourcesPerBlock );
 
-    launchNum_++;
-    void* arguments[] = { &context->deviceContext, &launchNum_, &lruThreshold_ };
-    HIP_CHECK( hipModuleLaunchKernel( kernels_.collectRequests, gridSize, 1, 1, blockSize, 1, 1, 0, stream, arguments, nullptr ) );
+        launchNum_++;
+        void* arguments[] = { &context->deviceContext, &launchNum_, &lruThreshold_.value };
+
+        HIP_CHECK( hipModuleLaunchKernel( kernels_.collectRequests, gridSize, 1, 1, blockSize, 1, 1, 0, stream, arguments, nullptr ) );
+    }
     memcpyDtoH( context->requestedResources, context->deviceContext.requestedResources, stream );
     memcpyDtoH( context->evictionCandidates.current, context->deviceContext.evictionCandidates, stream );
     memcpyDtoH( context->counters, context->deviceContext.counters, stream );
@@ -198,23 +198,23 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket, size_t inF
 {
     InFlightContext* context = inFlightContextPool_.get( inFlightIndex );
 
-    std::lock_guard<std::mutex> lock( mutex_ );
-
     uint32_t requestCount  = context->counters.ptr[static_cast<uint32_t>( CounterIndex::RequestedResources )];
     uint32_t evictionCount = context->counters.ptr[static_cast<uint32_t>( CounterIndex::EvictionCandidates )];
 
     // clamp here in order to avoid atomicMin on gpu
-    requestCount = std::min( static_cast<uint32_t>( context->requestedResources.len ), requestCount );
-    context->evictionCandidates.currentCount =
-        std::min( static_cast<uint32_t>( context->evictionCandidates.current.len ), evictionCount );
+    requestCount  = std::min( static_cast<uint32_t>( context->requestedResources.len ), requestCount );
+    evictionCount = std::min( static_cast<uint32_t>( context->evictionCandidates.current.len ), evictionCount );
 
     if( options_.enableEviction )
     {
+        bool fullEvictionCandidateList           = evictionCount == options_.maxEvictedPages;
+        context->evictionCandidates.currentCount = evictionCount;
+
         // here we are sure that residence bits are cleared on device for candidates from previous run
         // so we can safely start unmapping them
         if( context->evictionCandidates.previousCount > 0 )
         {
-            std::lock_guard<std::mutex> lock( bits_.mutex );
+            std::lock_guard lock( bits_.mutex );
             for( uint32_t i = 0; i < context->evictionCandidates.previousCount; i++ )
             {
                 const uint32_t pageId     = context->evictionCandidates.previous.ptr[i].pageId;
@@ -224,21 +224,29 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket, size_t inF
             }
         }
 
-        if( context->evictionCandidates.currentCount < options_.maxEvictedPages / 2 )
-            lruThreshold_ -= std::min( lruThreshold_ - lruThresholdMin, 4u );
-        else if( context->evictionCandidates.currentCount < options_.maxEvictedPages )
-            lruThreshold_ -= std::min( lruThreshold_ - lruThresholdMin, 2u );
-        else if( context->evictionCandidates.currentCount > 0 )
+        if( fullEvictionCandidateList )
         {
             auto pred = []( EvictionCandidate a, EvictionCandidate b ) { return a.lru < b.lru; };
             std::sort( context->evictionCandidates.current.ptr,
                        context->evictionCandidates.current.ptr + context->evictionCandidates.currentCount, pred );
+        }
 
-            const uint32_t medianLru =
-                context->evictionCandidates.current.ptr[context->evictionCandidates.currentCount / 2].lru;
-            if( medianLru > lruThreshold_ )
+        // update lru threshold
+        {
+            std::lock_guard lock( lruThreshold_.mutex );
+
+            if( context->evictionCandidates.currentCount < options_.maxEvictedPages / 2 )
+                lruThreshold_.value -= std::min( lruThreshold_.value - lruThresholdMin, 4u );
+            else if( context->evictionCandidates.currentCount < options_.maxEvictedPages )
+                lruThreshold_.value -= std::min( lruThreshold_.value - lruThresholdMin, 2u );
+            else if( fullEvictionCandidateList )
             {
-                lruThreshold_++;
+                const size_t   medianIndex = context->evictionCandidates.currentCount / 2;
+                const uint32_t medianLru   = context->evictionCandidates.current.ptr[medianIndex].lru;
+                if( medianLru > lruThreshold_.value )
+                {
+                    lruThreshold_.value++;
+                }
             }
         }
 
@@ -246,11 +254,10 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket, size_t inF
         std::swap( context->evictionCandidates.previousCount, context->evictionCandidates.currentCount );
     }
 
-    inFlightContextPool_.free( context );
-
     ProcessedBatch*    batch            = processedBatchPool_.alloc();
     HostSpan<uint32_t> requestResources = context->requestedResources.subspan( 0, requestCount );
     size_t             submittedCount   = requestProcessor_.submit( requestResources, batch, ticket );
+    inFlightContextPool_.free( context );
     if( submittedCount == 0 )
         recycleProcessedBatch( batch );
 }
@@ -258,7 +265,7 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket, size_t inF
 void DemandTextureLoaderImpl::processRequest( hipStream_t stream, ProcessedBatch* batch, uint32_t resourceId )
 {
     {
-        std::lock_guard<std::mutex> lock( bits_.mutex );
+        std::lock_guard lock( bits_.mutex );
         if( bits_.residence.test( resourceId ) || bits_.loading.test( resourceId ) )
             return;
 
@@ -299,7 +306,7 @@ void DemandTextureLoaderImpl::processRequest( hipStream_t stream, ProcessedBatch
     }
 
     {
-        std::lock_guard<std::mutex> lock( bits_.mutex );
+        std::lock_guard lock( bits_.mutex );
         bits_.residence.set( resourceId, success );
         bits_.loading.set( resourceId, false );
     }
@@ -309,7 +316,7 @@ DevicePtr<DeviceTextureInfo> DemandTextureLoaderImpl::processTextureInfo( hipStr
 {
     DemandTextureImpl* texture = nullptr;
     {
-        std::lock_guard<std::mutex> lock( mutex_ );
+        std::lock_guard lock( mutex_ );
         texture = textures_.at( textureId ).get();
     }
     TextureInfo imageInfo{};
@@ -381,7 +388,7 @@ DevicePtr<DeviceTextureInfo> DemandTextureLoaderImpl::processTextureInfo( hipStr
     h_info->mipTailSize       = static_cast<uint32_t>( mipTailSize );
 
     {
-        std::lock_guard<std::mutex> lock( metadataMutex_ );
+        std::lock_guard lock( metadataMutex_ );
 
         h_info->startPage = pageTable_.textureTiles.nextAvailablePage;
 
@@ -509,7 +516,7 @@ void DemandTextureLoaderImpl::publishProcessedBatch( hipStream_t stream, Process
 
 Resource DemandTextureLoaderImpl::decode( uint32_t resourceId )
 {
-    std::lock_guard<std::mutex> lock( metadataMutex_ );
+    std::lock_guard lock( metadataMutex_ );
 
     if( resourceTable_.textureInfos.contains( resourceId ) )
     {
