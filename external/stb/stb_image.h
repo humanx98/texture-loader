@@ -7529,6 +7529,16 @@ static void *stbi__pnm_load(stbi__context *s, int *x, int *y, int *comp, int req
       return stbi__errpuc("bad PNM", "PNM file truncated");
    }
 
+   // PGM/PPM 16-bit samples are stored most-significant byte first. Convert
+   // them to host integers before channel expansion or returning stbi_load_16.
+   if (ri->bits_per_channel == 16) {
+      int i;
+      for (i = 0; i < s->img_n * s->img_x * s->img_y; ++i) {
+         stbi__uint16 value = (stbi__uint16)((out[2*i] << 8) | out[2*i+1]);
+         ((stbi__uint16 *)out)[i] = value;
+      }
+   }
+
    if (req_comp && req_comp != s->img_n) {
       if (ri->bits_per_channel == 16) {
          out = (stbi_uc *) stbi__convert_format16((stbi__uint16 *) out, s->img_n, req_comp, s->img_x, s->img_y);
