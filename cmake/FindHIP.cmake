@@ -71,14 +71,14 @@ find_program(HIP_HIPCC_EXECUTABLE
 
 find_program(HIP_CLANG_EXECUTABLE
     NAMES clang++ amdclang
-    PATHS ${HIP_PATH}
+    PATHS ${HIP_PATH}/lib
     PATH_SUFFIXES bin llvm/bin
     NO_DEFAULT_PATH
 )
 
 find_path(HIP_DEVICE_LIB_PATH
     NAME bitcode
-    PATHS ${HIP_PATH}
+    PATHS ${HIP_PATH}/lib/llvm/
     PATH_SUFFIXES llvm amdgcn llvm/amdgcn
     NO_DEFAULT_PATH
 )
