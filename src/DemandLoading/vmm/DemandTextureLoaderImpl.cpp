@@ -211,9 +211,7 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
 
     deviceContext              = deviceContext_;
     deviceContext.textureInfos = deviceContext.textureInfos.subspan( 0, textures_.size() );
-
     clearEvictedPages( stream );
-
     memset( deviceContext.referenceBits, 0, stream );
 }
 
@@ -277,7 +275,7 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket )
             lruThreshold_ -= std::min( lruThreshold_ - lruThresholdMin, 4u );
         else if( eviction_.pendingUnmapCount < options_.maxEvictedPages )
             lruThreshold_ -= std::min( lruThreshold_ - lruThresholdMin, 2u );
-        else if( eviction_.pendingUnmapCount > 0 )
+        else if( eviction_.pendingUnmapCount > 0 ) // only if eviction_.candidates is full
         {
             auto pred = []( EvictionCandidate a, EvictionCandidate b ) { return a.lru < b.lru; };
             std::sort( eviction_.candidates.ptr, eviction_.candidates.ptr + eviction_.pendingUnmapCount, pred );

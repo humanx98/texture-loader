@@ -6,14 +6,6 @@
 
 namespace hip_demand::vmm {
 
-HIP_DEMAND_INLINE void atomicSetBit( uint32_t bitIndex, uint32_t* bitVector )
-{
-    const unsigned int wordIndex = bitIndex / 32;
-    const unsigned int bitOffset = bitIndex % 32;
-    const unsigned int mask      = 1U << bitOffset;
-    atomicOr( bitVector + wordIndex, mask );
-}
-
 HIP_DEMAND_INLINE uint32_t incrementLru( const uint32_t count, const uint32_t launchNum, const uint32_t resourceId )
 {
     /**
@@ -109,7 +101,7 @@ HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
             const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
             const uint32_t lruVal = getUint4( context.lru, pageId );
             if( lruVal != 0 && lruVal != lruNonEvictable )
-                atomicClearUint4( context.lru, pageId );
+                clearUint4( context.lru, pageId );
         }
     }
 
@@ -132,7 +124,7 @@ HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
             const uint32_t oldVal = getUint4( context.lru, pageId );
             const uint32_t newVal = incrementLru( oldVal, launchNum, pageId );
             if( newVal != oldVal )
-                atomicAddUint4( context.lru, pageId, 1 );
+                addUint4( context.lru, pageId, 1 );
             if( newVal >= lruThreshold && newVal < lruNonEvictable )
                 numEvictionBits++;
         }
