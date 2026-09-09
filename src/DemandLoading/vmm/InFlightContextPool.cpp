@@ -22,12 +22,15 @@ InFlightContext* InFlightContextPool::alloc( hipStream_t stream, const DemandTex
     if( contexts_.empty() )
     {
         residenceBits_ = allocArray<uint32_t>( loader.bits_.wordCount(), true, stream );
-        textureInfos_  = allocArray<DeviceTextureInfo*>( loader.options_.maxTextures, false, stream );
+        textureInfos_  = allocArray<DeviceTextureInfo*>( loader.options_.maxTextures, true, stream );
 
         // eviction logic should be applied only to texture tiles
         // 4 bits per textute tile page, 8 values per uint32_t
         if( loader.options_.enableEviction )
             lru_ = allocArray<uint32_t>( ceilDiv( loader.resourceTable_.textureTiles.count, 8u ), true, stream );
+
+        // sync beacause it's shared across streams
+        HIP_CHECK( hipStreamSynchronize( stream ) );
     }
 
     contexts_.push_back( std::make_unique<InFlightContext>() );

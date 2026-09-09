@@ -73,12 +73,16 @@ HIP_DEMAND_INLINE void getWordIdxAndBitIdx( uint32_t idx, uint32_t& wordIdx, uin
     bitIdx  = idx & 31u;  // idx % 32
 }
 
-HIP_DEMAND_INLINE void atomicSetBit(const DeviceSpan<uint32_t>& span, uint32_t index)
+HIP_DEMAND_INLINE void atomicSetBit( const DeviceSpan<uint32_t>& span, uint32_t index, int memoryOrder )
 {
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
     getWordIdxAndBitIdx( index, wordIdx, bitIdx );
+#if defined( __HIPCC__ )
+    __atomic_fetch_or( &span.ptr[wordIdx], 1u << bitIdx, memoryOrder );
+#else
     atomicOr( &span.ptr[wordIdx], 1u << bitIdx );
+#endif
 }
 
 HIP_DEMAND_INLINE void atomicUnsetBit(const DeviceSpan<uint32_t>& span, uint32_t index)
@@ -89,12 +93,17 @@ HIP_DEMAND_INLINE void atomicUnsetBit(const DeviceSpan<uint32_t>& span, uint32_t
     atomicAnd( &span.ptr[wordIdx], ~( 1u << bitIdx ) );
 }
 
-HIP_DEMAND_INLINE bool checkBitSet(const DeviceSpan<uint32_t>& span, uint32_t index)
+HIP_DEMAND_INLINE bool atomicCheckBit(const DeviceSpan<uint32_t>& span, uint32_t index, int memoryOrder)
 {
     uint32_t wordIdx = 0;
     uint32_t bitIdx  = 0;
     getWordIdxAndBitIdx( index, wordIdx, bitIdx );
-    return ( span.ptr[wordIdx] & ( 1u << bitIdx ) ) != 0;
+#if defined( __HIPCC__ )
+    const uint32_t word = __atomic_load_n( &span.ptr[wordIdx], memoryOrder );
+#else
+    const uint32_t word = span.ptr[wordIdx];
+#endif
+    return ( word & ( 1u << bitIdx ) ) != 0;
 }
 
 HIP_DEMAND_INLINE uint32_t getUint4( const DeviceSpan<uint32_t>& words, const uint32_t index )

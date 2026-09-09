@@ -11,8 +11,8 @@
 
 namespace hip_demand::vmm {
 
-HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId ) { atomicSetBit(context.referenceBits, resourceId); }
-HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId ) { return checkBitSet(context.residenceBits, resourceId); }
+HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId ) { atomicSetBit(context.referenceBits, resourceId, __ATOMIC_RELAXED); }
+HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId ) { return atomicCheckBit(context.residenceBits, resourceId, __ATOMIC_ACQUIRE); }
 
 HIP_DEMAND_INLINE int applyAddressMode( int coordinate, int extent, uint32_t mode, bool& valid )
 {

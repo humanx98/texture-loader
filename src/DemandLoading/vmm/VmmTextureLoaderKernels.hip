@@ -6,14 +6,6 @@
 
 namespace hip_demand::vmm {
 
-HIP_DEMAND_INLINE void atomicSetBit( uint32_t bitIndex, uint32_t* bitVector )
-{
-    const unsigned int wordIndex = bitIndex / 32;
-    const unsigned int bitOffset = bitIndex % 32;
-    const unsigned int mask      = 1U << bitOffset;
-    atomicOr( bitVector + wordIndex, mask );
-}
-
 HIP_DEMAND_INLINE uint32_t incrementLru( const uint32_t count, const uint32_t launchNum, const uint32_t resourceId )
 {
     /**
@@ -165,9 +157,9 @@ HIP_DEMAND_INLINE void collectRequestsAndEvictionCandidates( DeviceContext& cont
     {
         const uint32_t resourceBitOffset = wordIdx * 32;
         const uint32_t referenceWord = context.referenceBits.ptr[wordIdx];
-        const uint32_t residenceWord = context.residenceBits.ptr[wordIdx];
+        const uint32_t residenceWord = __atomic_load_n( &context.residenceBits.ptr[wordIdx], __ATOMIC_RELAXED );
         collectRequests(context, referenceWord & ~residenceWord, resourceBitOffset);
-        if( context.lru.ptr )
+        if( context.lru.len > 0 )
         {
             collectEvictionCandidates(context, launchNum, lruThreshold, referenceWord, residenceWord, resourceBitOffset);
         }
@@ -196,7 +188,7 @@ HIP_DEMAND_INLINE void updateProcessedResources( const ResourceTable& resourceTa
             textureInfos.ptr[textureId] = resource.textureInfo.ptr;
         }
 
-        atomicSetBit(residenceBits, resource.resourceId);
+        atomicSetBit( residenceBits, resource.resourceId, __ATOMIC_RELEASE );
         globalIdx += gridDim.x * blockDim.x;
     }
 }
