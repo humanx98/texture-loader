@@ -56,10 +56,6 @@ class OIIOReader : public ImageSource
     // Load entire image with all mip levels
     bool loadImage();
     
-    // Generate mip level from previous level
-    void generateMipLevel(const unsigned char* srcData, int srcWidth, int srcHeight,
-                         unsigned char* dstData, int dstWidth, int dstHeight,
-                         int channels);
 };
 
 }  // namespace hip_demand

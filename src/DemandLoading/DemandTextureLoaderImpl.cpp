@@ -5,6 +5,7 @@
 #include "Internal/HipCheck.h"
 #include "Internal/TextureMetadata.h"
 #include "Internal/Utils.h"
+#include "Internal/ImageData.h"
 
 #include <DemandLoading/Logging.h>
 #include <DemandLoading/Ticket.h>
@@ -27,7 +28,6 @@ namespace hip_demand {
 
 using internal::TextureMetadata;
 using internal::RequestStats;
-using internal::calculateMipmapMemory;
 using internal::calculateMipLevels;
 
 // -----------------------------------------------------------------------------
@@ -276,6 +276,7 @@ TextureHandle DemandTextureLoader::Impl::createTexture(const std::string& filena
 
     TextureMetadata& info = textures_[id];
     info.filename = filename;
+    info.uploadBytesPerPixel = stbi_is_hdr(filename.c_str()) || stbi_is_16_bit(filename.c_str()) ? 16 : 4;
     info.desc = desc;
     info.resident.store(false, std::memory_order_relaxed);
     info.loading.store(false, std::memory_order_relaxed);
@@ -291,8 +292,11 @@ TextureHandle DemandTextureLoader::Impl::createTexture(const std::string& filena
             if (imgSrc->isOpen()) {
                 info.width = texInfo.width;
                 info.height = texInfo.height;
-                info.channels = 4;  // OIIO always converts to RGBA
-                imgSrc->close();
+                info.channels = texInfo.numChannels;
+                info.uploadBytesPerPixel = texInfo.format == HIP_AD_FORMAT_UNSIGNED_INT8 ? 4 : 16;
+                // Keep the opened source so estimates use its actual format
+                // and uploads can consume its supplied mip levels.
+                info.imageSource = std::move(imgSrc);
             } else {
                 // Fall back to stb_image
                 int w, h, c;
@@ -395,6 +399,7 @@ TextureHandle DemandTextureLoader::Impl::createTexture(std::shared_ptr<ImageSour
             info.width = texInfo.width;
             info.height = texInfo.height;
             info.channels = texInfo.numChannels;
+            info.uploadBytesPerPixel = texInfo.format == HIP_AD_FORMAT_UNSIGNED_INT8 ? 4 : 16;
             // Don't close - keep open for later reading, or let ImageSource manage state
         } else {
             info.lastError = LoaderError::ImageLoadFailed;
@@ -417,9 +422,17 @@ TextureHandle DemandTextureLoader::Impl::createTextureFromMemory(const void* dat
                                                                   int channels, const TextureDesc& desc) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (!data || width <= 0 || height <= 0 || channels <= 0) {
+    if (!data || width <= 0 || height <= 0 || channels <= 0 || channels > 4) {
         lastError_ = LoaderError::InvalidParameter;
         logMessage(LogLevel::Error, "createTextureFromMemory: invalid parameters (w=%d h=%d ch=%d)", width, height, channels);
+        return TextureHandle{0, false, 0, 0, 0, lastError_};
+    }
+
+    size_t dataSize;
+    try {
+        dataSize = internal::imageByteSize(width, height, channels, 1);
+    } catch (const std::exception&) {
+        lastError_ = LoaderError::InvalidParameter;
         return TextureHandle{0, false, 0, 0, 0, lastError_};
     }
 
@@ -441,7 +454,6 @@ TextureHandle DemandTextureLoader::Impl::createTextureFromMemory(const void* dat
     info.loading.store(false, std::memory_order_relaxed);
 
     // Cache the data
-    size_t dataSize = width * height * channels;
     info.cachedData = std::make_unique<uint8_t[]>(dataSize);
     std::memcpy(info.cachedData.get(), data, dataSize);
 
@@ -749,8 +761,21 @@ size_t DemandTextureLoader::Impl::processRequestsHost(uint32_t requestCount, con
                     int w = info.width;
                     int h = info.height;
                     if (w > 0 && h > 0) {
-                        size_t mipMemory = calculateMipmapMemory(w, h, 4);
-                        estimatedMemoryNeeded += mipMemory;
+                        const bool floating = info.imageSource && info.imageSource->isOpen() &&
+                            info.imageSource->getInfo().format != HIP_AD_FORMAT_UNSIGNED_INT8;
+                        int levels = info.desc.generateMipmaps ? calculateMipLevels(w, h) : 1;
+                        if (info.desc.maxMipLevel > 0)
+                            levels = static_cast<int>(std::min(static_cast<unsigned int>(levels), info.desc.maxMipLevel));
+                        try {
+                            const size_t mipMemory = internal::mipImageByteSize(w, h,
+                                floating ? sizeof(float) : info.uploadBytesPerPixel / 4, levels);
+                            if (mipMemory > std::numeric_limits<size_t>::max() - estimatedMemoryNeeded)
+                                estimatedMemoryNeeded = std::numeric_limits<size_t>::max();
+                            else
+                                estimatedMemoryNeeded += mipMemory;
+                        } catch (const std::exception&) {
+                            // The decoder reports malformed dimensions before reading pixels.
+                        }
                     }
                 }
             }
@@ -832,176 +857,86 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
     bool hasCached = (cachedPtr != nullptr);
     lock.unlock();
 
-    // Load image data
-    unsigned char* data = nullptr;
-    bool needsFree = false;
-    int width = initWidth;
-    int height = initHeight;
-    int channels = initChannels;
-
-    // Priority: 1) user-provided ImageSource, 2) filename, 3) cached memory
-    if (imageSource) {
-        // Load from user-provided ImageSource
-        try {
-            hip_demand::TextureInfo texInfo;
-            if (!imageSource->isOpen()) {
-                imageSource->open(&texInfo);
-            } else {
-                texInfo = imageSource->getInfo();
-            }
-            
-            if (imageSource->isOpen()) {
-                width = texInfo.width;
-                height = texInfo.height;
-                channels = texInfo.numChannels;
-                
-                // Always convert to 4 channels for GPU texture
-                size_t imageSize = width * height * 4;
-                data = new unsigned char[imageSize];
-                needsFree = true;
-                
-                if (channels == 4) {
-                    if (!imageSource->readMipLevel(reinterpret_cast<char*>(data), 0, width, height)) {
-                        delete[] data;
-                        data = nullptr;
-                        needsFree = false;
-                    }
-                } else {
-                    // Read native channels then convert
-                    std::vector<unsigned char> tempData(width * height * channels);
-                    if (imageSource->readMipLevel(reinterpret_cast<char*>(tempData.data()), 0, width, height)) {
-                        for (size_t i = 0; i < static_cast<size_t>(width * height); ++i) {
-                            if (channels == 1) {
-                                data[i*4+0] = tempData[i];
-                                data[i*4+1] = tempData[i];
-                                data[i*4+2] = tempData[i];
-                                data[i*4+3] = 255;
-                            } else if (channels == 3) {
-                                data[i*4+0] = tempData[i*3+0];
-                                data[i*4+1] = tempData[i*3+1];
-                                data[i*4+2] = tempData[i*3+2];
-                                data[i*4+3] = 255;
-                            }
-                        }
-                    } else {
-                        delete[] data;
-                        data = nullptr;
-                        needsFree = false;
-                    }
+    // Read each ImageSource using its native pixel width before expanding to
+    // the upload representation. FLOAT RGBA sources require 16 bytes per pixel.
+    internal::ImageData image;
+    try {
+        bool loaded = false;
+        if (imageSource) {
+            loaded = internal::readImageSource(*imageSource, image);
+        } else if (!filename.empty()) {
+#ifdef USE_OIIO
+            try {
+                std::unique_ptr<ImageSource> source = createImageSource(filename);
+                if (source) {
+                    loaded = internal::readImageSource(*source, image);
+                    if (loaded)
+                        imageSource = std::move(source);
                 }
-                channels = 4;
+            } catch (...) {
+                loaded = false;
             }
-        } catch (const std::exception& e) {
-            logMessage(LogLevel::Error, "loadTexture: ImageSource exception: %s", e.what());
-            if (data && needsFree) {
-                delete[] data;
-                data = nullptr;
-                needsFree = false;
+#endif
+            if (!loaded) {
+                int width = 0, height = 0, channels = 0;
+                TextureInfo sourceInfo;
+                std::unique_ptr<void, decltype(&stbi_image_free)> pixels(nullptr, stbi_image_free);
+                if (stbi_is_hdr(filename.c_str())) {
+                    pixels.reset(stbi_loadf(filename.c_str(), &width, &height, &channels, 4));
+                    sourceInfo.format = HIP_AD_FORMAT_FLOAT;
+                } else if (stbi_is_16_bit(filename.c_str())) {
+                    pixels.reset(stbi_load_16(filename.c_str(), &width, &height, &channels, 4));
+                    sourceInfo.format = HIP_AD_FORMAT_UNSIGNED_INT16;
+                } else {
+                    pixels.reset(stbi_load(filename.c_str(), &width, &height, &channels, 4));
+                    sourceInfo.format = HIP_AD_FORMAT_UNSIGNED_INT8;
+                }
+                if (pixels) {
+                    sourceInfo.width = width;
+                    sourceInfo.height = height;
+                    sourceInfo.numChannels = 4;
+                    sourceInfo.isValid = true;
+                    image = internal::decodeImagePixels(pixels.get(), sourceInfo);
+                    loaded = true;
+                }
             }
-        } catch (...) {
-            logMessage(LogLevel::Error, "loadTexture: unknown ImageSource exception");
-            if (data && needsFree) {
-                delete[] data;
-                data = nullptr;
-                needsFree = false;
-            }
+        } else if (hasCached) {
+            TextureInfo sourceInfo;
+            sourceInfo.width = initWidth;
+            sourceInfo.height = initHeight;
+            sourceInfo.numChannels = initChannels;
+            sourceInfo.format = HIP_AD_FORMAT_UNSIGNED_INT8;
+            sourceInfo.isValid = true;
+            image = internal::decodeImagePixels(cachedPtr, sourceInfo);
+            loaded = true;
         }
-        
-        if (!data) {
+        if (!loaded) {
             lock.lock();
             info.loading.store(false, std::memory_order_release);
             info.lastError = LoaderError::ImageLoadFailed;
-            logMessage(LogLevel::Error, "loadTexture: failed to load from ImageSource");
+            logMessage(LogLevel::Error, "loadTexture: failed to read image for texId=%u", texId);
             return false;
         }
-    } else if (!filename.empty()) {
-#ifdef USE_OIIO
-        bool oiioSuccess = false;
-        try {
-            std::unique_ptr<ImageSource> imgSrc = createImageSource(filename);
-            if (imgSrc) {
-                hip_demand::TextureInfo texInfo;
-                imgSrc->open(&texInfo);
-                if (imgSrc->isOpen()) {
-                    width = texInfo.width;
-                    height = texInfo.height;
-                    channels = 4;
-
-                    size_t imageSize = width * height * 4;
-                    data = new unsigned char[imageSize];
-
-                    if (imgSrc->readMipLevel(reinterpret_cast<char*>(data), 0, width, height)) {
-                        needsFree = true;
-                        oiioSuccess = true;
-                    } else {
-                        delete[] data;
-                        data = nullptr;
-                    }
-                    imgSrc->close();
-                }
-            }
-        } catch (...) {
-            if (data) {
-                delete[] data;
-                data = nullptr;
-            }
-            oiioSuccess = false;
-        }
-
-        if (!oiioSuccess) {
-#endif
-            data = stbi_load(filename.c_str(), &width, &height, &channels, 4);
-            if (!data) {
-                lock.lock();
-                info.loading.store(false, std::memory_order_release);
-                info.lastError = LoaderError::ImageLoadFailed;
-                logMessage(LogLevel::Error, "loadTexture: failed to load image '%s'", filename.c_str());
-                return false;
-            }
-            needsFree = true;
-            channels = 4;
-#ifdef USE_OIIO
-        }
-#endif
-    } else if (hasCached) {
-        width = initWidth;
-        height = initHeight;
-        channels = initChannels;
-
-        if (channels == 4) {
-            data = const_cast<unsigned char*>(cachedPtr);
-        } else {
-            size_t pixelCount = width * height;
-            unsigned char* data4 = new unsigned char[pixelCount * 4];
-            needsFree = true;
-
-            for (size_t i = 0; i < pixelCount; ++i) {
-                if (channels == 1) {
-                    data4[i*4+0] = cachedPtr[i];
-                    data4[i*4+1] = cachedPtr[i];
-                    data4[i*4+2] = cachedPtr[i];
-                    data4[i*4+3] = 255;
-                } else if (channels == 3) {
-                    data4[i*4+0] = cachedPtr[i*3+0];
-                    data4[i*4+1] = cachedPtr[i*3+1];
-                    data4[i*4+2] = cachedPtr[i*3+2];
-                    data4[i*4+3] = 255;
-                }
-            }
-            data = data4;
-            channels = 4;
-        }
-    } else {
+    } catch (const std::exception& e) {
         lock.lock();
         info.loading.store(false, std::memory_order_release);
-        info.lastError = LoaderError::InvalidParameter;
-        logMessage(LogLevel::Error, "loadTexture: invalid parameters for texId=%u", texId);
+        info.lastError = LoaderError::ImageLoadFailed;
+        logMessage(LogLevel::Error, "loadTexture: image decode failed: %s", e.what());
+        return false;
+    } catch (...) {
+        lock.lock();
+        info.loading.store(false, std::memory_order_release);
+        info.lastError = LoaderError::ImageLoadFailed;
+        logMessage(LogLevel::Error, "loadTexture: unknown image decode failure");
         return false;
     }
 
-    int finalWidth = width;
-    int finalHeight = height;
-    int finalChannels = channels;
+    if (desc.sRGB)
+        internal::linearizeFloatSRGB(image);
+    const int width = static_cast<int>(image.width);
+    const int height = static_cast<int>(image.height);
+    const hipChannelFormatDesc channelDesc = image.channelDesc();
+    const size_t rowBytes = image.rowBytes();
 
     hipError_t err;
     bool success = false;
@@ -1043,21 +978,13 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
     if (useMipmaps) {
         int numLevels = calculateMipLevels(width, height);
         if (desc.maxMipLevel > 0) {
-            numLevels = std::min(numLevels, (int)desc.maxMipLevel);
+            numLevels = static_cast<int>(std::min(static_cast<unsigned int>(numLevels), desc.maxMipLevel));
         }
 
-        hipChannelFormatDesc channelDesc = hipCreateChannelDesc<uchar4>();
         hipExtent extent = make_hipExtent(width, height, 0);
 
         err = hipMallocMipmappedArray(&info.mipmapArray, &channelDesc, extent, numLevels);
         if (err != hipSuccess) {
-            if (needsFree) {
-                if (!filename.empty()) {
-                    stbi_image_free(data);
-                } else {
-                    delete[] data;
-                }
-            }
             lock.lock();
             info.loading.store(false, std::memory_order_release);
             info.lastError = LoaderError::OutOfMemory;
@@ -1067,12 +994,18 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
         hipArray_t level0Array;
         err = hipGetMipmappedArrayLevel(&level0Array, info.mipmapArray, 0);
         if (err == hipSuccess) {
-            err = hipMemcpy2DToArray(level0Array, 0, 0, data, width * 4,
-                                    width * 4, height, hipMemcpyHostToDevice);
+            err = hipMemcpy2DToArray(level0Array, 0, 0, image.data(), rowBytes,
+                                    rowBytes, height, hipMemcpyHostToDevice);
         }
 
         if (err == hipSuccess) {
-            success = generateMipLevels(info.mipmapArray, data, width, height, numLevels);
+            try {
+                success = generateMipLevels(info.mipmapArray, image, numLevels,
+                                               imageSource.get(), desc.sRGB);
+            } catch (const std::exception& e) {
+                logMessage(LogLevel::Error, "loadTexture: mip generation failed: %s", e.what());
+                success = false;
+            }
         }
 
         if (success) {
@@ -1084,9 +1017,9 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
             texDesc.addressMode[0] = desc.addressMode[0];
             texDesc.addressMode[1] = desc.addressMode[1];
             texDesc.filterMode = desc.filterMode;
-            texDesc.readMode = hipReadModeNormalizedFloat;
+            texDesc.readMode = image.readMode();
             texDesc.normalizedCoords = desc.normalizedCoords ? 1 : 0;
-            texDesc.sRGB = desc.sRGB ? 1 : 0;
+            texDesc.sRGB = desc.sRGB && !image.isFloat() ? 1 : 0;
             texDesc.maxMipmapLevelClamp = numLevels - 1;
             texDesc.minMipmapLevelClamp = 0;
             texDesc.mipmapFilterMode = hipFilterModeLinear;
@@ -1097,16 +1030,15 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
             if (success) {
                 info.hasMipmaps = true;
                 info.numMipLevels = numLevels;
-                info.memoryUsage = calculateMipmapMemory(width, height, 4);
+                info.memoryUsage = internal::mipImageByteSize(image, numLevels);
             }
         }
     } else {
-        hipChannelFormatDesc channelDesc = hipCreateChannelDesc<uchar4>();
         err = hipMallocArray(&info.array, &channelDesc, width, height);
 
         if (err == hipSuccess) {
-            err = hipMemcpy2DToArray(info.array, 0, 0, data, width * 4,
-                                    width * 4, height, hipMemcpyHostToDevice);
+            err = hipMemcpy2DToArray(info.array, 0, 0, image.data(), rowBytes,
+                                    rowBytes, height, hipMemcpyHostToDevice);
         }
 
         if (err == hipSuccess) {
@@ -1118,9 +1050,9 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
             texDesc.addressMode[0] = desc.addressMode[0];
             texDesc.addressMode[1] = desc.addressMode[1];
             texDesc.filterMode = desc.filterMode;
-            texDesc.readMode = hipReadModeNormalizedFloat;
+            texDesc.readMode = image.readMode();
             texDesc.normalizedCoords = desc.normalizedCoords ? 1 : 0;
-            texDesc.sRGB = desc.sRGB ? 1 : 0;
+            texDesc.sRGB = desc.sRGB && !image.isFloat() ? 1 : 0;
 
             err = hipCreateTextureObject(&info.texObj, &resDesc, &texDesc, nullptr);
             success = (err == hipSuccess);
@@ -1128,16 +1060,8 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
             if (success) {
                 info.hasMipmaps = false;
                 info.numMipLevels = 1;
-                info.memoryUsage = width * height * 4;
+                info.memoryUsage = image.sizeBytes();
             }
-        }
-    }
-
-    if (needsFree) {
-        if (!filename.empty()) {
-            stbi_image_free(data);
-        } else {
-            delete[] data;
         }
     }
 
@@ -1159,9 +1083,11 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
 
     // Publish results under lock
     lock.lock();
-    info.width = finalWidth;
-    info.height = finalHeight;
-    info.channels = finalChannels;
+    info.width = width;
+    info.height = height;
+    info.uploadBytesPerPixel = static_cast<unsigned int>(image.bytesPerPixel());
+    // Keep the source channel count: cachedData still holds that native layout
+    // and must be decoded with the same stride after unload or eviction.
     h_textures_[texId] = (TextureObject) info.texObj;
     uint32_t wordIdx = texId / 32;
     uint32_t bitIdx = texId % 32;
@@ -1181,59 +1107,37 @@ bool DemandTextureLoader::Impl::loadTexture(uint32_t texId) {
     return true;
 }
 
-bool DemandTextureLoader::Impl::generateMipLevels(hipMipmappedArray_t mipmapArray, unsigned char* baseData,
-                                                   int baseWidth, int baseHeight, int numLevels) {
-    std::vector<unsigned char> currentLevel(baseWidth * baseHeight * 4);
-    std::memcpy(currentLevel.data(), baseData, baseWidth * baseHeight * 4);
-
-    int width = baseWidth;
-    int height = baseHeight;
-
+bool DemandTextureLoader::Impl::generateMipLevels(hipMipmappedArray_t mipmapArray,
+                                                   const internal::ImageData& baseImage,
+                                                   int numLevels, ImageSource* source,
+                                                   bool sourceSRGB) {
+    internal::ImageData ownedCurrent;
+    const internal::ImageData* current = &baseImage;
     for (int level = 1; level < numLevels; ++level) {
-        int prevWidth = width;
-        int prevHeight = height;
-        width = std::max(1, width / 2);
-        height = std::max(1, height / 2);
-
-        std::vector<unsigned char> nextLevel(width * height * 4);
-
-        // Simple box filter downsample
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                int sx = x * 2;
-                int sy = y * 2;
-
-                for (int c = 0; c < 4; ++c) {
-                    int sum = 0;
-                    int count = 0;
-
-                    for (int dy = 0; dy < 2 && (sy + dy) < prevHeight; ++dy) {
-                        for (int dx = 0; dx < 2 && (sx + dx) < prevWidth; ++dx) {
-                            sum += currentLevel[((sy + dy) * prevWidth + (sx + dx)) * 4 + c];
-                            count++;
-                        }
-                    }
-
-                    nextLevel[(y * width + x) * 4 + c] = sum / count;
-                }
-            }
+        internal::ImageData next;
+        if (source && static_cast<unsigned int>(level) < source->getInfo().numMipLevels) {
+            if (!internal::readImageSource(*source, next, level))
+                return false;
+            if (sourceSRGB)
+                internal::linearizeFloatSRGB(next);
+            if (next.width != std::max(1u, current->width / 2) ||
+                next.height != std::max(1u, current->height / 2) ||
+                next.isFloat() != baseImage.isFloat())
+                return false;
+        } else {
+            next = internal::downsampleImage(*current, sourceSRGB);
         }
-
         hipArray_t levelArray;
         hipError_t err = hipGetMipmappedArrayLevel(&levelArray, mipmapArray, level);
-        if (err != hipSuccess) {
+        if (err != hipSuccess)
             return false;
-        }
-
-        err = hipMemcpy2DToArray(levelArray, 0, 0, nextLevel.data(), width * 4,
-                                width * 4, height, hipMemcpyHostToDevice);
-        if (err != hipSuccess) {
+        err = hipMemcpy2DToArray(levelArray, 0, 0, next.data(), next.rowBytes(),
+                                  next.rowBytes(), next.height, hipMemcpyHostToDevice);
+        if (err != hipSuccess)
             return false;
-        }
-
-        currentLevel = std::move(nextLevel);
+        ownedCurrent = std::move(next);
+        current = &ownedCurrent;
     }
-
     return true;
 }
 
@@ -1293,7 +1197,8 @@ void DemandTextureLoader::Impl::evictIfNeeded(size_t requiredMemory) {
         return;
     }
 
-    if (totalMemoryUsage_ + requiredMemory <= options_.maxTextureMemory) {
+    if (requiredMemory <= options_.maxTextureMemory &&
+        totalMemoryUsage_ <= options_.maxTextureMemory - requiredMemory) {
         return;
     }
 
@@ -1341,7 +1246,8 @@ void DemandTextureLoader::Impl::evictIfNeeded(size_t requiredMemory) {
     // Sort by priority first, then by age (oldest first within same priority)
     std::sort(evictionList.begin(), evictionList.end());
 
-    size_t targetMemory = options_.maxTextureMemory - requiredMemory;
+    size_t targetMemory = requiredMemory < options_.maxTextureMemory ?
+                            options_.maxTextureMemory - requiredMemory : 0;
     for (const auto& [priority, frame, texId] : evictionList) {
         if (totalMemoryUsage_ <= targetMemory) {
             break;

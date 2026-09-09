@@ -12,6 +12,7 @@
 #include "Internal/PinnedMemoryPool.h"
 #include "Internal/ThreadPool.h"
 #include "Internal/Utils.h"
+#include "Internal/ImageData.h"
 
 #include <hip/hip_runtime.h>
 
@@ -80,8 +81,8 @@ private:
     size_t processRequestsHost(uint32_t requestCount, const uint32_t* requests);
 
     // Mipmap generation
-    bool generateMipLevels(hipMipmappedArray_t mipmapArray, unsigned char* baseData,
-                          int baseWidth, int baseHeight, int numLevels);
+    bool generateMipLevels(hipMipmappedArray_t mipmapArray, const internal::ImageData& baseImage,
+                          int numLevels, ImageSource* source, bool sourceSRGB);
 
     // Configuration
     LoaderOptions options_;

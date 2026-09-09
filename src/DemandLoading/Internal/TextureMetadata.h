@@ -34,6 +34,7 @@ struct TextureMetadata {
     int width = 0;
     int height = 0;
     int channels = 0;
+    unsigned int uploadBytesPerPixel = 4;
     bool hasMipmaps = false;
     int numMipLevels = 0;
     size_t memoryUsage = 0;
@@ -63,6 +64,7 @@ struct TextureMetadata {
         , width(other.width)
         , height(other.height)
         , channels(other.channels)
+        , uploadBytesPerPixel(other.uploadBytesPerPixel)
         , hasMipmaps(other.hasMipmaps)
         , numMipLevels(other.numMipLevels)
         , memoryUsage(other.memoryUsage)
@@ -86,6 +88,7 @@ struct TextureMetadata {
             width = other.width;
             height = other.height;
             channels = other.channels;
+            uploadBytesPerPixel = other.uploadBytesPerPixel;
             hasMipmaps = other.hasMipmaps;
             numMipLevels = other.numMipLevels;
             memoryUsage = other.memoryUsage;

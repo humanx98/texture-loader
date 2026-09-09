@@ -7,6 +7,11 @@
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
+
+    // CTest parses --gtest_list_tests output as test names. Avoid injecting
+    // device-info headings or initializing a GPU during test discovery.
+    if (GTEST_FLAG_GET(list_tests))
+        return RUN_ALL_TESTS();
     
     // Print HIP device info
     int deviceCount = 0;

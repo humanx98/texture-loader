@@ -455,6 +455,7 @@ if(BUILD_TESTS)
         tests/main.cpp
         tests/TextureInfoTests.cpp
         tests/DemandTextureLoaderTests.cpp
+        tests/TextureUploadTests.cpp
         tests/ThreadPoolTests.cpp
         tests/MemoryPoolTests.cpp
         tests/TicketTests.cpp
@@ -479,11 +480,21 @@ if(BUILD_TESTS)
     # Add OpenImageIO support to tests if enabled
     if(USE_OIIO)
         target_compile_definitions(texture_loader_tests PRIVATE USE_OIIO)
+        target_sources(texture_loader_tests PRIVATE tests/OIIOReaderTests.cpp)
+        target_link_libraries(texture_loader_tests PRIVATE OpenImageIO::OpenImageIO)
     endif()
     
     # Register tests with CTest
     include(GoogleTest)
     gtest_discover_tests(texture_loader_tests)
+
+    # Native image decode regressions do not initialize a GPU. This separate
+    # target can also be built and run with address/undefined sanitizers.
+    add_executable(image_data_tests tests/ImageDataTests.cpp)
+    target_include_directories(image_data_tests PRIVATE include src)
+    target_link_libraries(image_data_tests PRIVATE hip::host GTest::gtest_main)
+    target_compile_definitions(image_data_tests PRIVATE __HIP_PLATFORM_AMD__)
+    gtest_discover_tests(image_data_tests)
     
     message(STATUS "Building unit tests")
 endif()
