@@ -201,6 +201,12 @@ struct HostSpan
     }
 
     HIP_DEMAND_INLINE size_t sizeInBytes() const { return len * sizeof( T ); }
+
+    HostSpan<T> subspan( size_t offset, size_t newLen ) const
+    {
+        assert( offset + newLen <= len );
+        return HostSpan<T>{ ptr + offset, newLen };
+    }
 };
 
 template <typename T>

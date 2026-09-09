@@ -71,9 +71,13 @@ void RequestProcessor::workerLoop()
             if( !queue_.pop( request ) )
                 break;
 
-            std::shared_ptr<TicketImpl>& ticket     = TicketImpl::getImpl( request.ticket );
+            std::shared_ptr<TicketImpl>& ticket = TicketImpl::getImpl( request.ticket );
             loader_->processRequest( ticket->getStream(), request.resourceId );
-            ticket->notify();
+            if (ticket->finishTaskAndClaimFinalization())
+            {
+                loader_->updateProccedResources( ticket->getStream() );
+                ticket->publishCompletion();
+            }
         }
     }
     catch( const std::exception& e )

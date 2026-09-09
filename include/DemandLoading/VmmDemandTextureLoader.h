@@ -36,18 +36,14 @@ class Ticket
 
 struct Options
 {
-    uint32_t maxTextures      = 1024;
     uint32_t maxVirtualPages  = 32 * 1024;
     uint32_t maxPhysicalPages = 1024;  // 64KB * 1024
 
+    uint32_t maxTextures     = 1024;
     uint32_t maxRequests     = 1024;
-    uint32_t maxRequestQueue = 1024;
-    uint32_t maxProcessedResources = 1024;
-
-    uint32_t maxThreads = 0;
-
-    bool     enableEviction    = false;
+    bool     enableEviction  = false;
     uint32_t maxEvictedPages = 1024;
+    uint32_t maxThreads      = 0;
 };
 
 class DemandTexture

@@ -50,6 +50,10 @@ struct DeviceSpan
     }
 
     HIP_DEMAND_INLINE size_t sizeInBytes() const { return len * sizeof( T ); }
+    HIP_DEMAND_INLINE DeviceSpan<T> subspan( size_t offset, size_t newLen ) const
+    {
+        return DeviceSpan<T>{ ptr + offset, newLen };
+    }
 };
 
 }  // namespace hip_demand

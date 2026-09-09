@@ -295,15 +295,15 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
     void   processRequestsCallback( Ticket ticket );
     void   processRequest( hipStream_t stream, uint32_t resourceId );
+    void   updateProccedResources( hipStream_t stream );
     int    device() const { return pageSystem_.device(); }
 
   private:
     Resource                     decode( uint32_t resourceId );
+    void                         clearEvictedPages( hipStream_t stream );
     DevicePtr<DeviceTextureInfo> processTextureInfo( hipStream_t stream, const uint32_t textureId );
     void                         processTile( hipStream_t stream, const Resource::Tile& tile );
     void                         processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
-    void                         completeProcessingResource( hipStream_t stream, ProcessedResource resource );
-    void                         updateProcessedResources( DeviceContext& context, hipStream_t stream );
 
     mutable std::mutex mutex_;
     Options            options_{};
@@ -336,15 +336,17 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     DeviceContext      deviceContext_{};
     HostSpan<uint32_t> requestedResources_{};
     HostSpan<uint32_t> counters_{};
-    struct
-    {
-        HostSpan<EvictionCandidate> previous;
-        uint32_t                    previousCount;
-        HostSpan<EvictionCandidate> current;
-        uint32_t                    currentCount;
-    } evictionCandidates_{};
 
     ResourceBits bits_;
+
+    struct
+    {
+        mutable std::mutex          mutex;
+        HostSpan<EvictionCandidate> candidates;
+        uint32_t                    clearCount        = 0;  // Device candidates awaiting residence-bit clearing.
+        uint32_t                    pendingUnmapCount = 0;  // Cleared candidates awaiting the next host copy.
+
+    } eviction_{};
 
     struct
     {

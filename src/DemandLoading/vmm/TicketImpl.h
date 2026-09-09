@@ -56,15 +56,26 @@ class TicketImpl
         }
     }
 
-    void notify( )
+    bool finishTaskAndClaimFinalization()
     {
-        std::unique_lock<std::mutex> lock( mutex_ );
-
+        std::lock_guard lock( mutex_ );
         assert( numTasksRemaining_ > 0 );
-        --numTasksRemaining_;
 
-        if( numTasksRemaining_ == 0 )
-            isDone_.notify_all();
+        if( numTasksRemaining_ > 1 )
+        {
+            --numTasksRemaining_;
+            return false;
+        }
+
+        return true;
+    }
+
+    void publishCompletion()
+    {
+        std::lock_guard lock( mutex_ );
+        assert( numTasksRemaining_ == 1 );
+        numTasksRemaining_ = 0;
+        isDone_.notify_all();
     }
 
   private:

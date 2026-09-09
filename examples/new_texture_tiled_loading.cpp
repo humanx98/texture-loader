@@ -295,7 +295,6 @@ void renderGrid( const fs::path& executableDir, const fs::path& outputPath, bool
     Options options{};
     options.maxPhysicalPages = 4096;
     options.maxRequests      = 100;
-    options.maxRequestQueue  = options.maxRequests;
 
     std::unique_ptr<DemandTextureLoader> loader = createDemandTextureLoader( options );
 
