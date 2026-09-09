@@ -33,6 +33,13 @@ class InFlightContextPool : NonCopyble
 
     InFlightContext* alloc( hipStream_t stream, const DemandTextureLoaderImpl& loader );
     void             free( InFlightContext* context );
+
+    void preallocateContext( hipStream_t stream, const DemandTextureLoaderImpl& loader )
+    { 
+        InFlightContext* context = alloc( stream, loader );
+        free( context );
+    }
+
     InFlightContext* get( size_t poolIndex );
 
     DeviceSpan<uint32_t>           residenceBits() const { return residenceBits_; }

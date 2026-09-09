@@ -104,6 +104,10 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     HIP_CHECK(
         hipModuleGetFunction( &kernels_.updateProcessedResources, kernels_.module, "updateProcessedResourcesKernel" ) );
     HIP_CHECK( hipModuleGetFunction( &kernels_.updateEvictedPages, kernels_.module, "updateEvictedPagesKernel" ) );
+
+    hipStream_t stream = nullptr;
+    inFlightContextPool_.preallocateContext( stream, *this );
+    HIP_CHECK(hipStreamSynchronize(stream));
 }
 
 DemandTextureLoaderImpl::~DemandTextureLoaderImpl()

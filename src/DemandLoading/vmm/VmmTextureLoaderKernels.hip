@@ -36,6 +36,27 @@ HIP_DEMAND_INLINE uint32_t incrementLru( const uint32_t count, const uint32_t la
     return ( ( mask & (launchNum + resourceId) ) == 0 ) ? count + 1u : count;
 }
 
+HIP_DEMAND_INLINE uint32_t atomicIncrementLru( const DeviceSpan<uint32_t>& lru, const uint32_t pageId, const uint32_t launchNum )
+{
+    const uint32_t wordIndex = pageId >> 3u;
+    const uint32_t shift     = 4u * ( pageId & 0x7u );
+    const uint32_t valueMask = 0xfu << shift;
+    uint32_t*      word      = &lru.ptr[wordIndex];
+
+    uint32_t expected = __atomic_load_n( word, __ATOMIC_RELAXED );
+    while( true )
+    {
+        const uint32_t oldValue = ( expected & valueMask ) >> shift;
+        const uint32_t newValue = incrementLru( oldValue, launchNum, pageId );
+        if( newValue == oldValue )
+            return oldValue;
+
+        const uint32_t desired = ( expected & ~valueMask ) | ( newValue << shift );
+        if( __atomic_compare_exchange_n( word, &expected, desired, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED ) )
+            return newValue;
+    }
+}
+
 HIP_DEMAND_INLINE uint32_t calcListStartIndex( const uint32_t numSetBits, uint32_t* counter )
 {
     const uint32_t laneId = __lane_id();
@@ -107,9 +128,9 @@ HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
 
     // num bits bigger than threshold
     {
-        const uint32_t evictionBits = ~referenceWord & residenceWord;
-        uint32_t numEvictionBits = 0;
-        uint32_t bits = evictionBits;
+        const uint32_t evictionBits  = ~referenceWord & residenceWord;
+        uint32_t       candidateBits = 0;
+        uint32_t       bits          = evictionBits;
         while( bits != 0 )
         {
             const uint32_t bitIndex = __ffs( bits ) - 1;
@@ -117,20 +138,19 @@ HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
 
             // eviction logic should be applied only to texture tiles
             const uint32_t resourceId = resourceBitOffset + bitIndex;
-            if( !context.resourceTable.textureTiles.contains(resourceId) )
+            if( !context.resourceTable.textureTiles.contains( resourceId ) )
                 continue;
 
-            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
-            const uint32_t oldVal = getUint4( context.lru, pageId );
-            const uint32_t newVal = incrementLru( oldVal, launchNum, pageId );
-            if( newVal != oldVal )
-                atomicAddUint4( context.lru, pageId, 1 );
+            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId( resourceId );
+            const uint32_t newVal = atomicIncrementLru( context.lru, pageId, launchNum );
             if( newVal >= lruThreshold && newVal < lruNonEvictable )
-                numEvictionBits++;
+                candidateBits |= 1u << bitIndex;
         }
 
-        uint32_t candidateIndex = calcListStartIndex( numEvictionBits, &context.counters.ptr[static_cast<uint32_t>( CounterIndex::EvictionCandidates )] );
-        bits = evictionBits;
+        const uint32_t numEvictionBits = __popc( candidateBits );
+        uint32_t       candidateIndex =
+            calcListStartIndex( numEvictionBits, &context.counters.ptr[static_cast<uint32_t>( CounterIndex::EvictionCandidates )] );
+        bits = candidateBits;
         while( bits != 0 && ( candidateIndex < context.evictionCandidates.len ) )
         {
             const uint32_t bitIndex = __ffs( bits ) - 1;
@@ -138,13 +158,12 @@ HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
 
             // eviction logic should be applied only to texture tiles
             const uint32_t resourceId = resourceBitOffset + bitIndex;
-            if( !context.resourceTable.textureTiles.contains(resourceId) )
+            if( !context.resourceTable.textureTiles.contains( resourceId ) )
                 continue;
 
-            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
+            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId( resourceId );
             const uint32_t lruVal = getUint4( context.lru, pageId );
-            if( lruVal >= lruThreshold && lruVal != lruNonEvictable )
-                context.evictionCandidates.ptr[candidateIndex++] = { pageId, lruVal };
+            context.evictionCandidates.ptr[candidateIndex++] = { pageId, lruVal };
         }
     }
 }

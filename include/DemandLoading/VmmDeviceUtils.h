@@ -109,19 +109,18 @@ HIP_DEMAND_INLINE bool atomicCheckBit(const DeviceSpan<uint32_t>& span, uint32_t
 HIP_DEMAND_INLINE uint32_t getUint4( const DeviceSpan<uint32_t>& words, const uint32_t index )
 {
     const uint32_t wordIndex = index >> 3;
-    return ( words.ptr[wordIndex] >> 4u * ( index & 0x7u ) ) & 0xf;
+#if defined( __HIPCC__ )
+    const uint32_t word = __atomic_load_n( &words.ptr[wordIndex], __ATOMIC_RELAXED );
+#else
+    const uint32_t word = words.ptr[wordIndex];
+#endif
+    return ( word >> 4u * ( index & 0x7u ) ) & 0xf;
 }
 
 HIP_DEMAND_INLINE void atomicClearUint4( const DeviceSpan<uint32_t>& words, const uint32_t index )
 {
     const uint32_t wordIndex = index >> 3u;
     atomicAnd( &words.ptr[wordIndex], ~( 0xf << ( 4u * ( index & 0x7u ) ) ) );
-}
-
-HIP_DEMAND_INLINE void atomicAddUint4( const DeviceSpan<uint32_t>& words, const uint32_t index, const uint32_t val )
-{
-    const uint32_t wordIndex = index >> 3;
-    atomicAdd( &words.ptr[wordIndex], val << ( 4u * ( index & 0x7u ) ) );
 }
 
 }  // namespace hip_demand::vmm
