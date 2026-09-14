@@ -50,6 +50,7 @@ set ZLIB_LIBRARY=%ZLIB_ROOT%\lib\zlibstatic.lib
 cmake -S . -B .\build\ ^
   -G "Visual Studio 17 2022" ^
   -A x64 ^
+  -DUSE_VCPKG=OFF ^
   -DBUILD_EXAMPLES=ON ^
   -DUSE_OIIO=ON ^
   -DOpenImageIO_DIR=%OIIO_DIR% ^

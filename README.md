@@ -25,24 +25,21 @@
 
 **Using vcpkg (Recommended)**:
 ```powershell
-# 1. Install vcpkg if you haven't already
-git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-cd C:\vcpkg
-.\bootstrap-vcpkg.bat
-.\vcpkg integrate install
-
-# 2. Install OpenImageIO (provides all dependencies)
-cd C:\vcpkg
-.\vcpkg install openimageio:x64-windows
-
-# 3. Build with vcpkg toolchain
-cd <your-project-dir>
+# Set your supported HIP SDK path. CMake downloads vcpkg and dependencies.
+$env:HIP_PATH = "C:\Program Files\AMD\ROCm\6.4"
+$env:PATH = "$env:HIP_PATH\bin;$env:PATH"
 cmake -B build -S . -G "Visual Studio 17 2022" -A x64 `
-      -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
       -DBUILD_EXAMPLES=ON -DUSE_OIIO=ON
 cmake --build build --config Release
+cmake --build build --config Debug
 .\build\Release\texture_loader_example.exe
 ```
+
+The pinned [vcpkg manifest](vcpkg.json) always supplies stb, adds OpenImageIO
+only with `USE_OIIO=ON` (default OFF), and GoogleTest only with `BUILD_TESTS=ON`.
+Both Debug and Release dependencies are built. Git, a host compiler and ROCm/HIP
+must already be installed. Existing vcpkg installations can be selected using
+`VCPKG_ROOT`; use `USE_VCPKG=OFF` for system or manually built dependencies.
 
 **Basic Build (without OpenImageIO)**:
 ```powershell
@@ -84,10 +81,13 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 
-# With OpenImageIO
-sudo apt install libopenimageio-dev
+# With OpenImageIO (automatically restored by vcpkg)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_OIIO=ON -DBUILD_EXAMPLES=ON
 cmake --build build
+
+# Debug uses a separate build tree with a single-config generator
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DUSE_OIIO=ON
+cmake --build build/debug
 ```
 
 See [BUILD.md](BUILD.md) for detailed build instructions.
