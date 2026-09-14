@@ -1,5 +1,9 @@
 # Download stb_image.h
 
+Standalone builds now restore pinned stb headers automatically through vcpkg.
+These bundled headers and the manual download instructions below are only
+needed when configuring with `-DUSE_VCPKG=OFF`. See [BUILD.md](../../BUILD.md).
+
 This directory should contain stb_image.h from the stb library.
 
 ## Download:

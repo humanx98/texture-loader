@@ -2,6 +2,13 @@
 
 Complete guide for building the HIP Demand Texture Loader on Windows and Linux.
 
+The root [CMakeLists.txt](CMakeLists.txt) configures dependencies and the loader
+library. Optional targets are defined in
+[examples/CMakeLists.txt](examples/CMakeLists.txt) and
+[tests/CMakeLists.txt](tests/CMakeLists.txt). Continue configuring from the
+repository root; build commands, executable locations and top-level CTest
+discovery are unchanged.
+
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
@@ -17,16 +24,50 @@ Complete guide for building the HIP Demand Texture Loader on Windows and Linux.
 
 - **ROCm/HIP**: Version 6.0+ (tested with 6.4)
 - **CMake**: Version 3.21+
+- **Git** and internet access for the first dependency restore
 - **C++17 Compiler**:
   - Windows: Visual Studio 2022
   - Linux: GCC 9+ or Clang 10+
 
-### Image Loading (choose one):
+### Automatic dependencies
 
-- **stb_image**: Header-only library (default, basic formats)
-- **OpenImageIO**: Advanced formats (EXR, HDR, TIFF 16/32-bit, etc.)
-  - **Recommended**: Install via vcpkg (handles all dependencies automatically)
-  - Alternative: Build from source or use system package manager
+CMake uses **vcpkg manifest mode by default** for standalone builds on Windows
+and Linux. No separate clone, bootstrap, `vcpkg install`, or global
+`vcpkg integrate install` step is needed.
+
+| Dependency | Downloaded when |
+|------------|-----------------|
+| stb (image loading and example image writing) | Always |
+| OpenImageIO and its transitive dependencies | `USE_OIIO=ON` |
+| GoogleTest | `BUILD_TESTS=ON` |
+
+`USE_OIIO` remains **OFF** by default. Enabling it adds EXR, TIFF and other
+OpenImageIO formats; it does not remove stb. Unneeded OIIO tools, viewers,
+Python bindings and optional codecs are not enabled by the manifest.
+
+The `builtin-baseline` in [vcpkg.json](vcpkg.json) pins dependency versions
+and the automatically downloaded vcpkg checkout. Checkouts are cached under
+`external/vcpkg/<baseline>`; installed packages belong to each build directory
+under `vcpkg_installed`. vcpkg's normal binary/download caches can be reused.
+The first OIIO restore builds a substantial dependency tree and may take a while.
+
+An existing vcpkg can be selected with the `VCPKG_ROOT` environment variable or
+`CMAKE_TOOLCHAIN_FILE`. Its checkout is not modified by this project. To use
+another compiler toolchain with vcpkg, pass `VCPKG_CHAINLOAD_TOOLCHAIN_FILE`.
+Start a new build directory when changing toolchains, triplets, or dependency
+providers. For offline builds, prepopulate vcpkg's download/binary caches and
+provide an existing vcpkg checkout.
+
+When updating `builtin-baseline`, configure a fresh build directory to select
+the new pinned checkout as well as the new dependency versions.
+
+ROCm/HIP, the GPU driver, and the host compiler are **not** installed by vcpkg.
+Linux also needs the standard native build utilities (for example, on Debian/
+Ubuntu: `build-essential git curl zip unzip tar pkg-config`).
+
+Use `-DUSE_VCPKG=OFF` for system/custom packages or an embedding parent project.
+When included via `add_subdirectory`, dependency management defaults to OFF;
+the parent must select its toolchain before its own `project()` call.
 
 ### Supported GPUs
 
@@ -39,34 +80,37 @@ Complete guide for building the HIP Demand Texture Loader on Windows and Linux.
 
 ### Method 1: Using vcpkg (Recommended)
 
-The easiest way to get started with full format support:
+Configure once and build either configuration with matching dependencies:
 
 ```powershell
-# 1. Install and setup vcpkg (one-time setup)
-cd C:\
-git clone https://github.com/microsoft/vcpkg.git
-cd vcpkg
-.\bootstrap-vcpkg.bat
-.\vcpkg integrate install  # Makes packages available to all VS projects
-
-# 2. Install OpenImageIO (includes all dependencies: stb, libpng, libjpeg, libtiff, OpenEXR, etc.)
-.\vcpkg install openimageio:x64-windows
-
-# 3. Build your project with vcpkg toolchain
-cd <your-project-directory>
-cmake -B build -S . `
+$env:HIP_PATH = "C:\Program Files\AMD\ROCm\6.4" # Or your supported SDK
+$env:PATH = "$env:HIP_PATH\bin;$env:PATH"
+cmake -B build\oiio -S . `
       -G "Visual Studio 17 2022" -A x64 `
-      -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
       -DBUILD_EXAMPLES=ON `
+      -DBUILD_TESTS=ON `
       -DUSE_OIIO=ON
 
-cmake --build build --config Release
+cmake --build build\oiio --config Release --parallel
+cmake --build build\oiio --config Debug --parallel
+ctest --test-dir build\oiio -C Release --output-on-failure
+ctest --test-dir build\oiio -C Debug --output-on-failure
 
-# 4. Run
-.\build\Release\texture_loader_example.exe
+.\build\oiio\Release\texture_loader_example.exe
 ```
 
-**Note**: Adjust the vcpkg path if you installed it elsewhere. The first build will take ~5-10 minutes as vcpkg compiles OpenImageIO and its dependencies.
+The standard `x64-windows` triplet provides both Release and Debug libraries.
+CMake selects the correct imported libraries and `/MD` (Release) or `/MDd`
+(Debug) CRT automatically. Do not point Debug at Release-only OIIO libraries or
+use HART's release-only triplet: STL/CRT ABIs must match. vcpkg copies dependency
+DLLs next to build-tree binaries.
+The build also copies the HIP runtime (`amdhip64_<major>.dll` or `amdhip64.dll`)
+and matching COMGR DLL from the configured `HIP_PATH/bin` next to the loader,
+examples and tests. These two DLLs are also installed into `bin`. Application-local
+copies take precedence over a different HIP runtime supplied by the graphics
+driver in Windows `System32`; adding the SDK to `PATH` alone does not guarantee
+that the intended runtime is loaded. Other SDK support files and third-party
+dependencies still need to be available when deploying the installation.
 
 ### Method 2: Basic Build (stb_image only)
 
@@ -76,18 +120,12 @@ For basic image format support (PNG, JPEG, BMP, TGA, HDR):
 # 1. Set HIP_PATH
 $env:HIP_PATH = "C:\Program Files\AMD\ROCm\6.4"
 
-# 2. Download stb headers
-New-Item -ItemType Directory -Force -Path external\stb
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h" `
-                  -OutFile "external\stb\stb_image.h"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h" `
-                  -OutFile "external\stb\stb_image_write.h"
-
-# 3. Build
+# 2. Configure (stb is restored automatically; OIIO is not downloaded)
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_EXAMPLES=ON
 cmake --build build --config Release
+cmake --build build --config Debug
 
-# 4. Run
+# 3. Run
 .\build\Release\texture_loader_example.exe
 ```
 
@@ -109,7 +147,10 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_EXAMPLES=ON
 
 ### Method 3: Custom OpenImageIO Build
 
-For advanced users with existing OpenImageIO installations:
+Set `USE_VCPKG=OFF` for existing OpenImageIO installations. The sample script
+sets this option and shows explicit dependency paths. Alternatively, pass
+`CMAKE_PREFIX_PATH` containing your package installation prefixes. All libraries
+must provide compatible Debug and Release configurations.
 
 If you have OpenImageIO built from source or installed elsewhere:
 
@@ -142,55 +183,40 @@ The example script includes:
 
 ## Linux Build
 
-### Using System Package Manager (Recommended)
+### Automatic vcpkg Build (Recommended)
 
 ```bash
-# 1. Install ROCm
-sudo apt install rocm-hip-sdk
+# Install a supported ROCm SDK and host build utilities first.
+export HIP_PATH=/opt/rocm
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release \
+      -DUSE_OIIO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+cmake --build build/release --parallel
+ctest --test-dir build/release --output-on-failure
 
-# 2. Install OpenImageIO (includes all dependencies)
-sudo apt install libopenimageio-dev
-
-# 3. Build with OpenImageIO support
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm -DUSE_OIIO=ON -DBUILD_EXAMPLES=ON
-cmake --build build -j$(nproc)
-./build/texture_loader_example
+cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug \
+      -DUSE_OIIO=ON -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+cmake --build build/debug --parallel
+ctest --test-dir build/debug --output-on-failure
 ```
 
-### Basic Build (stb_image only)
+For stb-only builds, omit `-DUSE_OIIO=ON`; no OIIO dependency is restored.
+The standard `x64-linux` triplet provides both dependency configurations and
+position-independent static libraries suitable for the shared loader. Other
+supported target triplets can be selected with `VCPKG_TARGET_TRIPLET`.
+
+### Using System Packages Instead
 
 ```bash
-# 1. Install ROCm
-sudo apt install rocm-hip-sdk
-
-# 2. Download stb headers
-mkdir -p external/stb
-wget -O external/stb/stb_image.h https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
-wget -O external/stb/stb_image_write.h https://raw.githubusercontent.com/nothings/stb/master/stb_image_write.h
-
-# 3. Build
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm -DBUILD_EXAMPLES=ON
-cmake --build build -j$(nproc)
-./build/texture_loader_example
+sudo apt install libopenimageio-dev libstb-dev libgtest-dev
+cmake -S . -B build/system -DCMAKE_BUILD_TYPE=Release \
+      -DUSE_VCPKG=OFF -DUSE_OIIO=ON -DBUILD_TESTS=ON \
+      -DSTB_INCLUDE_DIR=/usr/include/stb
+cmake --build build/system --parallel
 ```
 
-### Alternative: Using vcpkg on Linux
-
-```bash
-# Install vcpkg
-git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
-~/vcpkg/bootstrap-vcpkg.sh
-
-# Install OpenImageIO
-~/vcpkg/vcpkg install openimageio:x64-linux
-
-# Build with vcpkg toolchain
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_PREFIX_PATH=/opt/rocm \
-      -DCMAKE_TOOLCHAIN_FILE=~/vcpkg/scripts/buildsystems/vcpkg.cmake \
-      -DUSE_OIIO=ON -DBUILD_EXAMPLES=ON
-cmake --build build -j$(nproc)
-```
+With vcpkg disabled, stb defaults to the bundled `external/stb` headers unless
+overridden. Tests use an installed GTest package if available, otherwise the
+existing FetchContent fallback downloads GoogleTest.
 
 ## HIP Module API
 
@@ -275,7 +301,8 @@ The project includes a comprehensive test suite using Google Test.
 ```powershell
 # Windows
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTS=ON
-cmake --build build --config Release
+cmake --build build --config Release --target texture_loader_tests image_data_tests
+cmake --build build --config Debug --target texture_loader_tests image_data_tests
 ```
 
 ```bash
@@ -284,7 +311,24 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/rocm -DB
 cmake --build build -j$(nproc)
 ```
 
-**Note**: The first build with tests will download Google Test automatically via CMake FetchContent.
+**Note**: Configuring with tests enabled restores GoogleTest through vcpkg.
+
+### CTest Discovery
+
+Individual GoogleTest cases, including parameterized cases, are registered with
+CTest automatically after the test executables are built. The
+`vcpkg_bootstrap_config` CMake regression test is registered during configuration.
+
+```powershell
+ctest --test-dir build -C Release -N
+ctest --test-dir build -C Debug -N
+```
+
+With Visual Studio, specify `-C Release` or `-C Debug` and build that configuration
+first. A `texture_loader_tests_NOT_BUILT` or `image_data_tests_NOT_BUILT` entry
+means the corresponding test target still needs to be built; configuring alone
+does not enumerate its GoogleTest cases. Use the build directory, not the source
+directory, when invoking CTest.
 
 ### Running Tests
 
@@ -326,7 +370,7 @@ The test suite covers:
 
 - **GPU Required**: Most tests require a HIP-compatible AMD GPU
 - **ROCm/HIP**: Must be properly installed and configured
-- **Internet**: First build downloads Google Test (~1 MB)
+- **Internet**: First configure restores enabled dependencies, unless cached
 
 ### Combining Build Options
 
@@ -343,6 +387,23 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 ## Troubleshooting
+
+### GPU tests hang during loader construction
+
+Rebuild the test targets so the selected SDK's HIP runtime and COMGR DLLs are
+copied next to the executables. A mismatched driver/runtime/compiler combination
+can hang in `hipStreamCreateWithFlags`; HIP tracing may report missing ROCm
+device libraries or failure to create internal blit kernels.
+
+```powershell
+cmake --build build --config Release --target texture_loader_tests image_data_tests
+ctest --test-dir build -C Release -R '^HipTestFixture\.DefaultConstruction$' `
+      --timeout 30 --output-on-failure
+```
+
+For diagnostics, set `$env:AMD_LOG_LEVEL = "4"` and `$env:AMD_LOG_MASK = "1"`
+before running CTest with `-V` to see HIP API calls. These settings are not
+required for normal test execution.
 
 ### "HIP not found"
 
@@ -366,11 +427,11 @@ ls "$env:HIP_PATH\lib" | Select-String comgr
 
 ### "stb_image.h not found"
 
-**Solution**:
-```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h" `
-                  -OutFile "external\stb\stb_image.h"
-```
+**Solution**: Check the vcpkg restore log in the build directory and configure
+again. If using `USE_VCPKG=OFF`, set `STB_INCLUDE_DIR` to a directory containing
+`stb_image.h` (and `stb_image_write.h` when building examples). A stale
+`STB_INCLUDE_DIR` cache entry may need to be removed or updated when switching
+providers; use a fresh build directory.
 
 ### "Failed to load HIP module"
 
@@ -408,11 +469,13 @@ desc.maxMipLevel = 4;          // Limit mip levels
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HIP_PATH` | Auto | Path to HIP installation |
-| `STB_INCLUDE_DIR` | `external/stb` | Path to stb headers |
+| `USE_VCPKG` | ON (standalone) | Automatically provision vcpkg and restore dependencies |
+| `STB_INCLUDE_DIR` | Auto with vcpkg; otherwise `external/stb` | Path to stb headers |
 | `BUILD_EXAMPLES` | OFF | Build example applications |
-| `BUILD_TESTS` | OFF | Build unit tests (fetches Google Test) |
+| `BUILD_TESTS` | OFF | Build unit tests (restores GoogleTest) |
 | `USE_OIIO` | OFF | Enable OpenImageIO support |
-| `CMAKE_BUILD_TYPE` | Release | Build configuration |
+| `CMAKE_BUILD_TYPE` | Generator default | Set Release or Debug for single-config generators |
+| `VCPKG_TARGET_TRIPLET` | vcpkg platform default | Target architecture/linkage; normally `x64-windows` or `x64-linux` |
 
 ### Compiler Flags
 

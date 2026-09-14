@@ -22,6 +22,10 @@ cmake_install.cmake
 *.cmake
 !CMakeLists.txt
 !cmake/FindHIP.cmake
+!cmake/VcpkgBootstrap.cmake
+!tests/VcpkgBootstrapTests.cmake
+external/vcpkg/
+vcpkg_installed/
 
 # Local configuration (user-specific paths)
 cmake_configure_vs17.cmd

@@ -110,6 +110,23 @@ message(STATUS "Libraries: ${HIP_LIBRARY}, ${HIP_COMGR_LIBRARY}")
 message(STATUS "Compiler:\n  -- hipcc: ${HIP_HIPCC_EXECUTABLE}\n  -- clang: ${HIP_CLANG_EXECUTABLE}")
 message(STATUS "Device libs: ${HIP_DEVICE_LIB_PATH}")
 
+if(WIN32)
+    find_file(HIP_RUNTIME_DLL
+        NAMES amdhip64_${HIP_VERSION_MAJOR}.dll amdhip64.dll
+        PATHS "${HIP_BIN_DIR}"
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    get_filename_component(_hip_comgr_name "${HIP_COMGR_LIBRARY}" NAME_WE)
+    find_file(HIP_COMGR_RUNTIME_DLL
+        NAMES "${_hip_comgr_name}.dll"
+        PATHS "${HIP_BIN_DIR}"
+        NO_DEFAULT_PATH
+        REQUIRED
+    )
+    set(HIP_RUNTIME_DLLS "${HIP_RUNTIME_DLL}" "${HIP_COMGR_RUNTIME_DLL}")
+endif()
+
 # Create interface targets
 if(NOT TARGET hip::include)
     add_library(hip::include INTERFACE IMPORTED)

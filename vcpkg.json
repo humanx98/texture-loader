@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "hip-demand-texture-loader",
+  "version": "0.1.0",
+  "builtin-baseline": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
+  "dependencies": [
+    "stb"
+  ],
+  "features": {
+    "oiio": {
+      "description": "OpenImageIO image loading (USE_OIIO)",
+      "dependencies": [
+        {
+          "name": "openimageio",
+          "default-features": false
+        }
+      ]
+    },
+    "tests": {
+      "description": "GoogleTest regression tests (BUILD_TESTS)",
+      "dependencies": [
+        "gtest"
+      ]
+    }
+  }
+}
