@@ -177,8 +177,7 @@ std::vector<fs::path> findImages( const fs::path& directory, bool includeOver4k 
             const hip_demand::TextureInfo& info  = image->getInfo();
             if( info.width > max4kDimension || info.height > max4kDimension )
             {
-                std::cout << "  Skipped (>4K): " << path.filename().string() << " (" << info.width << 'x'
-                          << info.height << ")\n";
+                std::cout << "  Skipped (>4K): " << path.filename().string() << " (" << info.width << 'x' << info.height << ")\n";
                 continue;
             }
             selectedPaths.push_back( path );
@@ -213,7 +212,7 @@ std::unique_ptr<hip_demand::vmm::DemandTextureLoader> createLoaderForImages( con
     return loader;
 }
 
-void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::path>& imagePaths )
+void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::path>& imagePaths, bool logMemoryUsage )
 {
     using namespace hip_demand::vmm;
 
@@ -238,8 +237,10 @@ void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::pat
 
     HIP_CHECK( hipSetDevice( 0 ) );
     // MemPulse resets the HIP device on shutdown, so keep it alive until the render resources are destroyed.
-    GpuMemoryMonitor memoryMonitor( 0 );
-    KernelModule     module( kernelPath );
+    std::unique_ptr<GpuMemoryMonitor> memoryMonitor;
+    if( logMemoryUsage )
+        memoryMonitor = std::make_unique<GpuMemoryMonitor>( 0 );
+    KernelModule module( kernelPath );
 
     Options options{};
     options.maxVirtualPages  = maxVirtualPages;
@@ -281,9 +282,13 @@ void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::pat
         ticket.wait();
         const int requestCount = ticket.numTasksTotal();
         HIP_CHECK( hipStreamSynchronize( gpu.stream ) );
-        const MempulseDeviceMemoryInfo memory = memoryMonitor.memoryInfo();
-        std::cout << "  Pass " << nextPass + 1 << " | requests: " << requestCount << " | GPU VRAM: "
-                  << memory.dedicatedUsed / bytesPerMiB << " / " << memory.dedicatedTotal / bytesPerMiB << " MiB";
+        std::cout << "  Pass " << nextPass + 1 << " | requests: " << requestCount;
+        if( memoryMonitor )
+        {
+            const MempulseDeviceMemoryInfo memory = memoryMonitor->memoryInfo();
+            std::cout << " | GPU VRAM: " << memory.dedicatedUsed / bytesPerMiB << " / "
+                      << memory.dedicatedTotal / bytesPerMiB << " MiB";
+        }
         if( requestCount == 0 )
             std::cout << " | complete";
         std::cout << '\n';
@@ -309,7 +314,7 @@ void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::pat
     std::cout << "  Image saved: " << fs::absolute( outputPath ).string() << '\n';
 }
 
-void renderTextureGridWithEviction( const fs::path& executableDir, const std::vector<fs::path>& imagePaths )
+void renderTextureGridWithEviction( const fs::path& executableDir, const std::vector<fs::path>& imagePaths, bool logMemoryUsage )
 {
     using namespace hip_demand::vmm;
 
@@ -338,8 +343,10 @@ void renderTextureGridWithEviction( const fs::path& executableDir, const std::ve
 
     HIP_CHECK( hipSetDevice( 0 ) );
     // MemPulse resets the HIP device on shutdown, so keep it alive until the render resources are destroyed.
-    GpuMemoryMonitor memoryMonitor( 0 );
-    KernelModule     module( kernelPath );
+    std::unique_ptr<GpuMemoryMonitor> memoryMonitor;
+    if( logMemoryUsage )
+        memoryMonitor = std::make_unique<GpuMemoryMonitor>( 0 );
+    KernelModule module( kernelPath );
 
     Options options{};
     options.maxTextures      = static_cast<uint32_t>( imagePaths.size() );
@@ -370,12 +377,12 @@ void renderTextureGridWithEviction( const fs::path& executableDir, const std::ve
     {
         for( uint32_t regionX = 0; regionX < outputWidth; regionX += outputTileSize )
         {
-            uint32_t       regionWidth  = std::min( outputTileSize, outputWidth - regionX );
-            uint32_t       regionHeight = std::min( outputTileSize, outputHeight - regionY );
-            const uint32_t gridWidth    = ( regionWidth + blockWidth - 1 ) / blockWidth;
-            const uint32_t gridHeight   = ( regionHeight + blockHeight - 1 ) / blockHeight;
-            bool           complete     = false;
-            uint32_t       passesForTile = 0;
+            uint32_t       regionWidth         = std::min( outputTileSize, outputWidth - regionX );
+            uint32_t       regionHeight        = std::min( outputTileSize, outputHeight - regionY );
+            const uint32_t gridWidth           = ( regionWidth + blockWidth - 1 ) / blockWidth;
+            const uint32_t gridHeight          = ( regionHeight + blockHeight - 1 ) / blockHeight;
+            bool           complete            = false;
+            uint32_t       passesForTile       = 0;
             const uint32_t evictionsBeforeTile = evictedPages;
 
             for( uint32_t pass = 0; pass < maxPassesPerTile; ++pass )
@@ -428,12 +435,16 @@ void renderTextureGridWithEviction( const fs::path& executableDir, const std::ve
                 throw std::runtime_error( "Output tile (" + std::to_string( regionX ) + ", " + std::to_string( regionY )
                                           + ") did not become resident" );
 
-            const MempulseDeviceMemoryInfo memory = memoryMonitor.memoryInfo();
             std::cout << "  Tile " << completedTiles << '/' << tilesPerRow * tileRows << " at (" << regionX << ", "
                       << regionY << ") | passes: " << passesForTile << " | evictions: +"
-                      << evictedPages - evictionsBeforeTile << " (total " << evictedPages << ") | GPU VRAM: "
-                      << memory.dedicatedUsed / bytesPerMiB << " / " << memory.dedicatedTotal / bytesPerMiB
-                      << " MiB\n";
+                      << evictedPages - evictionsBeforeTile << " (total " << evictedPages << ')';
+            if( memoryMonitor )
+            {
+                const MempulseDeviceMemoryInfo memory = memoryMonitor->memoryInfo();
+                std::cout << " | GPU VRAM: " << memory.dedicatedUsed / bytesPerMiB << " / "
+                          << memory.dedicatedTotal / bytesPerMiB << " MiB";
+            }
+            std::cout << '\n';
         }
     }
 
@@ -462,27 +473,28 @@ int main( int argc, char** argv )
     try
     {
         constexpr bool includeOver4kImages = true;
+        constexpr bool logMemoryUsage      = true;
         const fs::path executableDir       = fs::absolute( fs::path{ argv[0] } ).parent_path();
-        fs::path imageDirectory            = fs::path{ TEST_IMAGES_DIR } / "png";
+        fs::path       imageDirectory      = fs::path{ TEST_IMAGES_DIR } / "png";
         imageDirectory.make_preferred();
 
         std::cout << "VMM texture loading tests\n"
                   << "  Image directory: " << imageDirectory.string() << '\n'
                   << "  Size filter: " << ( includeOver4kImages ? "all images" : "up to 4096 pixels per side" )
-                  << '\n';
+                  << "\n  GPU VRAM logging: " << ( logMemoryUsage ? "enabled" : "disabled" ) << '\n';
         const auto imagePaths = findImages( imageDirectory, includeOver4kImages );
         std::cout << "  Selected textures (" << imagePaths.size() << "):\n";
         for( const fs::path& imagePath : imagePaths )
         {
-            const auto image = readImage( imagePath );
-            const auto& info = image->getInfo();
-            std::cout << "    " << imagePath.filename().string() << " (" << info.width << 'x' << info.height
-                      << ")\n";
+            const auto  image = readImage( imagePath );
+            const auto& info  = image->getInfo();
+            std::cout << "    " << imagePath.filename().string() << " (" << info.width << 'x' << info.height << ")\n";
         }
-        std::cout << "  GPU VRAM readings cover the whole device, including other processes.\n";
+        if( logMemoryUsage )
+            std::cout << "  GPU VRAM readings cover the whole device, including other processes.\n";
 
-        renderTextureGrid( executableDir, imagePaths );
-        renderTextureGridWithEviction( executableDir, imagePaths );
+        renderTextureGrid( executableDir, imagePaths, logMemoryUsage );
+        renderTextureGridWithEviction( executableDir, imagePaths, logMemoryUsage );
         std::cout << "\nResult: PASS (both renders completed and eviction was observed)\n";
         return 0;
     }

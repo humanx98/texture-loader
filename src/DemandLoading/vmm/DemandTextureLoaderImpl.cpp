@@ -215,9 +215,9 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
     memset( deviceContext.referenceBits, 0, stream );
 }
 
-inline uint32_t roundNearest32( uint32_t value )
+inline uint32_t roundUpToMultipleOf32( uint32_t value )
 {
-    return ( value + 31 ) & 0xFFFFFFE0;  // Round to nearest multiple of 32
+    return ( value + 31 ) & 0xFFFFFFE0;  // Round up to a multiple of 32
 }
 
 Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const DeviceContext& deviceContext )
@@ -228,7 +228,7 @@ Ticket DemandTextureLoaderImpl::processRequests( hipStream_t stream, const Devic
 
     memset( deviceContext.counters, 0, stream );
 
-    const uint32_t resourcesPerThread = std::max( 32U, roundNearest32( resourceTable_.count() / 65536U ) );
+    const uint32_t resourcesPerThread = std::max( 32U, roundUpToMultipleOf32( resourceTable_.count() / 65536U ) );
     const uint32_t blockSize          = 256;
     const uint32_t resourcesPerBlock  = resourcesPerThread * blockSize;
     const uint32_t gridSize           = ceilDiv( resourceTable_.count(), resourcesPerBlock );
