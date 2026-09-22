@@ -29,7 +29,6 @@ struct MipRegion
 __device__ MipRegion findMipRegion( uint32_t localX, uint32_t localY, uint32_t cellWidth, uint32_t cellHeight,
                                     uint32_t mipCount )
 {
-    // Mip 0 occupies the left two thirds. Smaller mips stack on the right.
     const uint32_t baseWidth = max( 1u, cellWidth * 2u / 3u );
     if( localX < baseWidth )
         return { 0, 0, 0, baseWidth, cellHeight };
@@ -50,11 +49,10 @@ __device__ void renderGridPixel( const hip_demand::vmm::DeviceContext& context, 
                                  uint32_t outputWidth, uint32_t outputHeight, uint32_t textureCount,
                                  uint32_t columnCount, uint32_t rowCount, uint32_t x, uint32_t y )
 {
-    const size_t outputOffset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
-    // Match the cell boundaries below, including widths that do not divide evenly.
-    const uint32_t column    = ( ( x + 1 ) * columnCount - 1 ) / outputWidth;
-    const uint32_t row       = ( ( y + 1 ) * rowCount - 1 ) / outputHeight;
-    const uint32_t textureId = row * columnCount + column;
+    const size_t   outputOffset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
+    const uint32_t column       = ( ( x + 1 ) * columnCount - 1 ) / outputWidth;
+    const uint32_t row          = ( ( y + 1 ) * rowCount - 1 ) / outputHeight;
+    const uint32_t textureId    = row * columnCount + column;
     if( textureId >= textureCount )
     {
         writePixel( output, outputOffset, 0, 0, 0 );
@@ -68,7 +66,6 @@ __device__ void renderGridPixel( const hip_demand::vmm::DeviceContext& context, 
     const uint32_t localX     = x - cellX0;
     const uint32_t localY     = y - cellY0;
 
-    // Texture metadata is loaded on demand too. Request it before reading mipCount.
     const uint32_t textureResourceId = context.resourceTable.textureInfos.getResourceId( textureId );
     if( !hip_demand::vmm::isResourceResident( context, textureResourceId ) )
     {
@@ -100,16 +97,10 @@ __device__ void renderGridPixel( const hip_demand::vmm::DeviceContext& context, 
 
 }  // namespace
 
-extern "C" __global__ void renderVmmTextureRegion( hip_demand::vmm::DeviceContext context,
-                                                     uint8_t* output,
-                                                     uint32_t outputWidth,
-                                                     uint32_t outputHeight,
-                                                     uint32_t textureCount,
-                                                     uint32_t columnCount,
-                                                     uint32_t rowCount,
-                                                     uint32_t regionX,
-                                                     uint32_t regionY,
-                                                     uint32_t regionWidth,
+extern "C" __global__ void renderVmmTextureRegion( hip_demand::vmm::DeviceContext context, uint8_t* output,
+                                                     uint32_t outputWidth, uint32_t outputHeight,
+                                                     uint32_t textureCount, uint32_t columnCount, uint32_t rowCount,
+                                                     uint32_t regionX, uint32_t regionY, uint32_t regionWidth,
                                                      uint32_t regionHeight )
 {
     const uint32_t localX = blockIdx.x * blockDim.x + threadIdx.x;
@@ -121,44 +112,4 @@ extern "C" __global__ void renderVmmTextureRegion( hip_demand::vmm::DeviceContex
     const uint32_t y = regionY + localY;
     if( x < outputWidth && y < outputHeight )
         renderGridPixel( context, output, outputWidth, outputHeight, textureCount, columnCount, rowCount, x, y );
-}
-
-extern "C" __global__ void renderVmmTex2DLodBenchmark( hip_demand::vmm::DeviceContext context,
-                                                         uint8_t* output,
-                                                         uint32_t outputWidth,
-                                                         uint32_t outputHeight,
-                                                         float mipLevel )
-{
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if( x >= outputWidth || y >= outputHeight )
-        return;
-
-    const float u = ( static_cast<float>( x ) + 0.5f ) / static_cast<float>( outputWidth );
-    const float v = ( static_cast<float>( y ) + 0.5f ) / static_cast<float>( outputHeight );
-    bool        resident = false;
-    const float3 color = hip_demand::vmm::tex2DLod<float3>( context, 0, u, v, mipLevel, resident );
-    const size_t outputOffset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
-    if( resident )
-        writePixel( output, outputOffset, toUnorm8( color.x ), toUnorm8( color.y ), toUnorm8( color.z ) );
-    else
-        writePixel( output, outputOffset, 255, 0, 255 );
-}
-
-extern "C" __global__ void renderHipTex2DLodBenchmark( hipTextureObject_t texture,
-                                                         uint8_t* output,
-                                                         uint32_t outputWidth,
-                                                         uint32_t outputHeight,
-                                                         float mipLevel )
-{
-    const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    if( x >= outputWidth || y >= outputHeight )
-        return;
-
-    const float u = ( static_cast<float>( x ) + 0.5f ) / static_cast<float>( outputWidth );
-    const float v = ( static_cast<float>( y ) + 0.5f ) / static_cast<float>( outputHeight );
-    const float4 color = tex2DLod<float4>( texture, u, v, mipLevel );
-    const size_t outputOffset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
-    writePixel( output, outputOffset, toUnorm8( color.x ), toUnorm8( color.y ), toUnorm8( color.z ) );
 }

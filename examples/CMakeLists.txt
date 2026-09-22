@@ -264,26 +264,51 @@ install(FILES
 )
 
 if(USE_OIIO)
+
+    set(VMM_DEVICE_DEPS
+        ${PROJECT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
+        ${PROJECT_SOURCE_DIR}/include/DemandLoading/VmmDeviceUtils.h
+        ${PROJECT_SOURCE_DIR}/include/DemandLoading/VmmTextureSampling.h
+    )
+
     hip_add_executable(
-        TARGET vmm_texture_tiled_loading_kernel
-        SOURCES vmm_texture_tiled_loading.hip
+        TARGET vmm_loader_vram_usage_kernel
+        SOURCES vmm_loader_vram_usage.hip
         ARCHITECTURES ${HIP_ARCHITECTURES}
         OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
         INCLUDES ${PROJECT_SOURCE_DIR}/include
-        DEPENDS
-            ${PROJECT_SOURCE_DIR}/include/DemandLoading/DeviceContext.h
-            ${PROJECT_SOURCE_DIR}/include/DemandLoading/VmmDeviceUtils.h
-            ${PROJECT_SOURCE_DIR}/include/DemandLoading/VmmTextureSampling.h
+        DEPENDS ${VMM_DEVICE_DEPS}
     )
 
-    add_executable(vmm_texture_tiled_loading_example vmm_texture_tiled_loading.cpp)
-    target_include_directories(vmm_texture_tiled_loading_example PRIVATE
+    hip_add_executable(
+        TARGET vmm_loader_sampler_benchmark_kernel
+        SOURCES vmm_loader_sampler_benchmark.hip
+        ARCHITECTURES ${HIP_ARCHITECTURES}
+        OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
+        INCLUDES ${PROJECT_SOURCE_DIR}/include
+        DEPENDS ${VMM_DEVICE_DEPS}
+    )
+
+    add_executable(vmm_loader_vram_usage vmm_loader_vram_usage.cpp)
+    add_executable(vmm_loader_sampler_benchmark vmm_loader_sampler_benchmark.cpp)
+
+    target_include_directories(vmm_loader_vram_usage PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${STB_INCLUDE_DIR}
     )
-    target_link_libraries(vmm_texture_tiled_loading_example PRIVATE hip_demand_texture)
-    target_compile_definitions(vmm_texture_tiled_loading_example PRIVATE
-        __HIP_PLATFORM_AMD__ USE_OIIO
+    target_include_directories(vmm_loader_sampler_benchmark PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${STB_INCLUDE_DIR}
+    )
+
+    target_link_libraries(vmm_loader_vram_usage PRIVATE hip_demand_texture)
+    target_link_libraries(vmm_loader_sampler_benchmark PRIVATE hip_demand_texture)
+    target_compile_definitions(vmm_loader_vram_usage PRIVATE
+        __HIP_PLATFORM_AMD__
+        TEST_IMAGES_DIR="${PROJECT_SOURCE_DIR}/test_images"
+    )
+    target_compile_definitions(vmm_loader_sampler_benchmark PRIVATE
+        __HIP_PLATFORM_AMD__
         TEST_IMAGES_DIR="${PROJECT_SOURCE_DIR}/test_images"
     )
 
@@ -298,30 +323,43 @@ if(USE_OIIO)
         IMPORTED_LOCATION "${MEMPULSE_ROOT}/bin/x64/mempulse.dll"
         INTERFACE_INCLUDE_DIRECTORIES "${MEMPULSE_ROOT}/include"
     )
-    target_link_libraries(vmm_texture_tiled_loading_example PRIVATE Mempulse::Mempulse)
-    add_custom_command(TARGET vmm_texture_tiled_loading_example POST_BUILD
+    target_link_libraries(vmm_loader_vram_usage PRIVATE Mempulse::Mempulse)
+    add_custom_command(TARGET vmm_loader_vram_usage POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:Mempulse::Mempulse>
-            $<TARGET_FILE_DIR:vmm_texture_tiled_loading_example>
+            $<TARGET_FILE_DIR:vmm_loader_vram_usage>
         COMMENT "Copying MemPulse runtime library"
         VERBATIM
     )
 
-    add_custom_command(TARGET vmm_texture_tiled_loading_kernel POST_BUILD
+    add_custom_command(TARGET vmm_loader_vram_usage_kernel POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_PROPERTY:vmm_texture_tiled_loading_kernel,HIP_CODE_OBJECT>
-            $<TARGET_FILE_DIR:vmm_texture_tiled_loading_example>/vmm_texture_tiled_loading_kernel.co
-        COMMENT "Copying tiled demand-loading HIP kernel code object"
+            $<TARGET_PROPERTY:vmm_loader_vram_usage_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:vmm_loader_vram_usage>/vmm_loader_vram_usage_kernel.co
+        COMMENT "Copying VMM VRAM usage HIP kernel code object"
         VERBATIM
     )
-    add_dependencies(vmm_texture_tiled_loading_example vmm_texture_tiled_loading_kernel)
+    add_custom_command(TARGET vmm_loader_sampler_benchmark_kernel POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:vmm_loader_sampler_benchmark_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:vmm_loader_sampler_benchmark>/vmm_loader_sampler_benchmark_kernel.co
+        COMMENT "Copying VMM sampler benchmark HIP kernel code object"
+        VERBATIM
+    )
+    add_dependencies(vmm_loader_vram_usage vmm_loader_vram_usage_kernel)
+    add_dependencies(vmm_loader_sampler_benchmark vmm_loader_sampler_benchmark_kernel)
 
-    install(TARGETS vmm_texture_tiled_loading_example RUNTIME DESTINATION bin)
+    install(TARGETS vmm_loader_vram_usage vmm_loader_sampler_benchmark RUNTIME DESTINATION bin)
     install(FILES "${MEMPULSE_ROOT}/bin/x64/mempulse.dll" DESTINATION bin)
     install(FILES
-        $<TARGET_PROPERTY:vmm_texture_tiled_loading_kernel,HIP_CODE_OBJECT>
+        $<TARGET_PROPERTY:vmm_loader_vram_usage_kernel,HIP_CODE_OBJECT>
         DESTINATION bin
-        RENAME vmm_texture_tiled_loading_kernel.co
+        RENAME vmm_loader_vram_usage_kernel.co
+    )
+    install(FILES
+        $<TARGET_PROPERTY:vmm_loader_sampler_benchmark_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME vmm_loader_sampler_benchmark_kernel.co
     )
 
     add_executable(oiio_formats_example oiio_formats.cpp)
