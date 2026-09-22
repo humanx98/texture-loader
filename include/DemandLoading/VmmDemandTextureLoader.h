@@ -36,14 +36,26 @@ class Ticket
 
 struct Options
 {
-    uint32_t maxVirtualPages  = 32 * 1024;
-    uint32_t maxPhysicalPages = 1024;  // 64KB * 1024
+    /// Maximum number of VMM pages in the reserved virtual address space, including texture metadata and image tiles.
+    uint32_t maxVirtualPages  = 64 * 1024 * 1024;
 
-    uint32_t maxTextures     = 1024;
-    uint32_t maxRequests     = 1024;
-    bool     enableEviction  = false;
-    uint32_t maxEvictedPages = 1024;
-    uint32_t maxThreads      = 0;
+    /// Maximum number of physical VMM pages that may be allocated. ~0u applies no loader-imposed limit.
+    uint32_t maxPhysicalPages = ~0u;
+
+    /// Maximum number of demand textures that can be registered with the loader.
+    uint32_t maxTextures = 256 * 1024;
+
+    /// Maximum number of missing-resource requests collected and queued in one processing pass.
+    uint32_t maxRequests = 8192;
+
+    /// Enables LRU tracking and eviction of resident image-tile pages. Texture metadata is not evicted.
+    bool enableEviction = true;
+
+    /// Maximum number of eviction candidates collected per pass. A value of zero disables eviction.
+    uint32_t maxEvictedPages = 8192;
+
+    /// Number of CPU request-processing threads. Zero selects hardware concurrency.
+    uint32_t maxThreads = 0;
 };
 
 class DemandTexture

@@ -221,10 +221,15 @@ void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::pat
     constexpr uint32_t blockWidth         = 16;
     constexpr uint32_t blockHeight        = 16;
     constexpr uint32_t channels           = 4;
-    constexpr uint32_t maxVirtualPages    = 64 * 1024;
-    constexpr uint32_t maxPhysicalPages   = 64 * 1024;
     constexpr uint32_t maxRequestsPerPass = 1024;
     constexpr double   bytesPerMiB        = 1024.0 * 1024.0;
+
+    Options options{};
+    options.maxVirtualPages  = 64 * 1024;
+    options.maxPhysicalPages = 64 * 1024;
+    options.maxRequests      = 1024;
+    options.maxEvictedPages  = 1024;
+    options.enableEviction   = false;
 
     const fs::path outputPath{ "vmm_texture_tiled_loading_renderTextureGrid.png" };
     const fs::path kernelPath = executableDir / "vmm_texture_tiled_loading_kernel.co";
@@ -232,8 +237,7 @@ void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::pat
         throw std::runtime_error( "HIP module not found: " + kernelPath.string() );
 
     std::cout << "\n[1/2] Texture grid (eviction disabled)\n"
-              << "  Output size: " << outputWidth << 'x' << outputHeight << " pixels\n"
-              << "  Physical page limit: " << maxPhysicalPages << '\n';
+              << "  Output size: " << outputWidth << 'x' << outputHeight << " pixels\n";
 
     HIP_CHECK( hipSetDevice( 0 ) );
     // MemPulse resets the HIP device on shutdown, so keep it alive until the render resources are destroyed.
@@ -241,11 +245,6 @@ void renderTextureGrid( const fs::path& executableDir, const std::vector<fs::pat
     if( logMemoryUsage )
         memoryMonitor = std::make_unique<GpuMemoryMonitor>( 0 );
     KernelModule module( kernelPath );
-
-    Options options{};
-    options.maxVirtualPages  = maxVirtualPages;
-    options.maxPhysicalPages = maxPhysicalPages;
-    options.maxRequests      = maxRequestsPerPass;
 
     auto loader = createLoaderForImages( options, imagePaths );
 
@@ -324,12 +323,15 @@ void renderTextureGridWithEviction( const fs::path& executableDir, const std::ve
     constexpr uint32_t blockHeight        = 16;
     constexpr uint32_t channels           = 4;
     constexpr uint32_t outputTileSize     = 512;
-    constexpr uint32_t maxVirtualPages    = 64 * 1024;
-    constexpr uint32_t maxPhysicalPages   = 64 * 1024;
-    constexpr uint32_t maxEvictedPages    = 64 * 1024;
-    constexpr uint32_t maxRequestsPerPass = 1024;
     constexpr uint32_t maxPassesPerTile   = 64;
     constexpr double   bytesPerMiB        = 1024.0 * 1024.0;
+
+    Options options{};
+    options.maxVirtualPages  = 64 * 1024;
+    options.maxPhysicalPages = 64 * 1024;
+    options.maxRequests      = 1024;
+    options.maxEvictedPages  = 1024;
+    options.enableEviction   = true;
 
     const fs::path outputPath{ "vmm_texture_tiled_loading_eviction.png" };
     const fs::path kernelPath = executableDir / "vmm_texture_tiled_loading_kernel.co";
@@ -338,8 +340,7 @@ void renderTextureGridWithEviction( const fs::path& executableDir, const std::ve
 
     std::cout << "\n[2/2] Tiled render (eviction enabled)\n"
               << "  Output size: " << outputWidth << 'x' << outputHeight << " pixels\n"
-              << "  Output tile size: " << outputTileSize << 'x' << outputTileSize << " pixels\n"
-              << "  Physical page limit: " << maxPhysicalPages << '\n';
+              << "  Output tile size: " << outputTileSize << 'x' << outputTileSize << " pixels\n";
 
     HIP_CHECK( hipSetDevice( 0 ) );
     // MemPulse resets the HIP device on shutdown, so keep it alive until the render resources are destroyed.
@@ -348,13 +349,6 @@ void renderTextureGridWithEviction( const fs::path& executableDir, const std::ve
         memoryMonitor = std::make_unique<GpuMemoryMonitor>( 0 );
     KernelModule module( kernelPath );
 
-    Options options{};
-    options.maxTextures      = static_cast<uint32_t>( imagePaths.size() );
-    options.maxVirtualPages  = maxVirtualPages;
-    options.maxPhysicalPages = maxPhysicalPages;
-    options.maxRequests      = maxRequestsPerPass;
-    options.maxEvictedPages  = maxEvictedPages;
-    options.enableEviction   = true;
     auto loader              = createLoaderForImages( options, imagePaths );
 
     uint32_t textureCount = static_cast<uint32_t>( imagePaths.size() );

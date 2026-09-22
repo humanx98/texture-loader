@@ -12,11 +12,10 @@ RequestProcessor::RequestProcessor( DemandTextureLoaderImpl* loader, uint32_t ma
     if( maxThreads == 0 )
         maxThreads = std::thread::hardware_concurrency();
 
-    const uint32_t threadCount = std::clamp( maxThreads, 1u, 16u );
     try
     {
-        workers_.reserve( threadCount );
-        for( uint32_t i = 0; i < threadCount; ++i )
+        workers_.reserve( maxThreads );
+        for( uint32_t i = 0; i < maxThreads; ++i )
             workers_.emplace_back( [this] { workerLoop(); } );
     }
     catch( ... )
