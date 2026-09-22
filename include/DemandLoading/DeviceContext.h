@@ -84,6 +84,10 @@ struct DeviceTextureInfo
     uint32_t        height           = 0;
     uint32_t        tileWidth        = 0;
     uint32_t        tileHeight       = 0;
+    uint32_t        tileWidthShift   = 0;
+    uint32_t        tileHeightShift  = 0;
+    uint32_t        tileWidthMask    = 0;
+    uint32_t        tileHeightMask   = 0;
     uint32_t        addressMode[2]   = { hipAddressModeWrap, hipAddressModeWrap };
     uint32_t        filterMode       = hipFilterModeLinear;
     uint32_t        mipmapFilterMode = hipFilterModeLinear;
@@ -110,8 +114,8 @@ struct DeviceTextureInfo
         mip.mipTailOffset = mips[level].mipTailOffset;
         mip.width         = std::max( width >> level, 1u );
         mip.height        = std::max( height >> level, 1u );
-        mip.tilesX        = mip.width / tileWidth + static_cast<uint32_t>( mip.width % tileWidth != 0 );
-        mip.tilesY        = mip.height / tileHeight + static_cast<uint32_t>( mip.height % tileHeight != 0 );
+        mip.tilesX        = ( mip.width >> tileWidthShift ) + static_cast<uint32_t>( ( mip.width & tileWidthMask ) != 0 );
+        mip.tilesY        = ( mip.height >> tileHeightShift ) + static_cast<uint32_t>( ( mip.height & tileHeightMask ) != 0 );
         mip.mipTail       = level >= mipTailFirstLevel;
         return mip;
     }

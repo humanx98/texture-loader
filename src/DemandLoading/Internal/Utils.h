@@ -131,6 +131,19 @@ inline bool safeAdd( uint32_t a, uint32_t b, uint32_t& result )
     return true;
 }
 
+inline uint32_t powerOfTwoExponent( uint32_t value )
+{
+    assert( value != 0 && ( value & ( value - 1 ) ) == 0 );
+
+    uint32_t exponent = 0;
+    while( value > 1 )
+    {
+        value >>= 1;
+        ++exponent;
+    }
+    return exponent;
+}
+
 inline uint2 tileShapeForGranularity( size_t granularity, uint32_t bytesPerTexel )
 {
     assert( bytesPerTexel );

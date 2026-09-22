@@ -143,7 +143,7 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     deviceContext_.pageSize           = pageSystem_.pageBytes();
     deviceContext_.pageMemory         = pageSystem_.virtualAddressSpace();
     deviceContext_.residenceBits      = allocArray<uint32_t>( bits_.wordCount(), true, stream );
-    deviceContext_.textureInfos       = allocArray<DeviceTextureInfo*>( options_.maxTextures, false, stream );
+    deviceContext_.textureInfos       = allocArray<DeviceTextureInfo*>( options_.maxTextures, true, stream );
     deviceContext_.referenceBits      = allocArray<uint32_t>( bits_.wordCount(), true, stream );
     deviceContext_.requestedResources = allocArray<uint32_t>( options_.maxRequests, false, stream );
     deviceContext_.counters = allocArray<uint32_t>( static_cast<size_t>( CounterIndex::NumCounters ), true, stream );
@@ -438,6 +438,10 @@ DevicePtr<DeviceTextureInfo> DemandTextureLoaderImpl::processTextureInfo( hipStr
     h_info->numChannels      = imageInfo.numChannels;
     h_info->tileWidth        = tileShape.x;
     h_info->tileHeight       = tileShape.y;
+    h_info->tileWidthShift   = powerOfTwoExponent( tileShape.x );
+    h_info->tileHeightShift  = powerOfTwoExponent( tileShape.y );
+    h_info->tileWidthMask    = tileShape.x - 1;
+    h_info->tileHeightMask   = tileShape.y - 1;
     h_info->bytesPerTexel    = bytesPerTexel;
     h_info->width            = imageInfo.width;
     h_info->height           = imageInfo.height;
