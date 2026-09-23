@@ -225,8 +225,21 @@ template <class Channel>
 HIP_DEMAND_INLINE float filterBilinearChannel( Channel value00, Channel value10, Channel value01, Channel value11,
                                                float weight00, float weight10, float weight01, float weight11 )
 {
-    return weight00 * decodeChannelValue( value00 ) + weight10 * decodeChannelValue( value10 )
-           + weight01 * decodeChannelValue( value01 ) + weight11 * decodeChannelValue( value11 );
+    if constexpr( std::is_same<Channel, uint8_t>::value || std::is_same<Channel, uint16_t>::value
+                  || std::is_same<Channel, uint32_t>::value )
+    {
+        constexpr float normalization = std::is_same<Channel, uint8_t>::value ? ( 1.0f / 255.0f )
+                                        : std::is_same<Channel, uint16_t>::value ? ( 1.0f / 65535.0f )
+                                                                                 : ( 1.0f / 4294967295.0f );
+        const float blended = weight00 * static_cast<float>( value00 ) + weight10 * static_cast<float>( value10 )
+                              + weight01 * static_cast<float>( value01 ) + weight11 * static_cast<float>( value11 );
+        return blended * normalization;
+    }
+    else
+    {
+        return weight00 * decodeChannelValue( value00 ) + weight10 * decodeChannelValue( value10 )
+               + weight01 * decodeChannelValue( value01 ) + weight11 * decodeChannelValue( value11 );
+    }
 }
 
 template <class Sample, uint32_t NumChannels, class Channel>
