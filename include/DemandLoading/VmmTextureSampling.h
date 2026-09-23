@@ -459,8 +459,9 @@ HIP_DEMAND_INLINE Sample fetchBilinearSample( const DeviceContext&     context,
 {
     // Fast path for four bilinear taps inside one tile. In-bounds coordinates need no address-mode handling,
     // and all texel addresses can be derived from one page lookup and one base offset.
-    if( !mip.mipTail && x0 >= 0 && y0 >= 0 && static_cast<uint32_t>( x0 ) + 1 < mip.width
-        && static_cast<uint32_t>( y0 ) + 1 < mip.height )
+    const bool footprintInBounds = x0 >= 0 && y0 >= 0 && static_cast<uint32_t>( x0 ) + 1 < mip.width
+                                   && static_cast<uint32_t>( y0 ) + 1 < mip.height;
+    if( !mip.mipTail && footprintInBounds )
     {
         const uint32_t texelX = static_cast<uint32_t>( x0 );
         const uint32_t texelY = static_cast<uint32_t>( y0 );
@@ -486,12 +487,22 @@ HIP_DEMAND_INLINE Sample fetchBilinearSample( const DeviceContext&     context,
         }
     }
 
-    const int2 x = applyAddressModePair( x0, x0 + 1, static_cast<int>( mip.width ), texture.addressMode[0] );
-    const int2 y = applyAddressModePair( y0, y0 + 1, static_cast<int>( mip.height ), texture.addressMode[1] );
-    x0           = x.x;
-    y0           = y.x;
-    const int x1 = x.y;
-    const int y1 = y.y;
+    int x1;
+    int y1;
+    if( footprintInBounds )
+    {
+        x1 = x0 + 1;
+        y1 = y0 + 1;
+    }
+    else
+    {
+        const int2 x = applyAddressModePair( x0, x0 + 1, static_cast<int>( mip.width ), texture.addressMode[0] );
+        const int2 y = applyAddressModePair( y0, y0 + 1, static_cast<int>( mip.height ), texture.addressMode[1] );
+        x0           = x.x;
+        y0           = y.x;
+        x1           = x.y;
+        y1           = y.y;
+    }
 
     if( mip.mipTail )
     {
@@ -610,10 +621,12 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
 
     const uint32_t mipLevel0 = static_cast<uint32_t>( std::floorf( lod ) );
     const uint32_t mipLevel1 = mipLevel0 + 1 < texture->mipCount ? mipLevel0 + 1 : mipLevel0;
+    const float    t         = lod - static_cast<float>( mipLevel0 );
 
     bool         resident0 = false;
     const Sample sample0   = sampleMipLevel<Sample>( context, *texture, mipLevel0, x, y, resident0 );
-    if( mipLevel0 == mipLevel1 )
+    // The next mip level cannot affect an exact-level sample or its residency.
+    if( mipLevel0 == mipLevel1 || t == 0.0f )
     {
         resident = resident0;
         return sample0;
@@ -623,7 +636,6 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
     const Sample sample1   = sampleMipLevel<Sample>( context, *texture, mipLevel1, x, y, resident1 );
 
     resident = resident0 && resident1;
-    float t    = lod - static_cast<float>( mipLevel0 );
     return ( 1.0f - t ) * sample0 + t * sample1;
 }
 
