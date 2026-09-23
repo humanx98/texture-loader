@@ -1,10 +1,12 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "vmm_loader_common.h"
 
 #include <array>
+#include <cstring>
 #include <iomanip>
+#include <sstream>
+#include <utility>
 
 #ifndef TEST_IMAGES_DIR
 #error "TEST_IMAGES_DIR must be defined by the build target"
@@ -13,6 +15,89 @@
 namespace {
 
 using namespace vmm_loader_example;
+
+constexpr uint32_t outputWidth     = 3840;
+constexpr uint32_t outputHeight    = 2160;
+constexpr uint32_t blockWidth      = 16;
+constexpr uint32_t blockHeight     = 16;
+constexpr uint32_t outputChannels  = 4;
+constexpr uint32_t maxWarmupPasses = 256;
+constexpr uint32_t callCount       = 1000;
+constexpr uint32_t batchSize       = 10;
+constexpr float    mipLevel        = 0.0f;
+
+struct BenchmarkTimes
+{
+    float vmmMilliseconds    = 0.0f;
+    float nativeMilliseconds = 0.0f;
+};
+
+enum class ResultStatus
+{
+    completed,
+    skipped,
+    failed
+};
+
+struct ImageResult
+{
+    std::string    name;
+    std::string    fileBytes   = "-";
+    std::string    dimensions  = "-";
+    std::string    pixelFormat = "-";
+    BenchmarkTimes times{};
+    ResultStatus   status = ResultStatus::failed;
+    std::string    note;
+};
+
+std::shared_ptr<hip_demand::ImageSource> readBenchmarkImage( const fs::path& path )
+{
+    auto                    image = std::make_shared<hip_demand::OIIOReader>( path.string() );
+    hip_demand::TextureInfo info{};
+    image->open( &info );
+    if( !info.isValid || info.width == 0 || info.height == 0 )
+        throw std::runtime_error( "Invalid image: " + path.string() );
+    return image;
+}
+
+std::string pixelFormatName( const hip_demand::TextureInfo& info )
+{
+    const char* channels[] = { "", "r", "rg", "rgb", "rgba" };
+    if( info.numChannels < 1 || info.numChannels > 4 )
+        return "unsupported";
+
+    const char* format = nullptr;
+    switch( info.format )
+    {
+        case HIP_AD_FORMAT_UNSIGNED_INT8:
+            format = "8";
+            break;
+        case HIP_AD_FORMAT_SIGNED_INT8:
+            format = "8s";
+            break;
+        case HIP_AD_FORMAT_UNSIGNED_INT16:
+            format = "16u";
+            break;
+        case HIP_AD_FORMAT_SIGNED_INT16:
+            format = "16s";
+            break;
+        case HIP_AD_FORMAT_UNSIGNED_INT32:
+            format = "32u";
+            break;
+        case HIP_AD_FORMAT_SIGNED_INT32:
+            format = "32s";
+            break;
+        case HIP_AD_FORMAT_HALF:
+            format = "16f";
+            break;
+        case HIP_AD_FORMAT_FLOAT:
+            format = "32f";
+            break;
+        default:
+            return "unsupported";
+    }
+    return std::string( channels[info.numChannels] ) + format;
+}
 
 class KernelModule
 {
@@ -92,6 +177,43 @@ class CompletionEvent
     hipEvent_t event_ = nullptr;
 };
 
+struct NativeTextureFormat
+{
+    hipChannelFormatDesc channelDesc{};
+    hipTextureReadMode   readMode     = hipReadModeNormalizedFloat;
+    bool                 convertInt32 = false;
+};
+
+NativeTextureFormat makeNativeTextureFormat( hipArray_Format sourceFormat )
+{
+    const bool convertInt32 = sourceFormat == HIP_AD_FORMAT_UNSIGNED_INT32 || sourceFormat == HIP_AD_FORMAT_SIGNED_INT32;
+    const bool floating = convertInt32 || sourceFormat == HIP_AD_FORMAT_HALF || sourceFormat == HIP_AD_FORMAT_FLOAT;
+    const bool signedInteger = sourceFormat == HIP_AD_FORMAT_SIGNED_INT8 || sourceFormat == HIP_AD_FORMAT_SIGNED_INT16;
+    const hipChannelFormatKind kind =
+        floating ? hipChannelFormatKindFloat : ( signedInteger ? hipChannelFormatKindSigned : hipChannelFormatKindUnsigned );
+    const unsigned int bits = 8 * hip_demand::getBytesPerChannel( sourceFormat );
+    if( bits == 0 )
+        throw std::invalid_argument( "Unsupported image channel format" );
+
+    return { hipCreateChannelDesc( bits, bits, bits, bits, kind ),
+             floating ? hipReadModeElementType : hipReadModeNormalizedFloat, convertInt32 };
+}
+
+float normalizedInt32Channel( const uint8_t* channel, hipArray_Format format )
+{
+    // Hardware linear filtering uses floating-point channels for 32-bit integer sources.
+    if( format == HIP_AD_FORMAT_UNSIGNED_INT32 )
+    {
+        uint32_t value = 0;
+        std::memcpy( &value, channel, sizeof( value ) );
+        return static_cast<float>( value ) * ( 1.0f / 4294967295.0f );
+    }
+
+    int32_t value = 0;
+    std::memcpy( &value, channel, sizeof( value ) );
+    return std::max( -1.0f, static_cast<float>( value ) * ( 1.0f / 2147483647.0f ) );
+}
+
 class HipMipmappedTexture
 {
   public:
@@ -99,11 +221,11 @@ class HipMipmappedTexture
     {
         try
         {
-            const hipChannelFormatDesc channelDesc = hipCreateChannelDesc<uchar4>();
-            HIP_CHECK( hipMallocMipmappedArray( &mipmappedArray_, &channelDesc,
+            const NativeTextureFormat format = makeNativeTextureFormat( info.format );
+            HIP_CHECK( hipMallocMipmappedArray( &mipmappedArray_, &format.channelDesc,
                                                 make_hipExtent( info.width, info.height, 0 ), info.numMipLevels ) );
-            uploadMipLevels( image, info );
-            createTextureObject( info.numMipLevels );
+            uploadMipLevels( image, info, format.convertInt32 );
+            createTextureObject( info.numMipLevels, format.readMode );
         }
         catch( ... )
         {
@@ -120,37 +242,57 @@ class HipMipmappedTexture
     hipTextureObject_t get() const { return texture_; }
 
   private:
-    void uploadMipLevels( hip_demand::ImageSource& image, const hip_demand::TextureInfo& info )
+    static std::vector<uint8_t> readRgbaMipLevel( hip_demand::ImageSource&       image,
+                                                  const hip_demand::TextureInfo& info,
+                                                  uint32_t                       level,
+                                                  uint32_t                       width,
+                                                  uint32_t                       height,
+                                                  bool                           convertInt32 )
     {
-        uint32_t width  = info.width;
-        uint32_t height = info.height;
+        const size_t         channelBytes = hip_demand::getBytesPerChannel( info.format );
+        const size_t         pixelCount   = static_cast<size_t>( width ) * height;
+        std::vector<uint8_t> source( pixelCount * info.numChannels * channelBytes );
+        if( !image.readMipLevel( reinterpret_cast<char*>( source.data() ), level, width, height ) )
+            throw std::runtime_error( "Could not read mip level " + std::to_string( level ) );
+
+        // HIP arrays have 1, 2 or 4 channels. Pad RGB and smaller formats to RGBA.
+        std::vector<uint8_t> rgba( pixelCount * 4 * channelBytes, 0 );
+        for( size_t pixel = 0; pixel < pixelCount; ++pixel )
+        {
+            const uint8_t* src = source.data() + pixel * info.numChannels * channelBytes;
+            uint8_t*       dst = rgba.data() + pixel * 4 * channelBytes;
+            if( convertInt32 )
+            {
+                for( uint32_t channel = 0; channel < info.numChannels; ++channel )
+                {
+                    const float value = normalizedInt32Channel( src + channel * channelBytes, info.format );
+                    std::memcpy( dst + channel * channelBytes, &value, sizeof( value ) );
+                }
+            }
+            else
+                std::memcpy( dst, src, info.numChannels * channelBytes );
+        }
+        return rgba;
+    }
+
+    void uploadMipLevels( hip_demand::ImageSource& image, const hip_demand::TextureInfo& info, bool convertInt32 )
+    {
+        const size_t channelBytes = hip_demand::getBytesPerChannel( info.format );
+        uint32_t     width        = info.width;
+        uint32_t     height       = info.height;
         for( uint32_t level = 0; level < info.numMipLevels; ++level )
         {
-            const size_t         pixelCount = static_cast<size_t>( width ) * height;
-            std::vector<uint8_t> source( pixelCount * info.numChannels );
-            if( !image.readMipLevel( reinterpret_cast<char*>( source.data() ), level, width, height ) )
-                throw std::runtime_error( "Could not read mip level " + std::to_string( level ) );
-
-            std::vector<uchar4> rgba( pixelCount );
-            for( size_t pixel = 0; pixel < pixelCount; ++pixel )
-            {
-                const uint8_t* value = source.data() + pixel * info.numChannels;
-                rgba[pixel].x        = value[0];
-                rgba[pixel].y        = info.numChannels > 1 ? value[1] : value[0];
-                rgba[pixel].z        = info.numChannels > 2 ? value[2] : value[0];
-                rgba[pixel].w        = info.numChannels > 3 ? value[3] : 255;
-            }
-
-            hipArray_t levelArray = nullptr;
+            const std::vector<uint8_t> rgba       = readRgbaMipLevel( image, info, level, width, height, convertInt32 );
+            hipArray_t                 levelArray = nullptr;
             HIP_CHECK( hipGetMipmappedArrayLevel( &levelArray, mipmappedArray_, level ) );
-            const size_t rowBytes = static_cast<size_t>( width ) * sizeof( uchar4 );
+            const size_t rowBytes = static_cast<size_t>( width ) * 4 * channelBytes;
             HIP_CHECK( hipMemcpy2DToArray( levelArray, 0, 0, rgba.data(), rowBytes, rowBytes, height, hipMemcpyHostToDevice ) );
             width  = std::max( 1u, width / 2 );
             height = std::max( 1u, height / 2 );
         }
     }
 
-    void createTextureObject( uint32_t mipLevelCount )
+    void createTextureObject( uint32_t mipLevelCount, hipTextureReadMode readMode )
     {
         hipResourceDesc resourceDesc{};
         resourceDesc.resType           = hipResourceTypeMipmappedArray;
@@ -160,7 +302,7 @@ class HipMipmappedTexture
         textureDesc.addressMode[0]      = hipAddressModeClamp;
         textureDesc.addressMode[1]      = hipAddressModeClamp;
         textureDesc.filterMode          = hipFilterModeLinear;
-        textureDesc.readMode            = hipReadModeNormalizedFloat;
+        textureDesc.readMode            = readMode;
         textureDesc.normalizedCoords    = 1;
         textureDesc.mipmapFilterMode    = hipFilterModePoint;
         textureDesc.minMipmapLevelClamp = 0.0f;
@@ -182,48 +324,12 @@ class HipMipmappedTexture
     hipTextureObject_t  texture_        = 0;
 };
 
-fs::path findLargestBenchmarkImage( const fs::path& directory, bool includeOver4k )
-{
-    hipDeviceProp_t deviceProperties{};
-    HIP_CHECK( hipGetDeviceProperties( &deviceProperties, 0 ) );
-    const uint32_t maxWidth =
-        static_cast<uint32_t>( deviceProperties.maxTexture2DMipmap[0] > 0 ? deviceProperties.maxTexture2DMipmap[0] :
-                                                                            deviceProperties.maxTexture2D[0] );
-    const uint32_t maxHeight =
-        static_cast<uint32_t>( deviceProperties.maxTexture2DMipmap[1] > 0 ? deviceProperties.maxTexture2DMipmap[1] :
-                                                                            deviceProperties.maxTexture2D[1] );
-
-    const std::vector<fs::path> imagePaths = findImages( directory, includeOver4k );
-    fs::path                    largestPath;
-    uint64_t                    largestPixelCount = 0;
-    for( const fs::path& imagePath : imagePaths )
-    {
-        const auto     image  = readImage( imagePath );
-        const auto&    info   = image->getInfo();
-        const uint64_t pixels = static_cast<uint64_t>( info.width ) * info.height;
-        if( info.width > maxWidth || info.height > maxHeight )
-        {
-            std::cout << "  Benchmark skipped (exceeds native mipmapped texture limit " << maxWidth << 'x' << maxHeight
-                      << "): " << imagePath.filename().string() << " (" << info.width << 'x' << info.height << ")\n";
-            continue;
-        }
-        if( pixels > largestPixelCount )
-        {
-            largestPixelCount = pixels;
-            largestPath       = imagePath;
-        }
-    }
-    if( largestPath.empty() )
-        throw std::runtime_error( "No test image fits the native mipmapped texture limit" );
-    return largestPath;
-}
-
 template <class Launch>
-uint32_t makeVmmTextureResident( hip_demand::vmm::DemandTextureLoader& loader,
-                                 hipStream_t                           stream,
-                                 hip_demand::vmm::DeviceContext&       context,
-                                 uint32_t                              maxPasses,
-                                 Launch&&                              launch )
+void makeVmmTextureResident( hip_demand::vmm::DemandTextureLoader& loader,
+                             hipStream_t                           stream,
+                             hip_demand::vmm::DeviceContext&       context,
+                             uint32_t                              maxPasses,
+                             Launch&&                              launch )
 {
     using namespace hip_demand::vmm;
 
@@ -236,13 +342,13 @@ uint32_t makeVmmTextureResident( hip_demand::vmm::DemandTextureLoader& loader,
         ticket.wait();
         HIP_CHECK( hipStreamSynchronize( stream ) );
         if( ticket.numTasksTotal() == 0 )
-            return pass;
+            return;
     }
     throw std::runtime_error( "VMM benchmark texture did not become resident" );
 }
 
 template <class Launch>
-void measureQueuedRenderCalls( const char* label, hipStream_t stream, uint32_t callCount, uint32_t batchSize, Launch&& launch )
+float measureQueuedRenderCalls( hipStream_t stream, uint32_t callCount, uint32_t batchSize, Launch&& launch )
 {
     if( batchSize == 0 )
         throw std::invalid_argument( "Batch size must be greater than zero" );
@@ -270,31 +376,16 @@ void measureQueuedRenderCalls( const char* label, hipStream_t stream, uint32_t c
         ++batchIndex;
     }
 
-    const float    milliseconds     = timer.stop( stream );
-    const uint32_t maxCallsInFlight = batchSize * bufferedBatchCount;
-    std::cout << "\n  " << label << "\n"
-              << "    Calls: " << callCount << " | Batch size: " << batchSize << '\n'
-              << "    Buffered batches: " << bufferedBatchCount << " | Max calls in flight: " << maxCallsInFlight << '\n'
-              << std::fixed << std::setprecision( 3 ) << "    Total rendering time: " << milliseconds << " ms\n"
-              << std::defaultfloat;
+    return timer.stop( stream );
 }
 
-void benchmarkTex2DLod( const fs::path& executableDir, const fs::path& imagePath )
+BenchmarkTimes benchmarkTex2DLod( const fs::path& executableDir, const std::shared_ptr<hip_demand::ImageSource>& image )
 {
     using namespace hip_demand::vmm;
 
-    uint32_t           outputWidth     = 3840;
-    uint32_t           outputHeight    = 2160;
-    constexpr uint32_t blockWidth      = 16;
-    constexpr uint32_t blockHeight     = 16;
-    constexpr uint32_t channels        = 4;
-    constexpr uint32_t maxWarmupPasses = 256;
-    constexpr uint32_t callCount       = 1000;
-    constexpr uint32_t batchSize       = 10;
-    float              mipLevel        = 0.0f;
-
-    const fs::path vmmOutputPath{ "vmm_loader_sampler_benchmark_vmm.png" };
-    const fs::path hipOutputPath{ "vmm_loader_sampler_benchmark_hip_texture.png" };
+    uint32_t renderWidth      = outputWidth;
+    uint32_t renderHeight     = outputHeight;
+    float    selectedMipLevel = mipLevel;
 
     Options options{};
     options.maxTextures      = 1;
@@ -308,23 +399,14 @@ void benchmarkTex2DLod( const fs::path& executableDir, const fs::path& imagePath
     if( !fs::exists( kernelPath ) )
         throw std::runtime_error( "HIP module not found: " + kernelPath.string() );
 
-    HIP_CHECK( hipSetDevice( 0 ) );
-    const auto                     image = readImage( imagePath );
-    const hip_demand::TextureInfo& info  = image->getInfo();
+    const hip_demand::TextureInfo& info = image->getInfo();
+    KernelModule                   module( kernelPath );
+    const size_t                   byteCount = static_cast<size_t>( outputWidth ) * outputHeight * outputChannels;
+    GpuResources                   gpu( byteCount );
+    const uint32_t                 gridWidth  = ( outputWidth + blockWidth - 1 ) / blockWidth;
+    const uint32_t                 gridHeight = ( outputHeight + blockHeight - 1 ) / blockHeight;
 
-    std::cout << "\nTexture sampler performance: VMM vs hipTextureObject_t\n"
-              << "  Image: " << imagePath.filename().string() << " (" << info.width << 'x' << info.height << ")\n"
-              << "  Available mip levels: " << info.numMipLevels << '\n'
-              << "  Rendered mip level: " << mipLevel << '\n'
-              << "  Output size: " << outputWidth << 'x' << outputHeight << " pixels\n"
-              << "  Timing: GPU elapsed time after resources are resident\n";
-
-    KernelModule   module( kernelPath );
-    const size_t   byteCount = static_cast<size_t>( outputWidth ) * outputHeight * channels;
-    GpuResources   gpu( byteCount );
-    const uint32_t gridWidth  = ( outputWidth + blockWidth - 1 ) / blockWidth;
-    const uint32_t gridHeight = ( outputHeight + blockHeight - 1 ) / blockHeight;
-
+    BenchmarkTimes times{};
     {
         auto              loader = createDemandTextureLoader( options );
         TextureDescriptor descriptor{};
@@ -338,34 +420,154 @@ void benchmarkTex2DLod( const fs::path& executableDir, const fs::path& imagePath
         DeviceContext context{};
         const auto    launchVmmKernel = [&]( const DeviceContext& deviceContext ) {
             DeviceContext mutableContext = deviceContext;
-            void*         arguments[]    = { &mutableContext, &gpu.output, &outputWidth, &outputHeight, &mipLevel };
+            void* arguments[] = { &mutableContext, &gpu.output, &renderWidth, &renderHeight, &selectedMipLevel };
             HIP_CHECK( hipModuleLaunchKernel( module.vmmTex2DLodKernel(), gridWidth, gridHeight, 1, blockWidth,
                                               blockHeight, 1, 0, gpu.stream, arguments, nullptr ) );
         };
-        const uint32_t warmupPasses = makeVmmTextureResident( *loader, gpu.stream, context, maxWarmupPasses, launchVmmKernel );
-        std::cout << "  VMM warm-up complete after " << warmupPasses << " passes\n";
+        makeVmmTextureResident( *loader, gpu.stream, context, maxWarmupPasses, launchVmmKernel );
 
-        const auto launchVmm = [&] { launchVmmKernel( context ); };
-        measureQueuedRenderCalls( "VMM tex2DLod continuously queued throughput", gpu.stream, callCount, batchSize, launchVmm );
-        saveGpuOutput( vmmOutputPath, gpu.stream, gpu.output, outputWidth, outputHeight, channels );
+        const auto launchVmm  = [&] { launchVmmKernel( context ); };
+        times.vmmMilliseconds = measureQueuedRenderCalls( gpu.stream, callCount, batchSize, launchVmm );
     }
 
     {
-        std::cout << "\n  Uploading every mip level to hipTextureObject_t...\n";
         HipMipmappedTexture texture( *image, info );
         hipTextureObject_t  textureObject = texture.get();
         const auto          launchHip     = [&] {
-            void* arguments[] = { &textureObject, &gpu.output, &outputWidth, &outputHeight, &mipLevel };
+            void* arguments[] = { &textureObject, &gpu.output, &renderWidth, &renderHeight, &selectedMipLevel };
             HIP_CHECK( hipModuleLaunchKernel( module.hipTex2DLodKernel(), gridWidth, gridHeight, 1, blockWidth,
                                               blockHeight, 1, 0, gpu.stream, arguments, nullptr ) );
         };
 
         launchHip();
         HIP_CHECK( hipStreamSynchronize( gpu.stream ) );
-        std::cout << "  hipTextureObject_t warm-up complete\n";
-        measureQueuedRenderCalls( "hipTextureObject_t tex2DLod continuously queued throughput", gpu.stream, callCount,
-                                  batchSize, launchHip );
-        saveGpuOutput( hipOutputPath, gpu.stream, gpu.output, outputWidth, outputHeight, channels );
+        times.nativeMilliseconds = measureQueuedRenderCalls( gpu.stream, callCount, batchSize, launchHip );
+    }
+    return times;
+}
+
+ImageResult benchmarkImage( const fs::path& imagePath,
+                            const fs::path& imageDir,
+                            const fs::path& executableDir,
+                            uint32_t        maxWidth,
+                            uint32_t        maxHeight,
+                            size_t          index,
+                            size_t          total )
+{
+    ImageResult result{};
+    result.name = imagePath.lexically_relative( imageDir ).string();
+    std::cout << "Rendering [" << index + 1 << '/' << total << "] " << result.name << " ... " << std::flush;
+
+    try
+    {
+        result.fileBytes   = std::to_string( fs::file_size( imagePath ) );
+        const auto  image  = readBenchmarkImage( imagePath );
+        const auto& info   = image->getInfo();
+        result.dimensions  = std::to_string( info.width ) + 'x' + std::to_string( info.height );
+        result.pixelFormat = pixelFormatName( info );
+
+        if( info.width > maxWidth || info.height > maxHeight )
+        {
+            result.status = ResultStatus::skipped;
+            result.note = "exceeds native mipmapped texture limit " + std::to_string( maxWidth ) + 'x' + std::to_string( maxHeight );
+        }
+        else
+        {
+            result.times  = benchmarkTex2DLod( executableDir, image );
+            result.status = ResultStatus::completed;
+        }
+    }
+    catch( const std::exception& error )
+    {
+        result.note = error.what();
+    }
+
+    switch( result.status )
+    {
+        case ResultStatus::completed:
+            std::cout << "done\n";
+            break;
+        case ResultStatus::skipped:
+            std::cout << "SKIPPED\n";
+            break;
+        case ResultStatus::failed:
+            std::cout << "FAILED\n";
+            break;
+    }
+    return result;
+}
+
+std::string formatNumber( float value, const char* suffix = "" )
+{
+    std::ostringstream out;
+    out << std::fixed << std::setprecision( 3 ) << value << suffix;
+    return out.str();
+}
+
+using TableRow = std::array<std::string, 8>;
+
+const char* statusName( ResultStatus status )
+{
+    switch( status )
+    {
+        case ResultStatus::completed:
+            return "OK";
+        case ResultStatus::skipped:
+            return "SKIPPED";
+        case ResultStatus::failed:
+            return "FAILED";
+    }
+    return "FAILED";
+}
+
+TableRow makeTableRow( const ImageResult& result )
+{
+    const char* status = statusName( result.status );
+    if( result.status != ResultStatus::completed )
+        return { result.name, result.fileBytes, result.dimensions, result.pixelFormat, "-", "-", "-", status };
+
+    return { result.name,
+             result.fileBytes,
+             result.dimensions,
+             result.pixelFormat,
+             formatNumber( result.times.vmmMilliseconds ),
+             formatNumber( result.times.nativeMilliseconds ),
+             formatNumber( result.times.vmmMilliseconds / result.times.nativeMilliseconds, "x" ),
+             status };
+}
+
+void printResultsTable( const std::vector<ImageResult>& results )
+{
+    size_t fileWidth = std::string( "File" ).size();
+    for( const ImageResult& result : results )
+        fileWidth = std::max( fileWidth, result.name.size() );
+    const std::array<size_t, 8> widths{ fileWidth, 12, 11, 8, 10, 10, 11, 7 };
+    const auto                  printSeparator = [&] {
+        std::cout << '+';
+        for( size_t width : widths )
+            std::cout << std::string( width + 2, '-' ) << '+';
+        std::cout << '\n';
+    };
+    const auto printRow = [&]( const TableRow& row ) {
+        std::cout << '|';
+        for( size_t column = 0; column < row.size(); ++column )
+            std::cout << ' ' << ( column == 1 || ( column >= 4 && column <= 6 ) ? std::right : std::left )
+                      << std::setw( static_cast<int>( widths[column] ) ) << row[column] << " |";
+        std::cout << '\n';
+    };
+
+    std::cout << '\n';
+    printSeparator();
+    printRow( TableRow{ "File", "Bytes", "Dimensions", "Format", "VMM ms", "Native ms", "VMM/native", "Status" } );
+    printSeparator();
+    for( const ImageResult& result : results )
+        printRow( makeTableRow( result ) );
+    printSeparator();
+
+    for( const ImageResult& result : results )
+    {
+        if( !result.note.empty() )
+            std::cout << result.name << ": " << result.note << '\n';
     }
 }
 
@@ -375,18 +577,57 @@ int main( int argc, char** argv )
 {
     try
     {
-        constexpr bool includeOver4kImages = false;
-        const fs::path executableDir       = fs::absolute( fs::path{ argv[0] } ).parent_path();
-        fs::path       imageDirectory      = fs::path{ TEST_IMAGES_DIR } / "png";
-        imageDirectory.make_preferred();
+        const fs::path executableDir = fs::absolute( fs::path{ argv[0] } ).parent_path();
+        fs::path       imageDir      = fs::path{ TEST_IMAGES_DIR };
+        imageDir.make_preferred();
 
+        HIP_CHECK( hipSetDevice( 0 ) );
+        hipDeviceProp_t deviceProperties{};
+        HIP_CHECK( hipGetDeviceProperties( &deviceProperties, 0 ) );
+        const uint32_t maxWidth =
+            static_cast<uint32_t>( deviceProperties.maxTexture2DMipmap[0] > 0 ? deviceProperties.maxTexture2DMipmap[0] :
+                                                                                deviceProperties.maxTexture2D[0] );
+        const uint32_t maxHeight =
+            static_cast<uint32_t>( deviceProperties.maxTexture2DMipmap[1] > 0 ? deviceProperties.maxTexture2DMipmap[1] :
+                                                                                deviceProperties.maxTexture2D[1] );
+
+        const std::vector<fs::path> imagePaths = findImages( imageDir, true, true );
         std::cout << "VMM loader sampler benchmark\n"
-                  << "  Image directory: " << imageDirectory.string() << '\n'
-                  << "  Size filter: " << ( includeOver4kImages ? "all images" : "up to 4096 pixels per side" ) << '\n';
+                  << "  Input: " << imageDir.string() << '\n'
+                  << "  Files: " << imagePaths.size() << '\n'
+                  << "  Rendering: " << outputWidth << 'x' << outputHeight << ", mip " << mipLevel << ", " << callCount
+                  << " calls per sampler\n"
+                  << "  Times are total GPU times after warm-up\n";
 
-        benchmarkTex2DLod( executableDir, findLargestBenchmarkImage( imageDirectory, includeOver4kImages ) );
-        std::cout << "\nResult: PASS (sampler benchmark completed)\n";
-        return 0;
+        std::vector<ImageResult> results;
+        results.reserve( imagePaths.size() );
+        size_t completed = 0;
+        size_t skipped   = 0;
+        size_t failed    = 0;
+        for( size_t imageIndex = 0; imageIndex < imagePaths.size(); ++imageIndex )
+        {
+            ImageResult result = benchmarkImage( imagePaths[imageIndex], imageDir, executableDir, maxWidth, maxHeight,
+                                                 imageIndex, imagePaths.size() );
+            switch( result.status )
+            {
+                case ResultStatus::completed:
+                    ++completed;
+                    break;
+                case ResultStatus::skipped:
+                    ++skipped;
+                    break;
+                case ResultStatus::failed:
+                    ++failed;
+                    break;
+            }
+            results.push_back( std::move( result ) );
+        }
+
+        printResultsTable( results );
+
+        std::cout << "\nResult: " << ( failed == 0 && completed != 0 ? "PASS" : "FAIL" ) << " (completed " << completed
+                  << ", skipped " << skipped << ", failed " << failed << ")\n";
+        return failed == 0 && completed != 0 ? 0 : 1;
     }
     catch( const std::exception& error )
     {

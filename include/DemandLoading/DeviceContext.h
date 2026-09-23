@@ -107,6 +107,16 @@ struct DeviceTextureInfo
         uint32_t mipTailOffset = 0;  // Byte offset within the 64 KiB mip-tail page; uint32_t keeps each mip descriptor compact.
     } mips[MAX_TEXTURE_MIP_LEVELS]{};
 
+    HIP_DEMAND_INLINE uint2 getTileCoords( uint32_t x, uint32_t y ) const
+    {
+        return { x >> tileWidthShift, y >> tileHeightShift };
+    }
+
+    HIP_DEMAND_INLINE uint2 getLocalCoords( uint32_t x, uint32_t y ) const
+    {
+        return { x & tileWidthMask, y & tileHeightMask };
+    }
+
     HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level ) const
     {
         DeviceMipLevel mip{};

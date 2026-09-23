@@ -72,7 +72,7 @@ inline std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path 
     return image;
 }
 
-inline std::vector<fs::path> findImages( const fs::path& directory, bool includeOver4k )
+inline std::vector<fs::path> findImages( const fs::path& directory, bool includeOver4k, bool recursive = false )
 {
     constexpr uint32_t max4kDimension = 4096;
 
@@ -80,17 +80,27 @@ inline std::vector<fs::path> findImages( const fs::path& directory, bool include
         throw std::runtime_error( "Image directory not found: " + directory.string() );
 
     std::vector<fs::path> imagePaths;
-    for( const fs::directory_entry& entry : fs::directory_iterator( directory ) )
-    {
+    const auto addImage = [&]( const fs::directory_entry& entry ) {
         if( !entry.is_regular_file() )
-            continue;
+            return;
 
         std::string extension = entry.path().extension().string();
         std::transform( extension.begin(), extension.end(), extension.begin(),
                         []( unsigned char c ) { return static_cast<char>( std::tolower( c ) ); } );
         if( extension == ".png" || extension == ".jpg" || extension == ".jpeg" || extension == ".bmp"
-            || extension == ".tga" )
+            || extension == ".tga" || extension == ".tif" || extension == ".tiff" || extension == ".exr"
+            || extension == ".hdr" )
             imagePaths.push_back( entry.path() );
+    };
+    if( recursive )
+    {
+        for( const fs::directory_entry& entry : fs::recursive_directory_iterator( directory ) )
+            addImage( entry );
+    }
+    else
+    {
+        for( const fs::directory_entry& entry : fs::directory_iterator( directory ) )
+            addImage( entry );
     }
     std::sort( imagePaths.begin(), imagePaths.end() );
     if( imagePaths.empty() )

@@ -343,12 +343,10 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, cons
     }
     else
     {
-        const uint32_t tileX  = static_cast<uint32_t>( x ) >> texture.tileWidthShift;
-        const uint32_t tileY  = static_cast<uint32_t>( y ) >> texture.tileHeightShift;
-        pageId                = mip.startPage + tileY * mip.tilesX + tileX;
-        const uint32_t localX = static_cast<uint32_t>( x ) & texture.tileWidthMask;
-        const uint32_t localY = static_cast<uint32_t>( y ) & texture.tileHeightMask;
-        pageByteOffset        = ( localY * texture.tileWidth + localX ) * texture.bytesPerTexel;
+        const uint2 tile  = texture.getTileCoords( static_cast<uint32_t>( x ), static_cast<uint32_t>( y ) );
+        const uint2 local = texture.getLocalCoords( static_cast<uint32_t>( x ), static_cast<uint32_t>( y ) );
+        pageId            = mip.startPage + tile.y * mip.tilesX + tile.x;
+        pageByteOffset    = ( local.y * texture.tileWidth + local.x ) * texture.bytesPerTexel;
     }
 
     const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
@@ -368,7 +366,7 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, cons
     return decodeTexel<Sample>( context.pageMemory.ptr + byteOffset, texture.format, texture.numChannels );
 }
 
-HIP_DEMAND_INLINE const uint8_t* resolveTexturePage( const DeviceContext& context, uint32_t pageId )
+HIP_DEMAND_INLINE uint8_t* resolveTexturePage( const DeviceContext& context, uint32_t pageId )
 {
     const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
     const bool     resident   = isResourceResident( context, resourceId );
@@ -390,6 +388,35 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
                                             Sample&                  t11,
                                             bool&                    resident )
 {
+    // Fast path for four bilinear taps inside one tile. In-bounds coordinates need no address-mode handling,
+    // and all texel addresses can be derived from one page lookup and one base offset.
+    if( !mip.mipTail && x0 >= 0 && y0 >= 0 && static_cast<uint32_t>( x0 ) + 1 < mip.width
+        && static_cast<uint32_t>( y0 ) + 1 < mip.height )
+    {
+        const uint32_t texelX = static_cast<uint32_t>( x0 );
+        const uint32_t texelY = static_cast<uint32_t>( y0 );
+        const uint2    local  = texture.getLocalCoords( texelX, texelY );
+        // The 2x2 footprint fits in one tile only if its top-left texel is before the last column and row.
+        if( local.x < texture.tileWidthMask && local.y < texture.tileHeightMask )
+        {
+            const uint2    tile     = texture.getTileCoords( texelX, texelY );
+            const uint32_t pageId   = mip.startPage + tile.y * mip.tilesX + tile.x;
+            const uint32_t rowBytes = texture.tileWidth * texture.bytesPerTexel;
+            const uint32_t offset00 = local.y * rowBytes + local.x * texture.bytesPerTexel;
+
+            const uint8_t* page = resolveTexturePage( context, pageId );
+            resident            = page != nullptr;
+            if( resident )
+            {
+                const uint8_t* row0 = page + offset00;
+                const uint8_t* row1 = row0 + rowBytes;
+                decodeBilinearTexels( texture, row0, row0 + texture.bytesPerTexel, row1,
+                                      row1 + texture.bytesPerTexel, t00, t10, t01, t11 );
+            }
+            return;
+        }
+    }
+
     const int2 x = applyAddressModePair( x0, x0 + 1, static_cast<int>( mip.width ), texture.addressMode[0] );
     const int2 y = applyAddressModePair( y0, y0 + 1, static_cast<int>( mip.height ), texture.addressMode[1] );
     x0           = x.x;
@@ -397,81 +424,49 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
     const int x1 = x.y;
     const int y1 = y.y;
 
-    uint32_t pageId = INVALID_PAGE;
-    uint32_t offset00{};
-    uint32_t offset10{};
-    uint32_t offset01{};
-    uint32_t offset11{};
-
     if( mip.mipTail )
     {
-        pageId                  = texture.mipTailPage;
-        const uint32_t rowBytes = mip.width * texture.bytesPerTexel;
-        offset00 = mip.mipTailOffset + static_cast<uint32_t>( y0 ) * rowBytes + static_cast<uint32_t>( x0 ) * texture.bytesPerTexel;
-        offset10 = mip.mipTailOffset + static_cast<uint32_t>( y0 ) * rowBytes + static_cast<uint32_t>( x1 ) * texture.bytesPerTexel;
-        offset01 = mip.mipTailOffset + static_cast<uint32_t>( y1 ) * rowBytes + static_cast<uint32_t>( x0 ) * texture.bytesPerTexel;
-        offset11 = mip.mipTailOffset + static_cast<uint32_t>( y1 ) * rowBytes + static_cast<uint32_t>( x1 ) * texture.bytesPerTexel;
-    }
-    else
-    {
-        const uint32_t tileX0   = static_cast<uint32_t>( x0 ) >> texture.tileWidthShift;
-        const uint32_t tileX1   = static_cast<uint32_t>( x1 ) >> texture.tileWidthShift;
-        const uint32_t tileY0   = static_cast<uint32_t>( y0 ) >> texture.tileHeightShift;
-        const uint32_t tileY1   = static_cast<uint32_t>( y1 ) >> texture.tileHeightShift;
-        const uint32_t localX0  = static_cast<uint32_t>( x0 ) & texture.tileWidthMask;
-        const uint32_t localX1  = static_cast<uint32_t>( x1 ) & texture.tileWidthMask;
-        const uint32_t localY0  = static_cast<uint32_t>( y0 ) & texture.tileHeightMask;
-        const uint32_t localY1  = static_cast<uint32_t>( y1 ) & texture.tileHeightMask;
-        const uint32_t rowBytes = texture.tileWidth * texture.bytesPerTexel;
-        offset00                = localY0 * rowBytes + localX0 * texture.bytesPerTexel;
-        offset10                = localY0 * rowBytes + localX1 * texture.bytesPerTexel;
-        offset01                = localY1 * rowBytes + localX0 * texture.bytesPerTexel;
-        offset11                = localY1 * rowBytes + localX1 * texture.bytesPerTexel;
-
-        const uint32_t pageRow0 = mip.startPage + tileY0 * mip.tilesX;
-        pageId                  = pageRow0 + tileX0;
-
-        if( tileX0 != tileX1 || tileY0 != tileY1 )
-        {
-            const uint32_t pageRow1 = mip.startPage + tileY1 * mip.tilesX;
-            const uint32_t pageId10 = pageRow0 + tileX1;
-            const uint32_t pageId01 = pageRow1 + tileX0;
-            const uint32_t pageId11 = pageRow1 + tileX1;
-
-            const uint8_t* page00 = resolveTexturePage( context, pageId );
-            const uint8_t* page10 = pageId10 == pageId ? page00 : resolveTexturePage( context, pageId10 );
-            const uint8_t* page01 = pageId01 == pageId ? page00 : resolveTexturePage( context, pageId01 );
-            const uint8_t* page11{};
-            if( pageId11 == pageId10 )
-                page11 = page10;
-            else if( pageId11 == pageId01 )
-                page11 = page01;
-            else
-                page11 = resolveTexturePage( context, pageId11 );
-
-            resident = page00 && page10 && page01 && page11;
-            if( resident )
-            {
-                decodeBilinearTexels( texture, page00 + offset00, page10 + offset10, page01 + offset01,
-                                      page11 + offset11, t00, t10, t01, t11 );
-            }
+        // All four taps share one page; compute each row and column address once.
+        const uint8_t* page = resolveTexturePage( context, texture.mipTailPage );
+        resident            = page != nullptr;
+        if( !resident )
             return;
-        }
-    }
 
-    const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
-    resident                  = isResourceResident( context, resourceId );
-    if( !resident )
-    {
-        recordRequest( context, resourceId );
+        const uint32_t rowBytes  = mip.width * texture.bytesPerTexel;
+        const uint8_t* row0     = page + mip.mipTailOffset + static_cast<uint32_t>( y0 ) * rowBytes;
+        const uint8_t* row1     = page + mip.mipTailOffset + static_cast<uint32_t>( y1 ) * rowBytes;
+        const uint32_t xOffset0 = static_cast<uint32_t>( x0 ) * texture.bytesPerTexel;
+        const uint32_t xOffset1 = static_cast<uint32_t>( x1 ) * texture.bytesPerTexel;
+        decodeBilinearTexels( texture, row0 + xOffset0, row0 + xOffset1, row1 + xOffset0, row1 + xOffset1,
+                              t00, t10, t01, t11 );
         return;
     }
-    if( context.requestIfResident )
-        recordRequest( context, resourceId );
+    const uint2    tile0    = texture.getTileCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
+    const uint2    tile1    = texture.getTileCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
+    const uint2    local0   = texture.getLocalCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
+    const uint2    local1   = texture.getLocalCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
+    const uint32_t rowBytes = texture.tileWidth * texture.bytesPerTexel;
+    const uint32_t offset00 = local0.y * rowBytes + local0.x * texture.bytesPerTexel;
+    const uint32_t offset10 = local0.y * rowBytes + local1.x * texture.bytesPerTexel;
+    const uint32_t offset01 = local1.y * rowBytes + local0.x * texture.bytesPerTexel;
+    const uint32_t offset11 = local1.y * rowBytes + local1.x * texture.bytesPerTexel;
 
-    const uint8_t* page = context.pageMemory.ptr + static_cast<size_t>( pageId ) * context.pageSize;
-    decodeBilinearTexels( texture, page + offset00, page + offset10, page + offset01, page + offset11, t00, t10,
-                          t01, t11 );
+    const uint32_t pageRow0 = mip.startPage + tile0.y * mip.tilesX;
+    const uint32_t pageRow1 = mip.startPage + tile1.y * mip.tilesX;
+    const bool     sameTileX = tile0.x == tile1.x;
+    const bool     sameTileY = tile0.y == tile1.y;
+    const uint8_t* page00   = resolveTexturePage( context, pageRow0 + tile0.x );
+    const uint8_t* page10   = sameTileX ? page00 : resolveTexturePage( context, pageRow0 + tile1.x );
+    const uint8_t* page01   = sameTileY ? page00 : resolveTexturePage( context, pageRow1 + tile0.x );
+    const uint8_t* page11   = sameTileY ? page10
+                                     : ( sameTileX ? page01 : resolveTexturePage( context, pageRow1 + tile1.x ) );
+
+    resident = page00 && page10 && page01 && page11;
+    if( !resident )
+        return;
+
+    decodeBilinearTexels( texture, page00 + offset00, page10 + offset10, page01 + offset01, page11 + offset11,
+                          t00, t10, t01, t11 );
 }
 
 template <class Sample>
