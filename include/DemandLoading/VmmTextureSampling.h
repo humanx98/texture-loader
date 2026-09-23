@@ -220,107 +220,163 @@ HIP_DEMAND_INLINE Sample decodeTexel( const uint8_t* texel, hipArray_Format form
     }
 }
 
+// Decode and blend one channel before moving to the next, avoiding four decoded Sample values.
+template <class Channel>
+HIP_DEMAND_INLINE float filterBilinearChannel( Channel value00, Channel value10, Channel value01, Channel value11,
+                                               float weight00, float weight10, float weight01, float weight11 )
+{
+    return weight00 * decodeChannelValue( value00 ) + weight10 * decodeChannelValue( value10 )
+           + weight01 * decodeChannelValue( value01 ) + weight11 * decodeChannelValue( value11 );
+}
+
 template <class Sample, uint32_t NumChannels, class Channel>
-HIP_DEMAND_INLINE void decodeBilinearPackedTexels( const uint8_t* texel00,
-                                                   const uint8_t* texel10,
-                                                   const uint8_t* texel01,
-                                                   const uint8_t* texel11,
-                                                   Sample&        t00,
-                                                   Sample&        t10,
-                                                   Sample&        t01,
-                                                   Sample&        t11 )
+HIP_DEMAND_INLINE Sample filterBilinearPackedTexels( const uint8_t* texel00, const uint8_t* texel10,
+                                                     const uint8_t* texel01, const uint8_t* texel11,
+                                                     float weight00, float weight10, float weight01, float weight11 )
 {
-    t00 = decodePackedChannels<Sample, NumChannels, Channel>( texel00 );
-    t10 = decodePackedChannels<Sample, NumChannels, Channel>( texel10 );
-    t01 = decodePackedChannels<Sample, NumChannels, Channel>( texel01 );
-    t11 = decodePackedChannels<Sample, NumChannels, Channel>( texel11 );
+    using PackedChannels = HIP_vector_type<Channel, NumChannels>;
+    const PackedChannels value00 = *reinterpret_cast<const PackedChannels*>( texel00 );
+    const PackedChannels value10 = *reinterpret_cast<const PackedChannels*>( texel10 );
+    const PackedChannels value01 = *reinterpret_cast<const PackedChannels*>( texel01 );
+    const PackedChannels value11 = *reinterpret_cast<const PackedChannels*>( texel11 );
+
+    const float x = filterBilinearChannel( value00.x, value10.x, value01.x, value11.x,
+                                          weight00, weight10, weight01, weight11 );
+    if constexpr( std::is_same<Sample, float>::value )
+        return x;
+    else
+    {
+        float y = 0.0f;
+        if constexpr( NumChannels > 1 )
+            y = filterBilinearChannel( value00.y, value10.y, value01.y, value11.y,
+                                       weight00, weight10, weight01, weight11 );
+        if constexpr( std::is_same<Sample, float2>::value )
+            return make_float2( x, y );
+        else
+        {
+            float z = 0.0f;
+            if constexpr( NumChannels > 2 )
+                z = filterBilinearChannel( value00.z, value10.z, value01.z, value11.z,
+                                           weight00, weight10, weight01, weight11 );
+            if constexpr( std::is_same<Sample, float3>::value )
+                return make_float3( x, y, z );
+            else if constexpr( std::is_same<Sample, float4>::value )
+            {
+                float w = 0.0f;
+                if constexpr( NumChannels > 3 )
+                    w = filterBilinearChannel( value00.w, value10.w, value01.w, value11.w,
+                                               weight00, weight10, weight01, weight11 );
+                return make_float4( x, y, z, w );
+            }
+            else
+                static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
+        }
+    }
 }
 
 template <class Sample, uint32_t NumChannels>
-HIP_DEMAND_INLINE void decodeBilinearHalfTexels( const uint8_t* texel00,
-                                                 const uint8_t* texel10,
-                                                 const uint8_t* texel01,
-                                                 const uint8_t* texel11,
-                                                 Sample&        t00,
-                                                 Sample&        t10,
-                                                 Sample&        t01,
-                                                 Sample&        t11 )
+HIP_DEMAND_INLINE Sample filterBilinearHalfTexels( const uint8_t* texel00, const uint8_t* texel10,
+                                                   const uint8_t* texel01, const uint8_t* texel11,
+                                                   float weight00, float weight10, float weight01, float weight11 )
 {
-    t00 = decodeHalfChannels<Sample, NumChannels>( texel00 );
-    t10 = decodeHalfChannels<Sample, NumChannels>( texel10 );
-    t01 = decodeHalfChannels<Sample, NumChannels>( texel01 );
-    t11 = decodeHalfChannels<Sample, NumChannels>( texel11 );
+    const __half* value00 = reinterpret_cast<const __half*>( texel00 );
+    const __half* value10 = reinterpret_cast<const __half*>( texel10 );
+    const __half* value01 = reinterpret_cast<const __half*>( texel01 );
+    const __half* value11 = reinterpret_cast<const __half*>( texel11 );
+
+    const float x = filterBilinearChannel( value00[0], value10[0], value01[0], value11[0],
+                                          weight00, weight10, weight01, weight11 );
+    if constexpr( std::is_same<Sample, float>::value )
+        return x;
+    else
+    {
+        float y = 0.0f;
+        if constexpr( NumChannels > 1 )
+            y = filterBilinearChannel( value00[1], value10[1], value01[1], value11[1],
+                                       weight00, weight10, weight01, weight11 );
+        if constexpr( std::is_same<Sample, float2>::value )
+            return make_float2( x, y );
+        else
+        {
+            float z = 0.0f;
+            if constexpr( NumChannels > 2 )
+                z = filterBilinearChannel( value00[2], value10[2], value01[2], value11[2],
+                                           weight00, weight10, weight01, weight11 );
+            if constexpr( std::is_same<Sample, float3>::value )
+                return make_float3( x, y, z );
+            else if constexpr( std::is_same<Sample, float4>::value )
+            {
+                float w = 0.0f;
+                if constexpr( NumChannels > 3 )
+                    w = filterBilinearChannel( value00[3], value10[3], value01[3], value11[3],
+                                               weight00, weight10, weight01, weight11 );
+                return make_float4( x, y, z, w );
+            }
+            else
+                static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
+        }
+    }
 }
 
 template <class Sample, uint32_t NumChannels>
-HIP_DEMAND_INLINE void decodeBilinearTexelsChannels( hipArray_Format format,
-                                                     const uint8_t* texel00,
-                                                     const uint8_t* texel10,
-                                                     const uint8_t* texel01,
-                                                     const uint8_t* texel11,
-                                                     Sample&        t00,
-                                                     Sample&        t10,
-                                                     Sample&        t01,
-                                                     Sample&        t11 )
+HIP_DEMAND_INLINE Sample filterBilinearTexelsChannels( hipArray_Format format,
+                                                       const uint8_t* texel00, const uint8_t* texel10,
+                                                       const uint8_t* texel01, const uint8_t* texel11,
+                                                       float weight00, float weight10, float weight01, float weight11 )
 {
     switch( format )
     {
         case HIP_AD_FORMAT_UNSIGNED_INT8:
-            return decodeBilinearPackedTexels<Sample, NumChannels, uint8_t>( texel00, texel10, texel01, texel11,
-                                                                              t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, uint8_t>( texel00, texel10, texel01, texel11,
+                                                                              weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_SIGNED_INT8:
-            return decodeBilinearPackedTexels<Sample, NumChannels, int8_t>( texel00, texel10, texel01, texel11,
-                                                                             t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, int8_t>( texel00, texel10, texel01, texel11,
+                                                                             weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_UNSIGNED_INT16:
-            return decodeBilinearPackedTexels<Sample, NumChannels, uint16_t>( texel00, texel10, texel01, texel11,
-                                                                               t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, uint16_t>( texel00, texel10, texel01, texel11,
+                                                                               weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_SIGNED_INT16:
-            return decodeBilinearPackedTexels<Sample, NumChannels, int16_t>( texel00, texel10, texel01, texel11,
-                                                                              t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, int16_t>( texel00, texel10, texel01, texel11,
+                                                                              weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_UNSIGNED_INT32:
-            return decodeBilinearPackedTexels<Sample, NumChannels, uint32_t>( texel00, texel10, texel01, texel11,
-                                                                               t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, uint32_t>( texel00, texel10, texel01, texel11,
+                                                                               weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_SIGNED_INT32:
-            return decodeBilinearPackedTexels<Sample, NumChannels, int32_t>( texel00, texel10, texel01, texel11,
-                                                                              t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, int32_t>( texel00, texel10, texel01, texel11,
+                                                                              weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_HALF:
-            return decodeBilinearHalfTexels<Sample, NumChannels>( texel00, texel10, texel01, texel11, t00, t10,
-                                                                   t01, t11 );
+            return filterBilinearHalfTexels<Sample, NumChannels>( texel00, texel10, texel01, texel11,
+                                                                   weight00, weight10, weight01, weight11 );
         case HIP_AD_FORMAT_FLOAT:
-            return decodeBilinearPackedTexels<Sample, NumChannels, float>( texel00, texel10, texel01, texel11,
-                                                                            t00, t10, t01, t11 );
+            return filterBilinearPackedTexels<Sample, NumChannels, float>( texel00, texel10, texel01, texel11,
+                                                                            weight00, weight10, weight01, weight11 );
         default:
-            t00 = t10 = t01 = t11 = Sample{};
+            return Sample{};
     }
 }
 
 template <class Sample>
-HIP_DEMAND_INLINE void decodeBilinearTexels( const DeviceTextureInfo& texture,
-                                             const uint8_t*          texel00,
-                                             const uint8_t*          texel10,
-                                             const uint8_t*          texel01,
-                                             const uint8_t*          texel11,
-                                             Sample&                 t00,
-                                             Sample&                 t10,
-                                             Sample&                 t01,
-                                             Sample&                 t11 )
+HIP_DEMAND_INLINE Sample filterBilinearTexels( const DeviceTextureInfo& texture,
+                                               const uint8_t* texel00, const uint8_t* texel10,
+                                               const uint8_t* texel01, const uint8_t* texel11,
+                                               float weight00, float weight10, float weight01, float weight11 )
 {
     switch( texture.numChannels )
     {
         case 1:
-            return decodeBilinearTexelsChannels<Sample, 1>( texture.format, texel00, texel10, texel01, texel11,
-                                                             t00, t10, t01, t11 );
+            return filterBilinearTexelsChannels<Sample, 1>( texture.format, texel00, texel10, texel01, texel11,
+                                                             weight00, weight10, weight01, weight11 );
         case 2:
-            return decodeBilinearTexelsChannels<Sample, 2>( texture.format, texel00, texel10, texel01, texel11,
-                                                             t00, t10, t01, t11 );
+            return filterBilinearTexelsChannels<Sample, 2>( texture.format, texel00, texel10, texel01, texel11,
+                                                             weight00, weight10, weight01, weight11 );
         case 3:
-            return decodeBilinearTexelsChannels<Sample, 3>( texture.format, texel00, texel10, texel01, texel11,
-                                                             t00, t10, t01, t11 );
+            return filterBilinearTexelsChannels<Sample, 3>( texture.format, texel00, texel10, texel01, texel11,
+                                                             weight00, weight10, weight01, weight11 );
         case 4:
-            return decodeBilinearTexelsChannels<Sample, 4>( texture.format, texel00, texel10, texel01, texel11,
-                                                             t00, t10, t01, t11 );
+            return filterBilinearTexelsChannels<Sample, 4>( texture.format, texel00, texel10, texel01, texel11,
+                                                             weight00, weight10, weight01, weight11 );
         default:
-            t00 = t10 = t01 = t11 = Sample{};
+            return Sample{};
     }
 }
 
@@ -377,16 +433,16 @@ HIP_DEMAND_INLINE uint8_t* resolveTexturePage( const DeviceContext& context, uin
 }
 
 template <class Sample>
-HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
-                                            const DeviceTextureInfo& texture,
-                                            const DeviceMipLevel&    mip,
-                                            int                      x0,
-                                            int                      y0,
-                                            Sample&                  t00,
-                                            Sample&                  t10,
-                                            Sample&                  t01,
-                                            Sample&                  t11,
-                                            bool&                    resident )
+HIP_DEMAND_INLINE Sample fetchBilinearSample( const DeviceContext&     context,
+                                              const DeviceTextureInfo& texture,
+                                              const DeviceMipLevel&    mip,
+                                              int                      x0,
+                                              int                      y0,
+                                              float                    weight00,
+                                              float                    weight10,
+                                              float                    weight01,
+                                              float                    weight11,
+                                              bool&                    resident )
 {
     // Fast path for four bilinear taps inside one tile. In-bounds coordinates need no address-mode handling,
     // and all texel addresses can be derived from one page lookup and one base offset.
@@ -406,14 +462,14 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
 
             const uint8_t* page = resolveTexturePage( context, pageId );
             resident            = page != nullptr;
-            if( resident )
-            {
-                const uint8_t* row0 = page + offset00;
-                const uint8_t* row1 = row0 + rowBytes;
-                decodeBilinearTexels( texture, row0, row0 + texture.bytesPerTexel, row1,
-                                      row1 + texture.bytesPerTexel, t00, t10, t01, t11 );
-            }
-            return;
+            if( !resident )
+                return Sample{};
+
+            const uint8_t* row0 = page + offset00;
+            const uint8_t* row1 = row0 + rowBytes;
+            return filterBilinearTexels<Sample>( texture, row0, row0 + texture.bytesPerTexel,
+                                                 row1, row1 + texture.bytesPerTexel,
+                                                 weight00, weight10, weight01, weight11 );
         }
     }
 
@@ -430,16 +486,16 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
         const uint8_t* page = resolveTexturePage( context, texture.mipTailPage );
         resident            = page != nullptr;
         if( !resident )
-            return;
+            return Sample{};
 
         const uint32_t rowBytes  = mip.width * texture.bytesPerTexel;
         const uint8_t* row0     = page + mip.mipTailOffset + static_cast<uint32_t>( y0 ) * rowBytes;
         const uint8_t* row1     = page + mip.mipTailOffset + static_cast<uint32_t>( y1 ) * rowBytes;
         const uint32_t xOffset0 = static_cast<uint32_t>( x0 ) * texture.bytesPerTexel;
         const uint32_t xOffset1 = static_cast<uint32_t>( x1 ) * texture.bytesPerTexel;
-        decodeBilinearTexels( texture, row0 + xOffset0, row0 + xOffset1, row1 + xOffset0, row1 + xOffset1,
-                              t00, t10, t01, t11 );
-        return;
+        return filterBilinearTexels<Sample>( texture, row0 + xOffset0, row0 + xOffset1,
+                                             row1 + xOffset0, row1 + xOffset1,
+                                             weight00, weight10, weight01, weight11 );
     }
     const uint2    tile0    = texture.getTileCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
     const uint2    tile1    = texture.getTileCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
@@ -463,10 +519,11 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
 
     resident = page00 && page10 && page01 && page11;
     if( !resident )
-        return;
+        return Sample{};
 
-    decodeBilinearTexels( texture, page00 + offset00, page10 + offset10, page01 + offset01, page11 + offset11,
-                          t00, t10, t01, t11 );
+    return filterBilinearTexels<Sample>( texture, page00 + offset00, page10 + offset10,
+                                         page01 + offset01, page11 + offset11,
+                                         weight00, weight10, weight01, weight11 );
 }
 
 template <class Sample>
@@ -496,13 +553,12 @@ sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, 
     const float a  = x - static_cast<float>( x0 );
     const float b  = y - static_cast<float>( y0 );
 
-    Sample t00{};
-    Sample t10{};
-    Sample t01{};
-    Sample t11{};
-    fetchBilinearTexels( context, texture, mip, x0, y0, t00, t10, t01, t11, resident );
-
-    return ( 1.0f - a ) * ( 1.0f - b ) * t00 + a * ( 1.0f - b ) * t10 + ( 1.0f - a ) * b * t01 + a * b * t11;
+    const float weight00 = ( 1.0f - a ) * ( 1.0f - b );
+    const float weight10 = a * ( 1.0f - b );
+    const float weight01 = ( 1.0f - a ) * b;
+    const float weight11 = a * b;
+    return fetchBilinearSample<Sample>( context, texture, mip, x0, y0,
+                                        weight00, weight10, weight01, weight11, resident );
 }
 
 template <class Sample>
