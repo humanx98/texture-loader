@@ -291,7 +291,7 @@ void benchmarkTex2DLod( const fs::path& executableDir, const fs::path& imagePath
     constexpr uint32_t maxWarmupPasses = 256;
     constexpr uint32_t callCount       = 1000;
     constexpr uint32_t batchSize       = 10;
-    float              mipLevel        = 1.0f;
+    float              mipLevel        = 0.0f;
 
     const fs::path vmmOutputPath{ "vmm_loader_sampler_benchmark_vmm.png" };
     const fs::path hipOutputPath{ "vmm_loader_sampler_benchmark_hip_texture.png" };

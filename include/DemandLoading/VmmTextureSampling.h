@@ -220,6 +220,110 @@ HIP_DEMAND_INLINE Sample decodeTexel( const uint8_t* texel, hipArray_Format form
     }
 }
 
+template <class Sample, uint32_t NumChannels, class Channel>
+HIP_DEMAND_INLINE void decodeBilinearPackedTexels( const uint8_t* texel00,
+                                                   const uint8_t* texel10,
+                                                   const uint8_t* texel01,
+                                                   const uint8_t* texel11,
+                                                   Sample&        t00,
+                                                   Sample&        t10,
+                                                   Sample&        t01,
+                                                   Sample&        t11 )
+{
+    t00 = decodePackedChannels<Sample, NumChannels, Channel>( texel00 );
+    t10 = decodePackedChannels<Sample, NumChannels, Channel>( texel10 );
+    t01 = decodePackedChannels<Sample, NumChannels, Channel>( texel01 );
+    t11 = decodePackedChannels<Sample, NumChannels, Channel>( texel11 );
+}
+
+template <class Sample, uint32_t NumChannels>
+HIP_DEMAND_INLINE void decodeBilinearHalfTexels( const uint8_t* texel00,
+                                                 const uint8_t* texel10,
+                                                 const uint8_t* texel01,
+                                                 const uint8_t* texel11,
+                                                 Sample&        t00,
+                                                 Sample&        t10,
+                                                 Sample&        t01,
+                                                 Sample&        t11 )
+{
+    t00 = decodeHalfChannels<Sample, NumChannels>( texel00 );
+    t10 = decodeHalfChannels<Sample, NumChannels>( texel10 );
+    t01 = decodeHalfChannels<Sample, NumChannels>( texel01 );
+    t11 = decodeHalfChannels<Sample, NumChannels>( texel11 );
+}
+
+template <class Sample, uint32_t NumChannels>
+HIP_DEMAND_INLINE void decodeBilinearTexelsChannels( hipArray_Format format,
+                                                     const uint8_t* texel00,
+                                                     const uint8_t* texel10,
+                                                     const uint8_t* texel01,
+                                                     const uint8_t* texel11,
+                                                     Sample&        t00,
+                                                     Sample&        t10,
+                                                     Sample&        t01,
+                                                     Sample&        t11 )
+{
+    switch( format )
+    {
+        case HIP_AD_FORMAT_UNSIGNED_INT8:
+            return decodeBilinearPackedTexels<Sample, NumChannels, uint8_t>( texel00, texel10, texel01, texel11,
+                                                                              t00, t10, t01, t11 );
+        case HIP_AD_FORMAT_SIGNED_INT8:
+            return decodeBilinearPackedTexels<Sample, NumChannels, int8_t>( texel00, texel10, texel01, texel11,
+                                                                             t00, t10, t01, t11 );
+        case HIP_AD_FORMAT_UNSIGNED_INT16:
+            return decodeBilinearPackedTexels<Sample, NumChannels, uint16_t>( texel00, texel10, texel01, texel11,
+                                                                               t00, t10, t01, t11 );
+        case HIP_AD_FORMAT_SIGNED_INT16:
+            return decodeBilinearPackedTexels<Sample, NumChannels, int16_t>( texel00, texel10, texel01, texel11,
+                                                                              t00, t10, t01, t11 );
+        case HIP_AD_FORMAT_UNSIGNED_INT32:
+            return decodeBilinearPackedTexels<Sample, NumChannels, uint32_t>( texel00, texel10, texel01, texel11,
+                                                                               t00, t10, t01, t11 );
+        case HIP_AD_FORMAT_SIGNED_INT32:
+            return decodeBilinearPackedTexels<Sample, NumChannels, int32_t>( texel00, texel10, texel01, texel11,
+                                                                              t00, t10, t01, t11 );
+        case HIP_AD_FORMAT_HALF:
+            return decodeBilinearHalfTexels<Sample, NumChannels>( texel00, texel10, texel01, texel11, t00, t10,
+                                                                   t01, t11 );
+        case HIP_AD_FORMAT_FLOAT:
+            return decodeBilinearPackedTexels<Sample, NumChannels, float>( texel00, texel10, texel01, texel11,
+                                                                            t00, t10, t01, t11 );
+        default:
+            t00 = t10 = t01 = t11 = Sample{};
+    }
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE void decodeBilinearTexels( const DeviceTextureInfo& texture,
+                                             const uint8_t*          texel00,
+                                             const uint8_t*          texel10,
+                                             const uint8_t*          texel01,
+                                             const uint8_t*          texel11,
+                                             Sample&                 t00,
+                                             Sample&                 t10,
+                                             Sample&                 t01,
+                                             Sample&                 t11 )
+{
+    switch( texture.numChannels )
+    {
+        case 1:
+            return decodeBilinearTexelsChannels<Sample, 1>( texture.format, texel00, texel10, texel01, texel11,
+                                                             t00, t10, t01, t11 );
+        case 2:
+            return decodeBilinearTexelsChannels<Sample, 2>( texture.format, texel00, texel10, texel01, texel11,
+                                                             t00, t10, t01, t11 );
+        case 3:
+            return decodeBilinearTexelsChannels<Sample, 3>( texture.format, texel00, texel10, texel01, texel11,
+                                                             t00, t10, t01, t11 );
+        case 4:
+            return decodeBilinearTexelsChannels<Sample, 4>( texture.format, texel00, texel10, texel01, texel11,
+                                                             t00, t10, t01, t11 );
+        default:
+            t00 = t10 = t01 = t11 = Sample{};
+    }
+}
+
 template <class Sample>
 HIP_DEMAND_INLINE Sample
 fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, const DeviceMipLevel& mip, int x, int y, bool& resident )
@@ -348,10 +452,8 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
             resident = page00 && page10 && page01 && page11;
             if( resident )
             {
-                t00 = decodeTexel<Sample>( page00 + offset00, texture.format, texture.numChannels );
-                t10 = decodeTexel<Sample>( page10 + offset10, texture.format, texture.numChannels );
-                t01 = decodeTexel<Sample>( page01 + offset01, texture.format, texture.numChannels );
-                t11 = decodeTexel<Sample>( page11 + offset11, texture.format, texture.numChannels );
+                decodeBilinearTexels( texture, page00 + offset00, page10 + offset10, page01 + offset01,
+                                      page11 + offset11, t00, t10, t01, t11 );
             }
             return;
         }
@@ -368,10 +470,8 @@ HIP_DEMAND_INLINE void fetchBilinearTexels( const DeviceContext&     context,
         recordRequest( context, resourceId );
 
     const uint8_t* page = context.pageMemory.ptr + static_cast<size_t>( pageId ) * context.pageSize;
-    t00                 = decodeTexel<Sample>( page + offset00, texture.format, texture.numChannels );
-    t10                 = decodeTexel<Sample>( page + offset10, texture.format, texture.numChannels );
-    t01                 = decodeTexel<Sample>( page + offset01, texture.format, texture.numChannels );
-    t11                 = decodeTexel<Sample>( page + offset11, texture.format, texture.numChannels );
+    decodeBilinearTexels( texture, page + offset00, page + offset10, page + offset01, page + offset11, t00, t10,
+                          t01, t11 );
 }
 
 template <class Sample>
