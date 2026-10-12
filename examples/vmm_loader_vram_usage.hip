@@ -67,7 +67,7 @@ __device__ void renderGridPixel( const hip_demand::vmm::DeviceContext& context, 
     const uint32_t localY     = y - cellY0;
 
     const uint32_t textureResourceId = context.resourceTable.textureInfos.getResourceId( textureId );
-    if( !hip_demand::vmm::isResourceResident( context, textureResourceId ) )
+    if( !hip_demand::vmm::checkBitSet( context.residenceBits, textureResourceId ) )
     {
         bool resident = false;
         hip_demand::vmm::tex2DLod<float3>( context, textureId, 0.5f, 0.5f, 0.0f, resident );

@@ -13,18 +13,14 @@ namespace hip_demand::vmm {
 
 HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t resourceId )
 {
-// #if defined( HIP_ENABLE_WARP_SYNC_BUILTINS )
-//     const uint64_t activeLanes   = __activemask();
-//     const uint64_t matchingLanes = __match_any_sync( activeLanes, resourceId );
-//     const uint32_t leaderLane    = static_cast<uint32_t>( __ffsll( static_cast<long long>( matchingLanes ) ) - 1 );
-//     if( static_cast<uint32_t>( __lane_id() ) != leaderLane )
-//         return;
-// #endif
+    const uint64_t activeLanes   = __activemask();
+    const uint64_t matchingLanes = __match_any_sync( activeLanes, resourceId );
+    const uint32_t leaderLane    = static_cast<uint32_t>( __ffsll( static_cast<long long>( matchingLanes ) ) - 1 );
+    if( static_cast<uint32_t>( __lane_id() ) != leaderLane )
+        return;
 
     atomicSetBit( context.referenceBits, resourceId );
 }
-HIP_DEMAND_INLINE bool isResourceResident( const DeviceContext& context, uint32_t resourceId ) { return checkBitSet(context.residenceBits, resourceId); }
-
 HIP_DEMAND_INLINE int wrapCoordinate( int coordinate, int extent )
 {
     coordinate %= extent;
@@ -101,9 +97,11 @@ HIP_DEMAND_INLINE float decodeChannelValue( float value )
     return value;
 }
 
-template <class Sample, uint32_t NumChannels, class Vector>
-HIP_DEMAND_INLINE Sample decodeVectorTexel( const Vector& value )
+template <class Sample, uint32_t NumChannels, class Channel>
+HIP_DEMAND_INLINE Sample decodePackedChannels( const uint8_t* texel )
 {
+    using PackedChannels       = HIP_vector_type<Channel, NumChannels>;
+    const PackedChannels value = *reinterpret_cast<const PackedChannels*>( texel );
     const float x = decodeChannelValue( value.x );
     if constexpr( std::is_same<Sample, float>::value )
         return x;
@@ -132,14 +130,6 @@ HIP_DEMAND_INLINE Sample decodeVectorTexel( const Vector& value )
                 static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
         }
     }
-}
-
-template <class Sample, uint32_t NumChannels, class Channel>
-HIP_DEMAND_INLINE Sample decodePackedChannels( const uint8_t* texel )
-{
-    using PackedChannels       = HIP_vector_type<Channel, NumChannels>;
-    const PackedChannels value = *reinterpret_cast<const PackedChannels*>( texel );
-    return decodeVectorTexel<Sample, NumChannels>( value );
 }
 
 template <class Sample, uint32_t NumChannels>
@@ -429,7 +419,7 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, cons
     }
 
     const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
-    resident                  = isResourceResident( context, resourceId );
+    resident                  = checkBitSet( context.residenceBits, resourceId );
     if( !resident )
     {
         recordRequest( context, resourceId );
@@ -448,7 +438,7 @@ fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, cons
 HIP_DEMAND_INLINE uint8_t* resolveTexturePage( const DeviceContext& context, uint32_t pageId )
 {
     const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
-    const bool     resident   = isResourceResident( context, resourceId );
+    const bool     resident   = checkBitSet( context.residenceBits, resourceId );
     if( !resident || context.requestIfResident )
         recordRequest( context, resourceId );
 
@@ -589,6 +579,36 @@ sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, 
 }
 
 template <class Sample>
+HIP_DEMAND_INLINE Sample tex2DLodFromInfo( const DeviceContext& context, const DeviceTextureInfo& texture, float x, float y, float lod, bool& resident )
+{
+    lod = std::clamp( lod, 0.0f, static_cast<float>( texture.mipCount - 1 ) );
+    if( texture.mipmapFilterMode == hipFilterModePoint )
+    {
+        const uint32_t mipLevel = static_cast<uint32_t>( std::floorf( lod + 0.5f ) );
+        return sampleMipLevel<Sample>( context, texture, mipLevel, x, y, resident );
+    }
+
+    const uint32_t mipLevel0 = static_cast<uint32_t>( std::floorf( lod ) );
+    const uint32_t mipLevel1 = mipLevel0 + 1 < texture.mipCount ? mipLevel0 + 1 : mipLevel0;
+    const float    t         = lod - static_cast<float>( mipLevel0 );
+
+    bool         resident0 = false;
+    const Sample sample0   = sampleMipLevel<Sample>( context, texture, mipLevel0, x, y, resident0 );
+    // The next mip level cannot affect an exact-level sample or its residency.
+    if( mipLevel0 == mipLevel1 || t == 0.0f )
+    {
+        resident = resident0;
+        return sample0;
+    }
+
+    bool         resident1 = false;
+    const Sample sample1   = sampleMipLevel<Sample>( context, texture, mipLevel1, x, y, resident1 );
+
+    resident = resident0 && resident1;
+    return ( 1.0f - t ) * sample0 + t * sample1;
+}
+
+template <class Sample>
 HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& resident )
 {
     resident = false;
@@ -601,7 +621,6 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
     // no need to check isResourceResident if we could just try to load texture info and check if it's null
     // const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
     // resident                  = isResourceResident( context, resourceId );
-
     const DeviceTextureInfo* texture = context.textureInfos.ptr[textureId];
     if( !texture )
     {
@@ -613,33 +632,7 @@ HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textur
         recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
     }
 
-    resident = true;
-
-    lod = std::clamp( lod, 0.0f, static_cast<float>( texture->mipCount - 1 ) );
-    if( texture->mipmapFilterMode == hipFilterModePoint )
-    {
-        const uint32_t mipLevel = static_cast<uint32_t>( std::floorf( lod + 0.5f ) );
-        return sampleMipLevel<Sample>( context, *texture, mipLevel, x, y, resident );
-    }
-
-    const uint32_t mipLevel0 = static_cast<uint32_t>( std::floorf( lod ) );
-    const uint32_t mipLevel1 = mipLevel0 + 1 < texture->mipCount ? mipLevel0 + 1 : mipLevel0;
-    const float    t         = lod - static_cast<float>( mipLevel0 );
-
-    bool         resident0 = false;
-    const Sample sample0   = sampleMipLevel<Sample>( context, *texture, mipLevel0, x, y, resident0 );
-    // The next mip level cannot affect an exact-level sample or its residency.
-    if( mipLevel0 == mipLevel1 || t == 0.0f )
-    {
-        resident = resident0;
-        return sample0;
-    }
-
-    bool         resident1 = false;
-    const Sample sample1   = sampleMipLevel<Sample>( context, *texture, mipLevel1, x, y, resident1 );
-
-    resident = resident0 && resident1;
-    return ( 1.0f - t ) * sample0 + t * sample1;
+    return tex2DLodFromInfo<Sample>( context, *texture, x, y, lod, resident );
 }
 
 // TODO_BS: this implementation is generated by chatGPT. I'll need to do more research about it
@@ -653,22 +646,23 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
         return Sample{};
     }
 
-    const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
-    resident = isResourceResident( context, resourceId );
-    if( !resident )
+    // no need to check isResourceResident if we could just try to load texture info and check if it's null
+    // const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
+    // resident                  = isResourceResident( context, resourceId );
+    const DeviceTextureInfo* texture = context.textureInfos.ptr[textureId];
+    if( !texture )
     {
-        recordRequest( context, resourceId );
+        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
         return Sample{};
     }
-    else if (context.requestIfResident)
+    else if( context.requestIfResident )
     {
-        recordRequest( context, resourceId );
+        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
     }
 
-    const DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
-    if( texture.normalizedCoords )
+    if( texture->normalizedCoords )
     {
-        const DeviceMipLevel baseMip = texture.getMipLevel( 0 );
+        const DeviceMipLevel baseMip = texture->getMipLevel( 0 );
         ddx.x *= static_cast<float>( baseMip.width );
         ddx.y *= static_cast<float>( baseMip.height );
         ddy.x *= static_cast<float>( baseMip.width );
@@ -680,7 +674,7 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
     const float footprintSquared  = fmaxf( footprintXSquared, footprintYSquared );
     const float lod               = 0.5f * log2f( fmaxf( footprintSquared, 1.0f ) );
 
-    return tex2DLod<Sample>( context, textureId, x, y, lod, resident );
+    return tex2DLodFromInfo<Sample>( context, *texture, x, y, lod, resident );
 }
 
 template <class Sample>

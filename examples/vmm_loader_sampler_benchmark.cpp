@@ -1,5 +1,6 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 
+#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "vmm_loader_common.h"
 
 #include <array>
@@ -16,15 +17,18 @@ namespace {
 
 using namespace vmm_loader_example;
 
-constexpr uint32_t outputWidth     = 3840;
-constexpr uint32_t outputHeight    = 2160;
-constexpr uint32_t blockWidth      = 16;
-constexpr uint32_t blockHeight     = 16;
-constexpr uint32_t outputChannels  = 4;
-constexpr uint32_t maxWarmupPasses = 256;
-constexpr uint32_t callCount       = 1000;
-constexpr uint32_t batchSize       = 10;
-constexpr float    mipLevel        = 0.0f;
+constexpr uint32_t             outputWidth          = 3840;
+constexpr uint32_t             outputHeight         = 2160;
+constexpr uint32_t             blockWidth           = 16;
+constexpr uint32_t             blockHeight          = 16;
+constexpr uint32_t             outputChannels       = 4;
+constexpr uint32_t             maxWarmupPasses      = 256;
+constexpr uint32_t             callCount            = 5000;
+constexpr uint32_t             batchSize            = 10;
+constexpr hipTextureFilterMode mipmapFilterMode     = hipFilterModeLinear;
+constexpr float                mipLevel             = 0.5f;
+constexpr bool                 saveOutputImages     = true;
+constexpr bool                 includeOver4kImages = true;
 
 struct BenchmarkTimes
 {
@@ -304,7 +308,7 @@ class HipMipmappedTexture
         textureDesc.filterMode          = hipFilterModeLinear;
         textureDesc.readMode            = readMode;
         textureDesc.normalizedCoords    = 1;
-        textureDesc.mipmapFilterMode    = hipFilterModePoint;
+        textureDesc.mipmapFilterMode    = mipmapFilterMode;
         textureDesc.minMipmapLevelClamp = 0.0f;
         textureDesc.maxMipmapLevelClamp = static_cast<float>( mipLevelCount - 1 );
         HIP_CHECK( hipCreateTextureObject( &texture_, &resourceDesc, &textureDesc, nullptr ) );
@@ -379,7 +383,10 @@ float measureQueuedRenderCalls( hipStream_t stream, uint32_t callCount, uint32_t
     return timer.stop( stream );
 }
 
-BenchmarkTimes benchmarkTex2DLod( const fs::path& executableDir, const std::shared_ptr<hip_demand::ImageSource>& image )
+BenchmarkTimes benchmarkTex2DLod( const fs::path&                                 executableDir,
+                                  const std::shared_ptr<hip_demand::ImageSource>& image,
+                                  const fs::path&                                 vmmOutputPath,
+                                  const fs::path&                                 nativeOutputPath )
 {
     using namespace hip_demand::vmm;
 
@@ -413,7 +420,7 @@ BenchmarkTimes benchmarkTex2DLod( const fs::path& executableDir, const std::shar
         descriptor.addressMode[0]   = hipAddressModeClamp;
         descriptor.addressMode[1]   = hipAddressModeClamp;
         descriptor.filterMode       = hipFilterModeLinear;
-        descriptor.mipmapFilterMode = hipFilterModePoint;
+        descriptor.mipmapFilterMode = mipmapFilterMode;
         descriptor.normalizedCoords = true;
         loader->createTexture( image, descriptor );
 
@@ -428,6 +435,8 @@ BenchmarkTimes benchmarkTex2DLod( const fs::path& executableDir, const std::shar
 
         const auto launchVmm  = [&] { launchVmmKernel( context ); };
         times.vmmMilliseconds = measureQueuedRenderCalls( gpu.stream, callCount, batchSize, launchVmm );
+        if( saveOutputImages )
+            saveGpuOutput( vmmOutputPath, gpu.stream, gpu.output, renderWidth, renderHeight, outputChannels );
     }
 
     {
@@ -442,13 +451,22 @@ BenchmarkTimes benchmarkTex2DLod( const fs::path& executableDir, const std::shar
         launchHip();
         HIP_CHECK( hipStreamSynchronize( gpu.stream ) );
         times.nativeMilliseconds = measureQueuedRenderCalls( gpu.stream, callCount, batchSize, launchHip );
+        if( saveOutputImages )
+            saveGpuOutput( nativeOutputPath, gpu.stream, gpu.output, renderWidth, renderHeight, outputChannels );
     }
     return times;
+}
+
+fs::path makeOutputPath( const fs::path& outputDir, const fs::path& imagePath, const fs::path& imageDir, const char* samplerName )
+{
+    const fs::path relativePath = imagePath.lexically_relative( imageDir );
+    return outputDir / relativePath.parent_path() / ( relativePath.filename().string() + '_' + samplerName + ".png" );
 }
 
 ImageResult benchmarkImage( const fs::path& imagePath,
                             const fs::path& imageDir,
                             const fs::path& executableDir,
+                            const fs::path& outputDir,
                             uint32_t        maxWidth,
                             uint32_t        maxHeight,
                             size_t          index,
@@ -456,7 +474,7 @@ ImageResult benchmarkImage( const fs::path& imagePath,
 {
     ImageResult result{};
     result.name = imagePath.lexically_relative( imageDir ).string();
-    std::cout << "Rendering [" << index + 1 << '/' << total << "] " << result.name << " ... " << std::flush;
+    std::cout << "Rendering [" << index + 1 << '/' << total << "] " << result.name << '\n';
 
     try
     {
@@ -473,7 +491,12 @@ ImageResult benchmarkImage( const fs::path& imagePath,
         }
         else
         {
-            result.times  = benchmarkTex2DLod( executableDir, image );
+            const fs::path vmmOutputPath    = makeOutputPath( outputDir, imagePath, imageDir, "vmm" );
+            const fs::path nativeOutputPath = makeOutputPath( outputDir, imagePath, imageDir, "native" );
+            if( saveOutputImages )
+                fs::create_directories( vmmOutputPath.parent_path() );
+
+            result.times  = benchmarkTex2DLod( executableDir, image, vmmOutputPath, nativeOutputPath );
             result.status = ResultStatus::completed;
         }
     }
@@ -485,13 +508,13 @@ ImageResult benchmarkImage( const fs::path& imagePath,
     switch( result.status )
     {
         case ResultStatus::completed:
-            std::cout << "done\n";
+            std::cout << "  Status: done\n";
             break;
         case ResultStatus::skipped:
-            std::cout << "SKIPPED\n";
+            std::cout << "  Status: SKIPPED\n";
             break;
         case ResultStatus::failed:
-            std::cout << "FAILED\n";
+            std::cout << "  Status: FAILED\n";
             break;
     }
     return result;
@@ -579,7 +602,9 @@ int main( int argc, char** argv )
     {
         const fs::path executableDir = fs::absolute( fs::path{ argv[0] } ).parent_path();
         fs::path       imageDir      = fs::path{ TEST_IMAGES_DIR };
+        fs::path       outputDir     = fs::absolute( "vmm_loader_sampler_benchmark_output" );
         imageDir.make_preferred();
+        outputDir.make_preferred();
 
         HIP_CHECK( hipSetDevice( 0 ) );
         hipDeviceProp_t deviceProperties{};
@@ -591,10 +616,13 @@ int main( int argc, char** argv )
             static_cast<uint32_t>( deviceProperties.maxTexture2DMipmap[1] > 0 ? deviceProperties.maxTexture2DMipmap[1] :
                                                                                 deviceProperties.maxTexture2D[1] );
 
-        const std::vector<fs::path> imagePaths = findImages( imageDir, true, true );
+        const std::vector<fs::path> imagePaths = findImages( imageDir, includeOver4kImages, true );
         std::cout << "VMM loader sampler benchmark\n"
                   << "  Input: " << imageDir.string() << '\n'
-                  << "  Files: " << imagePaths.size() << '\n'
+                  << "  Save rendered images: " << ( saveOutputImages ? "yes" : "no" ) << '\n';
+        if( saveOutputImages )
+            std::cout << "  Output: " << outputDir.string() << '\n';
+        std::cout << "  Files: " << imagePaths.size() << '\n'
                   << "  Rendering: " << outputWidth << 'x' << outputHeight << ", mip " << mipLevel << ", " << callCount
                   << " calls per sampler\n"
                   << "  Times are total GPU times after warm-up\n";
@@ -606,8 +634,8 @@ int main( int argc, char** argv )
         size_t failed    = 0;
         for( size_t imageIndex = 0; imageIndex < imagePaths.size(); ++imageIndex )
         {
-            ImageResult result = benchmarkImage( imagePaths[imageIndex], imageDir, executableDir, maxWidth, maxHeight,
-                                                 imageIndex, imagePaths.size() );
+            ImageResult result = benchmarkImage( imagePaths[imageIndex], imageDir, executableDir, outputDir, maxWidth,
+                                                 maxHeight, imageIndex, imagePaths.size() );
             switch( result.status )
             {
                 case ResultStatus::completed:
