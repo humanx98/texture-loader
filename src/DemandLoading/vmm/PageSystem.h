@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <mutex>
-#include <functional>
+#include <vector>
 
 namespace hip_demand::vmm {
 
@@ -26,7 +26,6 @@ struct PageTable
         }
     };
 
-    Range textureInfos{};
     Range textureTiles{};
 };
 
@@ -36,7 +35,7 @@ class PageSystem : NonCopyble
     explicit PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages );
     ~PageSystem();
     void map( uint32_t pageId );
-    void enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, uint32_t reusablePageCount, std::function<void( uint32_t )> callback );
+    void enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, uint32_t reusablePageCount );
 
     DeviceSpan<uint8_t> page( uint32_t pageId ) const
     {

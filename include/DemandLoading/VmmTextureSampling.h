@@ -6,6 +6,7 @@
 #include <cmath>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
+#include <limits>
 #include <type_traits>
 
 
@@ -21,6 +22,99 @@ HIP_DEMAND_INLINE void recordRequest( const DeviceContext& context, uint32_t res
 
     atomicSetBit( context.referenceBits, resourceId );
 }
+
+HIP_DEMAND_INLINE bool referenceResource( const DeviceContext& context, uint32_t resourceId, bool resident )
+{
+    if( !resident || context.requestIfResident )
+        recordRequest( context, resourceId );
+    return resident;
+}
+
+HIP_DEMAND_INLINE uint32_t loadPageResidenceWord( const DeviceContext& context, uint32_t pageId )
+{
+    return context.residenceBits.ptr[context.resourceTable.textureTiles.getResourceId( pageId ) >> 5];
+}
+
+HIP_DEMAND_INLINE bool referencePage( const DeviceContext& context, uint32_t pageId, uint32_t residenceWord )
+{
+    const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
+    return referenceResource( context, resourceId, ( residenceWord >> ( resourceId & 31u ) ) & 1u );
+}
+
+HIP_DEMAND_INLINE bool referencePage( const DeviceContext& context, uint32_t pageId )
+{
+    return referencePage( context, pageId, loadPageResidenceWord( context, pageId ) );
+}
+
+// The page size is a power of two, so page offsets are computed with shifts.
+HIP_DEMAND_INLINE uint32_t pageSizeShift( const DeviceContext& context )
+{
+    return static_cast<uint32_t>( __builtin_ctzll( context.pageSize ) );
+}
+
+HIP_DEMAND_INLINE void referenceTextureInfo( const DeviceContext& context, uint32_t textureId )
+{
+    if( context.requestIfResident )
+        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
+}
+
+// Reads a value from device global memory through a global address space pointer. A generic pointer loaded from memory
+// can only be read with flat loads, which the compiler never turns into scalar loads, even for wave-uniform addresses.
+template <class T>
+HIP_DEMAND_INLINE T loadGlobal( const T* pointer )
+{
+    static_assert( std::is_trivially_copyable<T>::value && sizeof( T ) % sizeof( uint32_t ) == 0,
+                   "loadGlobal copies whole 32-bit words" );
+    using GlobalWord = const __attribute__( ( address_space( 1 ) ) ) uint32_t;
+
+    constexpr uint32_t wordCount = sizeof( T ) / sizeof( uint32_t );
+    GlobalWord*        source    = (GlobalWord*)pointer;
+    uint32_t           words[wordCount];
+    for( uint32_t word = 0; word < wordCount; ++word )
+        words[word] = source[word];
+
+    T value;
+    __builtin_memcpy( &value, words, sizeof( T ) );
+    return value;
+}
+
+// Texture metadata as read by the sampler: a local copy of the descriptor plus the location of the per-level page
+// descriptors, which are loaded only for the sampled levels.
+//
+// Metadata from the loader lives in global memory and is not written while kernels run. The sampler reads all of it
+// before referencing any resource: the compiler cannot prove that memory read after an atomic is unchanged, and would
+// then fall back from scalar to vector loads for wave-uniform textures.
+struct TextureMetadata
+{
+    DeviceTextureInfo info;
+    const uint32_t*   mips = nullptr;
+
+    HIP_DEMAND_INLINE DeviceMipLevel mipLevel( uint32_t level ) const
+    {
+        // info.mips must not be indexed.
+        // The page descriptor is read from global memory rather than from the local copy in info.mips. That copy
+        // lives in registers, and a register array cannot be indexed by a runtime value: the compiler would store the
+        // whole array to scratch memory and read the entry back through it, on every sample. A direct load of the one
+        // entry is a single scalar load for a wave-uniform level. The copy of info.mips is never read, so the compiler
+        // drops those loads from loadGlobal() and nothing is loaded twice.
+        return info.getMipLevel( level, loadGlobal( mips + level ) );
+    }
+};
+
+// Reads a texture's metadata and reports whether it is resident, requesting it otherwise. The metadata array is
+// always allocated, so the descriptor is read first; it is resident once the loader has copied it, which is visible
+// as a non-zero width because the copy and every kernel that can read it are ordered on the same stream.
+HIP_DEMAND_INLINE TextureMetadata loadTextureMetadata( const DeviceContext& context, uint32_t textureId, bool& resident )
+{
+    const DeviceTextureInfo* texture  = context.textureInfos.ptr + textureId;
+    const TextureMetadata    metadata = { loadGlobal( texture ), texture->mips };
+
+    resident = metadata.info.width != 0;
+    if( !resident )
+        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
+    return metadata;
+}
+
 HIP_DEMAND_INLINE int wrapCoordinate( int coordinate, int extent )
 {
     coordinate %= extent;
@@ -64,609 +158,523 @@ HIP_DEMAND_INLINE int2 applyAddressModePair( int coordinate0, int coordinate1, i
     }
 }
 
-HIP_DEMAND_INLINE float decodeChannelValue( uint8_t value )
+// ---------------------------------------------------------------------------------------------------------------------
+// Footprints
+//
+// A footprint holds the page and in-page byte offset of every texel a filter reads from one mip level. Footprints are
+// computed for all mip levels of a sample before any memory access, so that residence checks and texel loads of
+// different levels are issued together instead of as a chain of dependent loads.
+// ---------------------------------------------------------------------------------------------------------------------
+
+template <uint32_t NumTaps>
+struct Footprint
 {
-    return value * ( 1.0f / 255.0f );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( int8_t value )
+    static constexpr uint32_t numTaps = NumTaps;
+
+    uint32_t pageId[NumTaps];
+    uint32_t texelOffset[NumTaps];  // Low 32 bits of the byte offset from the texture's first page; see texelOffsetInTexture().
+    bool  singlePage = true;  // All taps are in pageId[0].
+    float fracX      = 0.0f;  // Bilinear weights of the right column and the bottom row.
+    float fracY      = 0.0f;
+};
+
+using PointFootprint    = Footprint<1>;
+using BilinearFootprint = Footprint<4>;
+
+// Texel addresses are kept as 32-bit offsets from the texture's first page, so that loads can use a wave-uniform base
+// address with a 32-bit per-lane offset instead of 64-bit address arithmetic per tap. For a texture whose pages span
+// more than 4 GiB (DeviceTextureInfo::wideOffsets) the upper 32 bits are recovered from the page id when filtering.
+HIP_DEMAND_INLINE uint32_t texelOffsetInTexture( const DeviceTextureInfo& texture, uint32_t pageShift, uint32_t pageId, uint32_t byteOffset )
 {
-    return fmaxf( -1.0f, value * ( 1.0f / 127.0f ) );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( uint16_t value )
-{
-    return value * ( 1.0f / 65535.0f );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( int16_t value )
-{
-    return fmaxf( -1.0f, value * ( 1.0f / 32767.0f ) );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( uint32_t value )
-{
-    return static_cast<float>( value ) * ( 1.0f / 4294967295.0f );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( int32_t value )
-{
-    return fmaxf( -1.0f, static_cast<float>( value ) * ( 1.0f / 2147483647.0f ) );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( __half value )
-{
-    return __half2float( value );
-}
-HIP_DEMAND_INLINE float decodeChannelValue( float value )
-{
-    return value;
+    return ( ( pageId - texture.startPage ) << pageShift ) + byteOffset;
 }
 
-template <class Sample, uint32_t NumChannels, class Channel>
-HIP_DEMAND_INLINE Sample decodePackedChannels( const uint8_t* texel )
+// Texel address for the low offset bits in a footprint. The in-page offset never carries into the page bits, so the
+// upper 32 bits of the full offset are simply the upper bits of the page offset.
+template <bool Wide>
+HIP_DEMAND_INLINE const uint8_t* texelAddress( const uint8_t*           textureMemory,
+                                               const DeviceTextureInfo& texture,
+                                               uint32_t                 pageShift,
+                                               uint32_t                 pageId,
+                                               uint32_t                 texelOffset )
 {
-    using PackedChannels       = HIP_vector_type<Channel, NumChannels>;
-    const PackedChannels value = *reinterpret_cast<const PackedChannels*>( texel );
-    const float x = decodeChannelValue( value.x );
-    if constexpr( std::is_same<Sample, float>::value )
-        return x;
-    else
+    if constexpr( Wide )
     {
-        float y = 0.0f;
-        if constexpr( NumChannels > 1 )
-            y = decodeChannelValue( value.y );
-        if constexpr( std::is_same<Sample, float2>::value )
-            return make_float2( x, y );
-        else
+        const size_t high = static_cast<size_t>( ( pageId - texture.startPage ) >> ( 32 - pageShift ) );
+        return textureMemory + ( ( high << 32 ) | texelOffset );
+    }
+    else
+        return textureMemory + texelOffset;
+}
+
+HIP_DEMAND_INLINE float2 texelCoordinates( const DeviceTextureInfo& texture, const DeviceMipLevel& mip, float x, float y )
+{
+    if( texture.normalizedCoords() )
+        return make_float2( x * static_cast<float>( mip.width ), y * static_cast<float>( mip.height ) );
+    return make_float2( x, y );
+}
+
+HIP_DEMAND_INLINE PointFootprint
+makePointFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& mip, uint32_t pageShift, float x, float y )
+{
+    const float2   coords = texelCoordinates( texture, mip, x, y );
+    const uint32_t texelX = static_cast<uint32_t>(
+        applyAddressMode( static_cast<int>( floorf( coords.x ) ), static_cast<int>( mip.width ), texture.addressMode( 0 ) ) );
+    const uint32_t texelY = static_cast<uint32_t>(
+        applyAddressMode( static_cast<int>( floorf( coords.y ) ), static_cast<int>( mip.height ), texture.addressMode( 1 ) ) );
+
+    uint32_t pageId = texture.mipTailPage;
+    // Within the page, so it fits 32 bits: a mip tail level is at most one page.
+    uint32_t byteOffset = mip.mipTailOffset + ( texelY * mip.width + texelX ) * texture.bytesPerTexel();
+    if( !mip.mipTail )
+    {
+        const uint2 tile  = texture.getTileCoords( texelX, texelY );
+        const uint2 local = texture.getLocalCoords( texelX, texelY );
+        pageId            = mip.startPage + tile.y * mip.tilesX + tile.x;
+        byteOffset        = ( local.y * texture.tileWidth() + local.x ) * texture.bytesPerTexel();
+    }
+
+    PointFootprint footprint{};
+    footprint.pageId[0]      = pageId;
+    footprint.texelOffset[0] = texelOffsetInTexture( texture, pageShift, pageId, byteOffset );
+    return footprint;
+}
+
+HIP_DEMAND_INLINE BilinearFootprint
+makeBilinearFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& mip, uint32_t pageShift, float x, float y )
+{
+    const float2 coords = texelCoordinates( texture, mip, x, y );
+    const float fx     = coords.x - 0.5f;
+    const float fy     = coords.y - 0.5f;
+    const float floorX = floorf( fx );
+    const float floorY = floorf( fy );
+    int         x0     = static_cast<int>( floorX );
+    int         y0     = static_cast<int>( floorY );
+
+    BilinearFootprint footprint{};
+    footprint.fracX = fx - floorX;
+    footprint.fracY = fy - floorY;
+
+    const uint32_t bytesPerTexel = texture.bytesPerTexel();
+    const bool     footprintInBounds =
+        x0 >= 0 && y0 >= 0 && static_cast<uint32_t>( x0 ) + 1 < mip.width && static_cast<uint32_t>( y0 ) + 1 < mip.height;
+
+    // Fast path for four taps inside one tile: in-bounds coordinates need no address-mode handling.
+    if( !mip.mipTail && footprintInBounds )
+    {
+        const uint2 local = texture.getLocalCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
+        // The 2x2 footprint fits in one tile only if its top-left texel is before the last column and row.
+        if( local.x < texture.tileWidthMask() && local.y < texture.tileHeightMask() )
         {
-            float z = 0.0f;
-            if constexpr( NumChannels > 2 )
-                z = decodeChannelValue( value.z );
-            if constexpr( std::is_same<Sample, float3>::value )
-                return make_float3( x, y, z );
-            else if constexpr( std::is_same<Sample, float4>::value )
-            {
-                float w = 0.0f;
-                if constexpr( NumChannels > 3 )
-                    w = decodeChannelValue( value.w );
-                return make_float4( x, y, z, w );
-            }
-            else
-                static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
+            const uint2    tile     = texture.getTileCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
+            const uint32_t pageId   = mip.startPage + tile.y * mip.tilesX + tile.x;
+            const uint32_t rowBytes = texture.tileWidth() * bytesPerTexel;
+            const uint32_t offset   = local.y * rowBytes + local.x * bytesPerTexel;
+
+            const uint32_t texel00 = texelOffsetInTexture( texture, pageShift, pageId, offset );
+            footprint.pageId[0] = footprint.pageId[1] = footprint.pageId[2] = footprint.pageId[3] = pageId;
+            footprint.texelOffset[0]                                                              = texel00;
+            footprint.texelOffset[1] = texel00 + bytesPerTexel;
+            footprint.texelOffset[2] = texel00 + rowBytes;
+            footprint.texelOffset[3] = texel00 + rowBytes + bytesPerTexel;
+            return footprint;
         }
     }
+
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    if( !footprintInBounds )
+    {
+        const int2 xs = applyAddressModePair( x0, x1, static_cast<int>( mip.width ), texture.addressMode( 0 ) );
+        const int2 ys = applyAddressModePair( y0, y1, static_cast<int>( mip.height ), texture.addressMode( 1 ) );
+        x0            = xs.x;
+        x1            = xs.y;
+        y0            = ys.x;
+        y1            = ys.y;
+    }
+
+    if( mip.mipTail )
+    {
+        // The whole mip tail is one page with row-major levels.
+        const uint32_t rowBytes = mip.width * bytesPerTexel;
+        const uint32_t row0     = mip.mipTailOffset + static_cast<uint32_t>( y0 ) * rowBytes;
+        const uint32_t row1     = mip.mipTailOffset + static_cast<uint32_t>( y1 ) * rowBytes;
+        const uint32_t column0  = static_cast<uint32_t>( x0 ) * bytesPerTexel;
+        const uint32_t column1  = static_cast<uint32_t>( x1 ) * bytesPerTexel;
+
+        const uint32_t page = texelOffsetInTexture( texture, pageShift, texture.mipTailPage, 0 );
+        footprint.pageId[0] = footprint.pageId[1] = footprint.pageId[2] = footprint.pageId[3] = texture.mipTailPage;
+        footprint.texelOffset[0]                                                              = page + row0 + column0;
+        footprint.texelOffset[1]                                                              = page + row0 + column1;
+        footprint.texelOffset[2]                                                              = page + row1 + column0;
+        footprint.texelOffset[3]                                                              = page + row1 + column1;
+        return footprint;
+    }
+
+    // The footprint crosses a tile edge or the texture border and may touch up to four pages. Tile and in-tile
+    // coordinates are separable per axis, so those of the two corner taps (x0, y0) and (x1, y1) give the other two
+    // taps as well: tap (x1, y0) is in tile (tile11.x, tile00.y), tap (x0, y1) in tile (tile00.x, tile11.y).
+    const uint2    tile00   = texture.getTileCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
+    const uint2    tile11   = texture.getTileCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
+    const uint2    local00  = texture.getLocalCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
+    const uint2    local11  = texture.getLocalCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
+    const uint32_t rowBytes = texture.tileWidth() * bytesPerTexel;
+    const uint32_t row0     = local00.y * rowBytes;
+    const uint32_t row1     = local11.y * rowBytes;
+    const uint32_t column0  = local00.x * bytesPerTexel;
+    const uint32_t column1  = local11.x * bytesPerTexel;
+    const uint32_t pageRow0 = mip.startPage + tile00.y * mip.tilesX;
+    const uint32_t pageRow1 = mip.startPage + tile11.y * mip.tilesX;
+
+    footprint.pageId[0]      = pageRow0 + tile00.x;  // tap (x0, y0)
+    footprint.pageId[1]      = pageRow0 + tile11.x;  // tap (x1, y0)
+    footprint.pageId[2]      = pageRow1 + tile00.x;  // tap (x0, y1)
+    footprint.pageId[3]      = pageRow1 + tile11.x;  // tap (x1, y1)
+    footprint.texelOffset[0] = texelOffsetInTexture( texture, pageShift, footprint.pageId[0], row0 + column0 );
+    footprint.texelOffset[1] = texelOffsetInTexture( texture, pageShift, footprint.pageId[1], row0 + column1 );
+    footprint.texelOffset[2] = texelOffsetInTexture( texture, pageShift, footprint.pageId[2], row1 + column0 );
+    footprint.texelOffset[3] = texelOffsetInTexture( texture, pageShift, footprint.pageId[3], row1 + column1 );
+    footprint.singlePage     = tile00.x == tile11.x && tile00.y == tile11.y;
+    return footprint;
 }
 
-template <class Sample, uint32_t NumChannels>
-HIP_DEMAND_INLINE Sample decodeHalfChannels( const uint8_t* texel )
+// Checks and references every distinct page of a footprint, given the residence word of its first page.
+template <uint32_t NumTaps>
+HIP_DEMAND_INLINE bool referenceFootprint( const DeviceContext& context, const Footprint<NumTaps>& footprint, uint32_t residenceWord )
 {
-    const __half* channels = reinterpret_cast<const __half*>( texel );
-    const float   x        = decodeChannelValue( channels[0] );
-    if constexpr( std::is_same<Sample, float>::value )
-        return x;
-    else
+    bool resident = referencePage( context, footprint.pageId[0], residenceWord );
+    if( !footprint.singlePage )
     {
-        float y = 0.0f;
-        if constexpr( NumChannels > 1 )
-            y = decodeChannelValue( channels[1] );
-        if constexpr( std::is_same<Sample, float2>::value )
-            return make_float2( x, y );
-        else
+        for( uint32_t tap = 1; tap < NumTaps; ++tap )
         {
-            float z = 0.0f;
-            if constexpr( NumChannels > 2 )
-                z = decodeChannelValue( channels[2] );
-            if constexpr( std::is_same<Sample, float3>::value )
-                return make_float3( x, y, z );
-            else if constexpr( std::is_same<Sample, float4>::value )
-            {
-                float w = 0.0f;
-                if constexpr( NumChannels > 3 )
-                    w = decodeChannelValue( channels[3] );
-                return make_float4( x, y, z, w );
-            }
-            else
-                static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
+            bool repeated = false;
+            for( uint32_t previous = 0; previous < tap; ++previous )
+                repeated = repeated || footprint.pageId[previous] == footprint.pageId[tap];
+            if( !repeated )
+                resident = referencePage( context, footprint.pageId[tap] ) && resident;
         }
     }
+    return resident;
 }
 
-template <class Sample, uint32_t NumChannels>
-HIP_DEMAND_INLINE Sample decodeTexelChannels( const uint8_t* texel, hipArray_Format format )
+// ---------------------------------------------------------------------------------------------------------------------
+// Texel formats
+//
+// Texels are loaded as "filterable" floats and normalized once per sample. Unsigned normalized channels stay in integer
+// scale until then, which saves one multiply per channel and texel when filtering. Other formats are fully decoded on
+// load; signed channels must be clamped to -1 per texel, before blending.
+// ---------------------------------------------------------------------------------------------------------------------
+
+template <class Storage_>
+struct UnsignedNormalizedChannel
+{
+    using Storage                = Storage_;
+    static constexpr float scale = 1.0f / static_cast<float>( std::numeric_limits<Storage>::max() );
+
+    HIP_DEMAND_INLINE static float toFilterable( Storage value ) { return static_cast<float>( value ); }
+};
+
+template <class Storage_>
+struct SignedNormalizedChannel
+{
+    using Storage                = Storage_;
+    static constexpr float scale = 1.0f;
+
+    HIP_DEMAND_INLINE static float toFilterable( Storage value )
+    {
+        constexpr float inverseMax = 1.0f / static_cast<float>( std::numeric_limits<Storage>::max() );
+        return fmaxf( -1.0f, static_cast<float>( value ) * inverseMax );
+    }
+};
+
+struct HalfChannel
+{
+    using Storage                = unsigned short;
+    static constexpr float scale = 1.0f;
+
+    HIP_DEMAND_INLINE static float toFilterable( Storage value ) { return __half2float( __ushort_as_half( value ) ); }
+};
+
+struct FloatChannel
+{
+    using Storage                = float;
+    static constexpr float scale = 1.0f;
+
+    HIP_DEMAND_INLINE static float toFilterable( Storage value ) { return value; }
+};
+
+template <class Channel_, uint32_t NumChannels>
+struct TexelFormat
+{
+    using Channel = Channel_;
+    using Packed  = HIP_vector_type<typename Channel::Storage, NumChannels>;
+
+    using Storage = typename Channel::Storage;
+
+    // A 3-channel texel of 1- or 2-byte channels is loaded as one 4- or 8-byte word instead of three channel loads.
+    // The word extends 1 or 2 bytes past the texel, which is always inside the same page: a tile holds a power-of-two
+    // number of texels and the mip tail a multiple of 3 channels, and neither byte size can equal the page size.
+    static constexpr bool loadAsWord = NumChannels == 3 && sizeof( Storage ) <= 2;
+    using Word                       = std::conditional_t<sizeof( Storage ) == 1, uint32_t, uint64_t>;
+
+    // Channels missing from the format read as zero.
+    HIP_DEMAND_INLINE static float4 load( const uint8_t* texel )
+    {
+        if constexpr( loadAsWord )
+        {
+            Word word;
+            __builtin_memcpy( &word, texel, sizeof( Word ) );
+            return make_float4( Channel::toFilterable( static_cast<Storage>( word ) ),
+                                Channel::toFilterable( static_cast<Storage>( word >> ( 8 * sizeof( Storage ) ) ) ),
+                                Channel::toFilterable( static_cast<Storage>( word >> ( 16 * sizeof( Storage ) ) ) ), 0.0f );
+        }
+        else
+        {
+            const Packed packed = *reinterpret_cast<const Packed*>( texel );
+            float4       value  = make_float4( Channel::toFilterable( packed.x ), 0.0f, 0.0f, 0.0f );
+            if constexpr( NumChannels > 1 )
+                value.y = Channel::toFilterable( packed.y );
+            if constexpr( NumChannels > 2 )
+                value.z = Channel::toFilterable( packed.z );
+            if constexpr( NumChannels > 3 )
+                value.w = Channel::toFilterable( packed.w );
+            return value;
+        }
+    }
+
+    // Converts loaded or blended filterable values to the sampled result.
+    HIP_DEMAND_INLINE static float4 normalize( float4 value )
+    {
+        if constexpr( Channel::scale != 1.0f )
+            value *= Channel::scale;
+        return value;
+    }
+};
+
+// Calls fn( TexelFormat<...>{} ) for the runtime format, or returns Result{} for an unsupported one.
+template <class Result, uint32_t NumChannels, class Fn>
+HIP_DEMAND_INLINE Result dispatchChannelFormat( hipArray_Format format, Fn&& fn )
 {
     switch( format )
     {
         case HIP_AD_FORMAT_UNSIGNED_INT8:
-            return decodePackedChannels<Sample, NumChannels, uint8_t>( texel );
+            return fn( TexelFormat<UnsignedNormalizedChannel<uint8_t>, NumChannels>{} );
         case HIP_AD_FORMAT_SIGNED_INT8:
-            return decodePackedChannels<Sample, NumChannels, int8_t>( texel );
+            return fn( TexelFormat<SignedNormalizedChannel<int8_t>, NumChannels>{} );
         case HIP_AD_FORMAT_UNSIGNED_INT16:
-            return decodePackedChannels<Sample, NumChannels, uint16_t>( texel );
+            return fn( TexelFormat<UnsignedNormalizedChannel<uint16_t>, NumChannels>{} );
         case HIP_AD_FORMAT_SIGNED_INT16:
-            return decodePackedChannels<Sample, NumChannels, int16_t>( texel );
+            return fn( TexelFormat<SignedNormalizedChannel<int16_t>, NumChannels>{} );
         case HIP_AD_FORMAT_UNSIGNED_INT32:
-            return decodePackedChannels<Sample, NumChannels, uint32_t>( texel );
+            return fn( TexelFormat<UnsignedNormalizedChannel<uint32_t>, NumChannels>{} );
         case HIP_AD_FORMAT_SIGNED_INT32:
-            return decodePackedChannels<Sample, NumChannels, int32_t>( texel );
+            return fn( TexelFormat<SignedNormalizedChannel<int32_t>, NumChannels>{} );
         case HIP_AD_FORMAT_HALF:
-            return decodeHalfChannels<Sample, NumChannels>( texel );
+            return fn( TexelFormat<HalfChannel, NumChannels>{} );
         case HIP_AD_FORMAT_FLOAT:
-            return decodePackedChannels<Sample, NumChannels, float>( texel );
+            return fn( TexelFormat<FloatChannel, NumChannels>{} );
         default:
-            return Sample{};
+            return Result{};
     }
 }
 
-template <class Sample>
-HIP_DEMAND_INLINE Sample decodeTexel( const uint8_t* texel, hipArray_Format format, uint32_t numChannels )
+template <class Result, class Fn>
+HIP_DEMAND_INLINE Result dispatchTexelFormat( hipArray_Format format, uint32_t numChannels, Fn&& fn )
 {
     switch( numChannels )
     {
         case 1:
-            return decodeTexelChannels<Sample, 1>( texel, format );
+            return dispatchChannelFormat<Result, 1>( format, fn );
         case 2:
-            return decodeTexelChannels<Sample, 2>( texel, format );
+            return dispatchChannelFormat<Result, 2>( format, fn );
         case 3:
-            return decodeTexelChannels<Sample, 3>( texel, format );
+            return dispatchChannelFormat<Result, 3>( format, fn );
         case 4:
-            return decodeTexelChannels<Sample, 4>( texel, format );
+            return dispatchChannelFormat<Result, 4>( format, fn );
         default:
-            return Sample{};
+            return Result{};
     }
 }
 
-// Decode and blend one channel before moving to the next, avoiding four decoded Sample values.
-template <class Channel>
-HIP_DEMAND_INLINE float filterBilinearChannel( Channel value00, Channel value10, Channel value01, Channel value11,
-                                               float weight00, float weight10, float weight01, float weight11 )
+template <class Sample>
+HIP_DEMAND_INLINE Sample toSample( float4 value )
 {
-    if constexpr( std::is_same<Channel, uint8_t>::value || std::is_same<Channel, uint16_t>::value
-                  || std::is_same<Channel, uint32_t>::value )
-    {
-        constexpr float normalization = std::is_same<Channel, uint8_t>::value ? ( 1.0f / 255.0f )
-                                        : std::is_same<Channel, uint16_t>::value ? ( 1.0f / 65535.0f )
-                                                                                 : ( 1.0f / 4294967295.0f );
-        const float blended = weight00 * static_cast<float>( value00 ) + weight10 * static_cast<float>( value10 )
-                              + weight01 * static_cast<float>( value01 ) + weight11 * static_cast<float>( value11 );
-        return blended * normalization;
-    }
+    if constexpr( std::is_same<Sample, float>::value )
+        return value.x;
+    else if constexpr( std::is_same<Sample, float2>::value )
+        return make_float2( value.x, value.y );
+    else if constexpr( std::is_same<Sample, float3>::value )
+        return make_float3( value.x, value.y, value.z );
     else
     {
-        return weight00 * decodeChannelValue( value00 ) + weight10 * decodeChannelValue( value10 )
-               + weight01 * decodeChannelValue( value01 ) + weight11 * decodeChannelValue( value11 );
+        static_assert( std::is_same<Sample, float4>::value, "Unsupported texture sample type" );
+        return value;
     }
 }
 
-template <class Sample, uint32_t NumChannels, class Channel>
-HIP_DEMAND_INLINE Sample filterBilinearPackedTexels( const uint8_t* texel00, const uint8_t* texel10,
-                                                     const uint8_t* texel01, const uint8_t* texel11,
-                                                     float fracX, float fracY )
-{
-    using PackedChannels = HIP_vector_type<Channel, NumChannels>;
-    const PackedChannels value00 = *reinterpret_cast<const PackedChannels*>( texel00 );
-    const PackedChannels value10 = *reinterpret_cast<const PackedChannels*>( texel10 );
-    const PackedChannels value01 = *reinterpret_cast<const PackedChannels*>( texel01 );
-    const PackedChannels value11 = *reinterpret_cast<const PackedChannels*>( texel11 );
+// ---------------------------------------------------------------------------------------------------------------------
+// Filtering
+// ---------------------------------------------------------------------------------------------------------------------
 
+// textureMemory is the address of the texture's first page.
+template <class Format, bool Wide>
+HIP_DEMAND_INLINE float4 filterFootprint( const uint8_t*           textureMemory,
+                                          const DeviceTextureInfo& texture,
+                                          uint32_t                 pageShift,
+                                          const PointFootprint&    footprint )
+{
+    return Format::normalize( Format::load(
+        texelAddress<Wide>( textureMemory, texture, pageShift, footprint.pageId[0], footprint.texelOffset[0] ) ) );
+}
+
+template <class Format, bool Wide>
+HIP_DEMAND_INLINE float4 filterFootprint( const uint8_t*           textureMemory,
+                                          const DeviceTextureInfo& texture,
+                                          uint32_t                 pageShift,
+                                          const BilinearFootprint& footprint )
+{
+    const uint8_t* texels[4];
+    for( uint32_t tap = 0; tap < 4; ++tap )
+        texels[tap] = texelAddress<Wide>( textureMemory, texture, pageShift, footprint.pageId[tap], footprint.texelOffset[tap] );
+
+    const float4 value00 = Format::load( texels[0] );
+    const float4 value10 = Format::load( texels[1] );
+    const float4 value01 = Format::load( texels[2] );
+    const float4 value11 = Format::load( texels[3] );
+
+    const float fracX    = footprint.fracX;
+    const float fracY    = footprint.fracY;
     const float weight00 = ( 1.0f - fracX ) * ( 1.0f - fracY );
     const float weight10 = fracX * ( 1.0f - fracY );
     const float weight01 = ( 1.0f - fracX ) * fracY;
     const float weight11 = fracX * fracY;
+    return Format::normalize( weight00 * value00 + weight10 * value10 + weight01 * value01 + weight11 * value11 );
+}
 
-    const float x = filterBilinearChannel( value00.x, value10.x, value01.x, value11.x,
-                                          weight00, weight10, weight01, weight11 );
-    if constexpr( std::is_same<Sample, float>::value )
-        return x;
+template <class Footprint>
+HIP_DEMAND_INLINE Footprint makeFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& mip, uint32_t pageShift, float x, float y )
+{
+    if constexpr( Footprint::numTaps == 1 )
+        return makePointFootprint( texture, mip, pageShift, x, y );
     else
-    {
-        float y = 0.0f;
-        if constexpr( NumChannels > 1 )
-            y = filterBilinearChannel( value00.y, value10.y, value01.y, value11.y,
-                                       weight00, weight10, weight01, weight11 );
-        if constexpr( std::is_same<Sample, float2>::value )
-            return make_float2( x, y );
-        else
-        {
-            float z = 0.0f;
-            if constexpr( NumChannels > 2 )
-                z = filterBilinearChannel( value00.z, value10.z, value01.z, value11.z,
-                                           weight00, weight10, weight01, weight11 );
-            if constexpr( std::is_same<Sample, float3>::value )
-                return make_float3( x, y, z );
-            else if constexpr( std::is_same<Sample, float4>::value )
-            {
-                float w = 0.0f;
-                if constexpr( NumChannels > 3 )
-                    w = filterBilinearChannel( value00.w, value10.w, value01.w, value11.w,
-                                               weight00, weight10, weight01, weight11 );
-                return make_float4( x, y, z, w );
-            }
-            else
-                static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
-        }
-    }
+        return makeBilinearFootprint( texture, mip, pageShift, x, y );
 }
 
-template <class Sample, uint32_t NumChannels>
-HIP_DEMAND_INLINE Sample filterBilinearHalfTexels( const uint8_t* texel00, const uint8_t* texel10,
-                                                   const uint8_t* texel01, const uint8_t* texel11,
-                                                   float fracX, float fracY )
+template <class Sample, class Footprint, uint32_t NumLevels, bool Wide>
+HIP_DEMAND_INLINE Sample filterLevels( const uint8_t*           textureMemory,
+                                       const DeviceTextureInfo& texture,
+                                       uint32_t                 pageShift,
+                                       const Footprint ( &footprints )[NumLevels],
+                                       float t )
 {
-    const __half* value00 = reinterpret_cast<const __half*>( texel00 );
-    const __half* value10 = reinterpret_cast<const __half*>( texel10 );
-    const __half* value01 = reinterpret_cast<const __half*>( texel01 );
-    const __half* value11 = reinterpret_cast<const __half*>( texel11 );
-
-    const float weight00 = ( 1.0f - fracX ) * ( 1.0f - fracY );
-    const float weight10 = fracX * ( 1.0f - fracY );
-    const float weight01 = ( 1.0f - fracX ) * fracY;
-    const float weight11 = fracX * fracY;
-
-    const float x = filterBilinearChannel( value00[0], value10[0], value01[0], value11[0],
-                                          weight00, weight10, weight01, weight11 );
-    if constexpr( std::is_same<Sample, float>::value )
-        return x;
-    else
-    {
-        float y = 0.0f;
-        if constexpr( NumChannels > 1 )
-            y = filterBilinearChannel( value00[1], value10[1], value01[1], value11[1],
-                                       weight00, weight10, weight01, weight11 );
-        if constexpr( std::is_same<Sample, float2>::value )
-            return make_float2( x, y );
-        else
-        {
-            float z = 0.0f;
-            if constexpr( NumChannels > 2 )
-                z = filterBilinearChannel( value00[2], value10[2], value01[2], value11[2],
-                                           weight00, weight10, weight01, weight11 );
-            if constexpr( std::is_same<Sample, float3>::value )
-                return make_float3( x, y, z );
-            else if constexpr( std::is_same<Sample, float4>::value )
-            {
-                float w = 0.0f;
-                if constexpr( NumChannels > 3 )
-                    w = filterBilinearChannel( value00[3], value10[3], value01[3], value11[3],
-                                               weight00, weight10, weight01, weight11 );
-                return make_float4( x, y, z, w );
-            }
-            else
-                static_assert( std::is_same<Sample, void>::value, "Unsupported texture sample type" );
-        }
-    }
+    return dispatchTexelFormat<Sample>( texture.format(), texture.numChannels(), [&]( auto texelFormat ) {
+        using Format = decltype( texelFormat );
+        float4 value = filterFootprint<Format, Wide>( textureMemory, texture, pageShift, footprints[0] );
+        if constexpr( NumLevels == 2 )
+            value = ( 1.0f - t ) * value + t * filterFootprint<Format, Wide>( textureMemory, texture, pageShift, footprints[1] );
+        return toSample<Sample>( value );
+    } );
 }
 
-template <class Sample, uint32_t NumChannels>
-HIP_DEMAND_INLINE Sample filterBilinearTexelsChannels( hipArray_Format format,
-                                                       const uint8_t* texel00, const uint8_t* texel10,
-                                                       const uint8_t* texel01, const uint8_t* texel11,
-                                                       float fracX, float fracY )
-{
-    switch( format )
-    {
-        case HIP_AD_FORMAT_UNSIGNED_INT8:
-            return filterBilinearPackedTexels<Sample, NumChannels, uint8_t>( texel00, texel10, texel01, texel11,
-                                                                              fracX, fracY );
-        case HIP_AD_FORMAT_SIGNED_INT8:
-            return filterBilinearPackedTexels<Sample, NumChannels, int8_t>( texel00, texel10, texel01, texel11,
-                                                                             fracX, fracY );
-        case HIP_AD_FORMAT_UNSIGNED_INT16:
-            return filterBilinearPackedTexels<Sample, NumChannels, uint16_t>( texel00, texel10, texel01, texel11,
-                                                                               fracX, fracY );
-        case HIP_AD_FORMAT_SIGNED_INT16:
-            return filterBilinearPackedTexels<Sample, NumChannels, int16_t>( texel00, texel10, texel01, texel11,
-                                                                              fracX, fracY );
-        case HIP_AD_FORMAT_UNSIGNED_INT32:
-            return filterBilinearPackedTexels<Sample, NumChannels, uint32_t>( texel00, texel10, texel01, texel11,
-                                                                               fracX, fracY );
-        case HIP_AD_FORMAT_SIGNED_INT32:
-            return filterBilinearPackedTexels<Sample, NumChannels, int32_t>( texel00, texel10, texel01, texel11,
-                                                                              fracX, fracY );
-        case HIP_AD_FORMAT_HALF:
-            return filterBilinearHalfTexels<Sample, NumChannels>( texel00, texel10, texel01, texel11,
-                                                                   fracX, fracY );
-        case HIP_AD_FORMAT_FLOAT:
-            return filterBilinearPackedTexels<Sample, NumChannels, float>( texel00, texel10, texel01, texel11,
-                                                                            fracX, fracY );
-        default:
-            return Sample{};
-    }
-}
-
-template <class Sample>
-HIP_DEMAND_INLINE Sample filterBilinearTexels( const DeviceTextureInfo& texture,
-                                               const uint8_t* texel00, const uint8_t* texel10,
-                                               const uint8_t* texel01, const uint8_t* texel11,
-                                               float fracX, float fracY )
-{
-    switch( texture.numChannels )
-    {
-        case 1:
-            return filterBilinearTexelsChannels<Sample, 1>( texture.format, texel00, texel10, texel01, texel11,
-                                                             fracX, fracY );
-        case 2:
-            return filterBilinearTexelsChannels<Sample, 2>( texture.format, texel00, texel10, texel01, texel11,
-                                                             fracX, fracY );
-        case 3:
-            return filterBilinearTexelsChannels<Sample, 3>( texture.format, texel00, texel10, texel01, texel11,
-                                                             fracX, fracY );
-        case 4:
-            return filterBilinearTexelsChannels<Sample, 4>( texture.format, texel00, texel10, texel01, texel11,
-                                                             fracX, fracY );
-        default:
-            return Sample{};
-    }
-}
-
-template <class Sample>
+template <class Sample, class Footprint, uint32_t NumLevels>
 HIP_DEMAND_INLINE Sample
-fetchTexel( const DeviceContext& context, const DeviceTextureInfo& texture, const DeviceMipLevel& mip, int x, int y, bool& resident )
+sampleMipLevels( const DeviceContext& context, const TextureMetadata& texture, uint32_t mipLevel, float t, float x, float y, bool& resident )
 {
-    resident = false;
+    const uint32_t pageShift = pageSizeShift( context );
 
-    x = applyAddressMode( x, static_cast<int>( mip.width ), texture.addressMode[0] );
-    y = applyAddressMode( y, static_cast<int>( mip.height ), texture.addressMode[1] );
+    // The page descriptors of all levels are loaded first, so that the scalar loads are issued together.
+    DeviceMipLevel mips[NumLevels];
+    for( uint32_t level = 0; level < NumLevels; ++level )
+        mips[level] = texture.mipLevel( mipLevel + level );
 
-    uint32_t pageId         = INVALID_PAGE;
-    uint32_t pageByteOffset = 0;
-    if( mip.mipTail )
-    {
-        pageId = texture.mipTailPage;
-        pageByteOffset =
-            mip.mipTailOffset + ( static_cast<uint32_t>( y ) * mip.width + static_cast<uint32_t>( x ) ) * texture.bytesPerTexel;
-    }
-    else
-    {
-        const uint2 tile  = texture.getTileCoords( static_cast<uint32_t>( x ), static_cast<uint32_t>( y ) );
-        const uint2 local = texture.getLocalCoords( static_cast<uint32_t>( x ), static_cast<uint32_t>( y ) );
-        pageId            = mip.startPage + tile.y * mip.tilesX + tile.x;
-        pageByteOffset    = ( local.y * texture.tileWidth + local.x ) * texture.bytesPerTexel;
-    }
+    Footprint footprints[NumLevels];
+    uint32_t  residenceWords[NumLevels];
+    for( uint32_t level = 0; level < NumLevels; ++level )
+        footprints[level] = makeFootprint<Footprint>( texture.info, mips[level], pageShift, x, y );
+    for( uint32_t level = 0; level < NumLevels; ++level )
+        residenceWords[level] = loadPageResidenceWord( context, footprints[level].pageId[0] );
 
-    const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
-    resident                  = checkBitSet( context.residenceBits, resourceId );
-    if( !resident )
-    {
-        recordRequest( context, resourceId );
-        return Sample{};
-    }
-    else if( context.requestIfResident )
-    {
-        recordRequest( context, resourceId );
-    }
-
-    const size_t byteOffset = static_cast<size_t>( pageId ) * context.pageSize + pageByteOffset;
-    resident                = true;
-    return decodeTexel<Sample>( context.pageMemory.ptr + byteOffset, texture.format, texture.numChannels );
-}
-
-HIP_DEMAND_INLINE uint8_t* resolveTexturePage( const DeviceContext& context, uint32_t pageId )
-{
-    const uint32_t resourceId = context.resourceTable.textureTiles.getResourceId( pageId );
-    const bool     resident   = checkBitSet( context.residenceBits, resourceId );
-    if( !resident || context.requestIfResident )
-        recordRequest( context, resourceId );
-
-    return resident ? context.pageMemory.ptr + static_cast<size_t>( pageId ) * context.pageSize : nullptr;
-}
-
-template <class Sample>
-HIP_DEMAND_INLINE Sample fetchBilinearSample( const DeviceContext&     context,
-                                              const DeviceTextureInfo& texture,
-                                              const DeviceMipLevel&    mip,
-                                              int                      x0,
-                                              int                      y0,
-                                              float                    fracX,
-                                              float                    fracY,
-                                              bool&                    resident )
-{
-    // Fast path for four bilinear taps inside one tile. In-bounds coordinates need no address-mode handling,
-    // and all texel addresses can be derived from one page lookup and one base offset.
-    const bool footprintInBounds = x0 >= 0 && y0 >= 0 && static_cast<uint32_t>( x0 ) + 1 < mip.width
-                                   && static_cast<uint32_t>( y0 ) + 1 < mip.height;
-    if( !mip.mipTail && footprintInBounds )
-    {
-        const uint32_t texelX = static_cast<uint32_t>( x0 );
-        const uint32_t texelY = static_cast<uint32_t>( y0 );
-        const uint2    local  = texture.getLocalCoords( texelX, texelY );
-        // The 2x2 footprint fits in one tile only if its top-left texel is before the last column and row.
-        if( local.x < texture.tileWidthMask && local.y < texture.tileHeightMask )
-        {
-            const uint2    tile     = texture.getTileCoords( texelX, texelY );
-            const uint32_t pageId   = mip.startPage + tile.y * mip.tilesX + tile.x;
-            const uint32_t rowBytes = texture.tileWidth * texture.bytesPerTexel;
-            const uint32_t offset00 = local.y * rowBytes + local.x * texture.bytesPerTexel;
-
-            const uint8_t* page = resolveTexturePage( context, pageId );
-            resident            = page != nullptr;
-            if( !resident )
-                return Sample{};
-
-            const uint8_t* row0 = page + offset00;
-            const uint8_t* row1 = row0 + rowBytes;
-            return filterBilinearTexels<Sample>( texture, row0, row0 + texture.bytesPerTexel,
-                                                 row1, row1 + texture.bytesPerTexel,
-                                                 fracX, fracY );
-        }
-    }
-
-    int x1;
-    int y1;
-    if( footprintInBounds )
-    {
-        x1 = x0 + 1;
-        y1 = y0 + 1;
-    }
-    else
-    {
-        const int2 x = applyAddressModePair( x0, x0 + 1, static_cast<int>( mip.width ), texture.addressMode[0] );
-        const int2 y = applyAddressModePair( y0, y0 + 1, static_cast<int>( mip.height ), texture.addressMode[1] );
-        x0           = x.x;
-        y0           = y.x;
-        x1           = x.y;
-        y1           = y.y;
-    }
-
-    if( mip.mipTail )
-    {
-        // All four taps share one page; compute each row and column address once.
-        const uint8_t* page = resolveTexturePage( context, texture.mipTailPage );
-        resident            = page != nullptr;
-        if( !resident )
-            return Sample{};
-
-        const uint32_t rowBytes  = mip.width * texture.bytesPerTexel;
-        const uint8_t* row0     = page + mip.mipTailOffset + static_cast<uint32_t>( y0 ) * rowBytes;
-        const uint8_t* row1     = page + mip.mipTailOffset + static_cast<uint32_t>( y1 ) * rowBytes;
-        const uint32_t xOffset0 = static_cast<uint32_t>( x0 ) * texture.bytesPerTexel;
-        const uint32_t xOffset1 = static_cast<uint32_t>( x1 ) * texture.bytesPerTexel;
-        return filterBilinearTexels<Sample>( texture, row0 + xOffset0, row0 + xOffset1,
-                                             row1 + xOffset0, row1 + xOffset1,
-                                             fracX, fracY );
-    }
-    const uint2    tile0    = texture.getTileCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
-    const uint2    tile1    = texture.getTileCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
-    const uint2    local0   = texture.getLocalCoords( static_cast<uint32_t>( x0 ), static_cast<uint32_t>( y0 ) );
-    const uint2    local1   = texture.getLocalCoords( static_cast<uint32_t>( x1 ), static_cast<uint32_t>( y1 ) );
-    const uint32_t rowBytes = texture.tileWidth * texture.bytesPerTexel;
-    const uint32_t offset00 = local0.y * rowBytes + local0.x * texture.bytesPerTexel;
-    const uint32_t offset10 = local0.y * rowBytes + local1.x * texture.bytesPerTexel;
-    const uint32_t offset01 = local1.y * rowBytes + local0.x * texture.bytesPerTexel;
-    const uint32_t offset11 = local1.y * rowBytes + local1.x * texture.bytesPerTexel;
-
-    const uint32_t pageRow0 = mip.startPage + tile0.y * mip.tilesX;
-    const uint32_t pageRow1 = mip.startPage + tile1.y * mip.tilesX;
-    const bool     sameTileX = tile0.x == tile1.x;
-    const bool     sameTileY = tile0.y == tile1.y;
-    const uint8_t* page00   = resolveTexturePage( context, pageRow0 + tile0.x );
-    const uint8_t* page10   = sameTileX ? page00 : resolveTexturePage( context, pageRow0 + tile1.x );
-    const uint8_t* page01   = sameTileY ? page00 : resolveTexturePage( context, pageRow1 + tile0.x );
-    const uint8_t* page11   = sameTileY ? page10
-                                     : ( sameTileX ? page01 : resolveTexturePage( context, pageRow1 + tile1.x ) );
-
-    resident = page00 && page10 && page01 && page11;
+    // Every level must be referenced, so the residence results are combined without short-circuiting.
+    resident = true;
+    for( uint32_t level = 0; level < NumLevels; ++level )
+        resident = referenceFootprint( context, footprints[level], residenceWords[level] ) && resident;
     if( !resident )
         return Sample{};
 
-    return filterBilinearTexels<Sample>( texture, page00 + offset00, page10 + offset10,
-                                         page01 + offset01, page11 + offset11,
-                                         fracX, fracY );
+    const uint8_t* textureMemory = context.pageMemory.ptr + ( static_cast<size_t>( texture.info.startPage ) << pageShift );
+    if( texture.info.wideOffsets() )
+        return filterLevels<Sample, Footprint, NumLevels, true>( textureMemory, texture.info, pageShift, footprints, t );
+    return filterLevels<Sample, Footprint, NumLevels, false>( textureMemory, texture.info, pageShift, footprints, t );
 }
 
-template <class Sample>
-HIP_DEMAND_INLINE Sample
-sampleMipLevel( const DeviceContext& context, const DeviceTextureInfo& texture, uint32_t mipLevel, float x, float y, bool& resident )
+template <class Sample, class Footprint>
+HIP_DEMAND_INLINE Sample sampleLod( const DeviceContext& context, const TextureMetadata& texture, float x, float y, float lod, bool& resident )
 {
-    resident                 = false;
-    const DeviceMipLevel mip = texture.getMipLevel( mipLevel );
-    if( texture.normalizedCoords )
+    const uint32_t mipCount = texture.info.mipCount();
+    lod                     = std::clamp( lod, 0.0f, static_cast<float>( mipCount - 1 ) );
+    if( texture.info.mipmapFilterMode() == hipFilterModePoint )
     {
-        x = x * static_cast<float>( mip.width );
-        y = y * static_cast<float>( mip.height );
+        const uint32_t mipLevel = static_cast<uint32_t>( floorf( lod + 0.5f ) );
+        return sampleMipLevels<Sample, Footprint, 1>( context, texture, mipLevel, 0.0f, x, y, resident );
     }
 
-    if( texture.filterMode == hipFilterModePoint )
-    {
-        x = std::floorf( x );
-        y = std::floorf( y );
-        return fetchTexel<Sample>( context, texture, mip, static_cast<int>( x ), static_cast<int>( y ), resident );
-    }
-
-    x = x - 0.5f;
-    y = y - 0.5f;
-
-    const int   x0 = static_cast<int>( std::floorf( x ) );
-    const int   y0 = static_cast<int>( std::floorf( y ) );
-    const float fracX = x - static_cast<float>( x0 );
-    const float fracY = y - static_cast<float>( y0 );
-    return fetchBilinearSample<Sample>( context, texture, mip, x0, y0,
-                                        fracX, fracY, resident );
-}
-
-template <class Sample>
-HIP_DEMAND_INLINE Sample tex2DLodFromInfo( const DeviceContext& context, const DeviceTextureInfo& texture, float x, float y, float lod, bool& resident )
-{
-    lod = std::clamp( lod, 0.0f, static_cast<float>( texture.mipCount - 1 ) );
-    if( texture.mipmapFilterMode == hipFilterModePoint )
-    {
-        const uint32_t mipLevel = static_cast<uint32_t>( std::floorf( lod + 0.5f ) );
-        return sampleMipLevel<Sample>( context, texture, mipLevel, x, y, resident );
-    }
-
-    const uint32_t mipLevel0 = static_cast<uint32_t>( std::floorf( lod ) );
-    const uint32_t mipLevel1 = mipLevel0 + 1 < texture.mipCount ? mipLevel0 + 1 : mipLevel0;
-    const float    t         = lod - static_cast<float>( mipLevel0 );
-
-    bool         resident0 = false;
-    const Sample sample0   = sampleMipLevel<Sample>( context, texture, mipLevel0, x, y, resident0 );
+    const uint32_t mipLevel = static_cast<uint32_t>( floorf( lod ) );
+    const float    t        = lod - static_cast<float>( mipLevel );
     // The next mip level cannot affect an exact-level sample or its residency.
-    if( mipLevel0 == mipLevel1 || t == 0.0f )
-    {
-        resident = resident0;
-        return sample0;
-    }
-
-    bool         resident1 = false;
-    const Sample sample1   = sampleMipLevel<Sample>( context, texture, mipLevel1, x, y, resident1 );
-
-    resident = resident0 && resident1;
-    return ( 1.0f - t ) * sample0 + t * sample1;
+    if( mipLevel + 1 >= mipCount || t == 0.0f )
+        return sampleMipLevels<Sample, Footprint, 1>( context, texture, mipLevel, 0.0f, x, y, resident );
+    return sampleMipLevels<Sample, Footprint, 2>( context, texture, mipLevel, t, x, y, resident );
 }
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample sampleTexture( const DeviceContext& context, const TextureMetadata& texture, float x, float y, float lod, bool& resident )
+{
+    if( texture.info.filterMode() == hipFilterModePoint )
+        return sampleLod<Sample, PointFootprint>( context, texture, x, y, lod, resident );
+    return sampleLod<Sample, BilinearFootprint>( context, texture, x, y, lod, resident );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Public sampling API
+// ---------------------------------------------------------------------------------------------------------------------
 
 template <class Sample>
 HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& resident )
 {
-    resident = false;
+    // Invalid texture ids are reported as resident so that callers do not wait for them.
+    resident = true;
     if( textureId >= context.textureInfos.len )
-    {
-        resident = true;
         return Sample{};
-    }
 
-    // no need to check isResourceResident if we could just try to load texture info and check if it's null
-    // const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
-    // resident                  = isResourceResident( context, resourceId );
-    const DeviceTextureInfo* texture = context.textureInfos.ptr[textureId];
-    if( !texture )
-    {
-        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
+    const TextureMetadata metadata = loadTextureMetadata( context, textureId, resident );
+    if( !resident )
         return Sample{};
-    }
-    else if( context.requestIfResident )
-    {
-        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
-    }
 
-    return tex2DLodFromInfo<Sample>( context, *texture, x, y, lod, resident );
+    const Sample sample = sampleTexture<Sample>( context, metadata, x, y, lod, resident );
+    referenceTextureInfo( context, textureId );
+    return sample;
 }
 
 // TODO_BS: this implementation is generated by chatGPT. I'll need to do more research about it
 template <class Sample>
 HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textureId, float x, float y, float2 ddx, float2 ddy, bool& resident )
 {
-    resident = false;
+    resident = true;
     if( textureId >= context.textureInfos.len )
-    {
-        resident = true;
         return Sample{};
-    }
 
-    // no need to check isResourceResident if we could just try to load texture info and check if it's null
-    // const uint32_t resourceId = context.resourceTable.textureInfos.getResourceId( textureId );
-    // resident                  = isResourceResident( context, resourceId );
-    const DeviceTextureInfo* texture = context.textureInfos.ptr[textureId];
-    if( !texture )
-    {
-        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
+    const TextureMetadata metadata = loadTextureMetadata( context, textureId, resident );
+    if( !resident )
         return Sample{};
-    }
-    else if( context.requestIfResident )
-    {
-        recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
-    }
 
-    if( texture->normalizedCoords )
+    if( metadata.info.normalizedCoords() )
     {
-        const DeviceMipLevel baseMip = texture->getMipLevel( 0 );
-        ddx.x *= static_cast<float>( baseMip.width );
-        ddx.y *= static_cast<float>( baseMip.height );
-        ddy.x *= static_cast<float>( baseMip.width );
-        ddy.y *= static_cast<float>( baseMip.height );
+        const float width  = static_cast<float>( metadata.info.width );
+        const float height = static_cast<float>( metadata.info.height );
+        ddx.x *= width;
+        ddx.y *= height;
+        ddy.x *= width;
+        ddy.y *= height;
     }
 
     const float footprintXSquared = ddx.x * ddx.x + ddx.y * ddx.y;
@@ -674,7 +682,9 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
     const float footprintSquared  = fmaxf( footprintXSquared, footprintYSquared );
     const float lod               = 0.5f * log2f( fmaxf( footprintSquared, 1.0f ) );
 
-    return tex2DLodFromInfo<Sample>( context, *texture, x, y, lod, resident );
+    const Sample sample = sampleTexture<Sample>( context, metadata, x, y, lod, resident );
+    referenceTextureInfo( context, textureId );
+    return sample;
 }
 
 template <class Sample>

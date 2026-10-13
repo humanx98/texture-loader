@@ -2,7 +2,6 @@
 
 #include "../Internal/HipCheck.h"
 #include "../Internal/Utils.h"
-#include "Allocator.h"
 #include "Lru.h"
 #include "PageSystem.h"
 #include "PinnedUploadPool.h"
@@ -11,6 +10,7 @@
 #include <cassert>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace hip_demand::vmm {
 
@@ -107,17 +107,34 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) override;
     void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
-    void   processRequestsCallback( Ticket ticket );
-    void   processRequest( hipStream_t stream, uint32_t resourceId );
-    void   updateProccedResources( hipStream_t stream );
-    int    device() const { return pageSystem_.device(); }
+
+    void processRequestsCallback( Ticket ticket );
+    void processRequest( hipStream_t stream, uint32_t resourceId );
+    void updateProcessedResources( hipStream_t stream );
+    int  device() const { return pageSystem_.device(); }
 
   private:
-    Resource                     decode( uint32_t resourceId );
-    void                         clearEvictedPages( hipStream_t stream );
-    DevicePtr<DeviceTextureInfo> processTextureInfo( hipStream_t stream, const uint32_t textureId );
-    void                         processTile( hipStream_t stream, const Resource::Tile& tile );
-    void                         processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
+    struct LoadedTexture
+    {
+        std::shared_ptr<ImageSource> image;
+        DeviceTextureInfo            info;
+    };
+
+    // The device descriptor does not carry the texture id; the host keeps it next to its copy.
+    struct LoadedTextureInfo
+    {
+        uint32_t          textureId = INVALID_TEXTURE;
+        DeviceTextureInfo info;
+    };
+
+    Resource      decodeResource( uint32_t resourceId ) const;
+    LoadedTexture loadedTexture( uint32_t textureId ) const;
+    void          clearEvictedPages( hipStream_t stream );
+    void          releaseEvictedPages( uint32_t reusablePageCount );
+    void          updateLruThreshold();
+    void          processTextureInfo( hipStream_t stream, uint32_t textureId );
+    void          processTile( hipStream_t stream, const Resource::Tile& tile );
+    void          processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
 
     mutable std::mutex mutex_;
     Options            options_{};
@@ -126,13 +143,12 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
 
     // metadata
-    mutable std::mutex           metadataMutex_;
-    Allocator<DeviceTextureInfo> textureInfoAllocator_;
-    ResourceTable                resourceTable_{};
-    PageTable                    pageTable_{};
-    // note that this list should be accessed by texture.loadedTextureInfoId
-    // and it's ordered by startPage in order to use std::upper_bound
-    std::vector<DeviceTextureInfo> loadedTextureInfos_{};
+    mutable std::mutex metadataMutex_;
+    ResourceTable      resourceTable_{};
+    PageTable          pageTable_{};
+    // Indexed by DemandTextureImpl::loadedTextureInfoId. Textures get their pages when their metadata is loaded, so the
+    // list is also ordered by startPage, which decodeResource() relies on.
+    std::vector<LoadedTextureInfo> loadedTextureInfos_{};
 
     RequestProcessor requestProcessor_;
     PinnedUploadPool uploadPool_;
@@ -143,8 +159,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
         hipFunction_t updateProcessedResources;
         hipFunction_t updateEvictedPages;
     } kernels_{};
-    uint32_t launchNum_    = 0;
-    uint32_t lruThreshold_ = lruThresholdMin;
+    uint32_t launchNum_ = 0;
 
     DeviceContext      deviceContext_{};
     HostSpan<uint32_t> requestedResources_{};
@@ -152,20 +167,25 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     ResourceBits bits_;
 
+    // Eviction is pipelined over passes: candidates collected by one pass are cleared on the device at the start of the
+    // next one (clearEvictedPages) and unmapped on the host after that pass's requests are read back.
     struct
     {
         mutable std::mutex          mutex;
         HostSpan<EvictionCandidate> candidates;
         uint32_t                    clearCount        = 0;  // Device candidates awaiting residence-bit clearing.
         uint32_t                    pendingUnmapCount = 0;  // Cleared candidates awaiting the next host copy.
-
+        uint32_t                    lruThreshold      = lruThresholdMin;
     } eviction_{};
 
+    // Resources loaded by the workers since the last device update. The loader expects one stream and a completed ticket
+    // before the next processRequests(), so a pass never adds more than maxRequests resources, and the copy from this
+    // buffer runs on the stream before the next pass's workers can overwrite it.
     struct
     {
-        mutable std::mutex          mutex;
-        HostSpan<ProcessedResource> resources;
-        uint32_t                    count;
+        mutable std::mutex mutex;
+        HostSpan<uint32_t> resources;
+        uint32_t           count = 0;
     } processed_{};
 };
 

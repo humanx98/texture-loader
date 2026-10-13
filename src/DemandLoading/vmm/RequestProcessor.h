@@ -3,6 +3,7 @@
 #include "../Internal/Utils.h"
 #include "HipEventPool.h"
 #include "TicketImpl.h"
+#include <algorithm>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -38,16 +39,14 @@ class RequestQueue : NonCopyble
     {
         std::unique_lock<std::mutex> lock( mutex_ );
 
-        if( requests_.size() >= maxQueueSize_ )
+        // The ticket counts only queued requests, so that it completes when they are processed.
+        if( closed_ )
             count = 0;
-        else if( count + requests_.size() > maxQueueSize_ )
-            count = static_cast<uint32_t>( maxQueueSize_ - requests_.size() );
+        else
+            count = static_cast<uint32_t>( std::min<size_t>( count, maxQueueSize_ - requests_.size() ) );
 
         TicketImpl::getImpl( ticket )->initialize( count );
         if( count == 0 )
-            return;
-
-        if( closed_ )
             return;
 
         for( uint32_t i = 0; i < count; i++ )
@@ -96,7 +95,7 @@ class RequestProcessor : NonCopyble
     void submit( const uint32_t* resourceIds, uint32_t count, Ticket ticket );
     void stop();
 
-    uint32_t threadCount() const noexcept { return workers_.size(); }
+    uint32_t threadCount() const noexcept { return static_cast<uint32_t>( workers_.size() ); }
 
   private:
     void workerLoop();
@@ -104,8 +103,8 @@ class RequestProcessor : NonCopyble
     mutable std::mutex       mutex_;
     RequestQueue             queue_;
     std::vector<std::thread> workers_;
-    bool                     stopped_                    = false;
-    DemandTextureLoaderImpl* loader_                     = nullptr;
+    bool                     stopped_ = false;
+    DemandTextureLoaderImpl* loader_  = nullptr;
 };
 
 }  // namespace hip_demand::vmm

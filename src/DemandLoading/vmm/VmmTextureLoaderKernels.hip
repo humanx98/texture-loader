@@ -173,27 +173,20 @@ HIP_DEMAND_INLINE void updateProcessedResources( DeviceContext& context, uint32_
     uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
     while( globalIdx < processedCount )
     {
-        ProcessedResource resource = context.processedResources.ptr[globalIdx];
-        if( context.resourceTable.textureTiles.contains( resource.resourceId ) )
+        const uint32_t resourceId = context.processedResources.ptr[globalIdx];
+        if( context.lru.ptr && context.resourceTable.textureTiles.contains( resourceId ) )
         {
-            if (context.lru.ptr)
-            {
-                const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resource.resourceId);
-                atomicClearUint4(context.lru, pageId);
-            }
-        }
-        else
-        {
-            const uint32_t textureId = context.resourceTable.textureInfos.getLocalId(resource.resourceId);
-            context.textureInfos.ptr[textureId] = resource.textureInfo.ptr;
+            const uint32_t pageId = context.resourceTable.textureTiles.getLocalId(resourceId);
+            atomicClearUint4(context.lru, pageId);
         }
 
-        atomicSetBit(context.residenceBits, resource.resourceId);
+        // For texture metadata this bit is what publishes the descriptor copied before this kernel.
+        atomicSetBit(context.residenceBits, resourceId);
         globalIdx += gridDim.x * blockDim.x;
     }
 }
 
-HIP_DEMAND_INLINE void updateEvictedPagesKernel( DeviceContext& context, uint32_t evictionCount )
+HIP_DEMAND_INLINE void updateEvictedPages( DeviceContext& context, uint32_t evictionCount )
 {
     uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
     while( globalIdx < evictionCount )
@@ -219,5 +212,5 @@ extern "C" __global__ void updateProcessedResourcesKernel( hip_demand::vmm::Devi
 
 extern "C" __global__ void updateEvictedPagesKernel( hip_demand::vmm::DeviceContext context, uint32_t evictionCount )
 {
-    hip_demand::vmm::updateEvictedPagesKernel(context, evictionCount);
+    hip_demand::vmm::updateEvictedPages(context, evictionCount);
 }

@@ -92,7 +92,6 @@ set(TEXTURE_LOADER_HEADERS
     src/DemandLoading/vmm/DemandTextureLoaderImpl.h
     src/DemandLoading/vmm/HipEventPool.h
     src/DemandLoading/vmm/Lru.h
-    src/DemandLoading/vmm/Allocator.h
     src/DemandLoading/vmm/PageSystem.h
     src/DemandLoading/vmm/PinnedUploadPool.h
     src/DemandLoading/vmm/RequestProcessor.h

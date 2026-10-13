@@ -18,11 +18,12 @@ PageSystem::PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
     allocationProp_.location.type = hipMemLocationTypeDevice;
     allocationProp_.location.id   = device_;
     HIP_CHECK( hipMemGetAllocationGranularity( &granularity_, &allocationProp_, hipMemAllocationGranularityMinimum ) );
-    if( granularity_ == 0 )
-        throw std::runtime_error( "hipMemAllocationGranularityMinimum is zero" );
+    // The sampler computes page addresses with shifts.
+    if( granularity_ == 0 || ( granularity_ & ( granularity_ - 1 ) ) != 0 )
+        throw std::runtime_error( "hipMemAllocationGranularityMinimum is not a power of two" );
 
     pageBytes_                = granularity_;
-    virtual_.addressSpace.len = virtual_.maxPages * pageBytes_;
+    virtual_.addressSpace.len = static_cast<size_t>( virtual_.maxPages ) * pageBytes_;
     HIP_CHECK( hipMemAddressReserve( reinterpret_cast<void**>( &virtual_.addressSpace.ptr ), virtual_.addressSpace.len,
                                      granularity_, nullptr, 0 ) );
 
@@ -95,19 +96,13 @@ void PageSystem::map( uint32_t pageId )
     physicalPage.virtualPageId          = pageId;
 }
 
-void PageSystem::enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages,
-                                      uint32_t                           reusablePageCount,
-                                      std::function<void( uint32_t )>    callback )
+void PageSystem::enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, uint32_t reusablePageCount )
 {
     std::lock_guard<std::mutex> lock( mutex_ );
 
     virtual_.pendingReusableEvictedPageCount += std::min( static_cast<uint32_t>( pages.len ), reusablePageCount );
     for( size_t i = 0; i < pages.len; i++ )
-    {
-        const uint32_t pageId = pages.ptr[i].pageId;
-        virtual_.pendingEvictedPages.push_back( pageId );
-        callback( pageId );
-    }
+        virtual_.pendingEvictedPages.push_back( pages.ptr[i].pageId );
 }
 
 void PageSystem::processPendingEvictedPages()
@@ -116,7 +111,8 @@ void PageSystem::processPendingEvictedPages()
     {
         const size_t requestedReusablePages = virtual_.pendingReusableEvictedPageCount;
         const size_t availableReusablePages = physical_.reusablePages.size();
-        const size_t pagesToReuse = virtual_.pendingReusableEvictedPageCount - std::min( requestedReusablePages, availableReusablePages );
+        const size_t pagesToReuse =
+            virtual_.pendingReusableEvictedPageCount - std::min( requestedReusablePages, availableReusablePages );
         for( size_t i = 0; i < virtual_.pendingEvictedPages.size(); i++ )
         {
             const uint32_t virtualPageId  = virtual_.pendingEvictedPages.at( i );

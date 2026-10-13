@@ -28,7 +28,7 @@ constexpr uint32_t             batchSize            = 10;
 constexpr hipTextureFilterMode mipmapFilterMode     = hipFilterModeLinear;
 constexpr float                mipLevel             = 0.5f;
 constexpr bool                 saveOutputImages     = true;
-constexpr bool                 includeOver4kImages = true;
+constexpr bool                 includeOver4kImages  = true;
 
 struct BenchmarkTimes
 {

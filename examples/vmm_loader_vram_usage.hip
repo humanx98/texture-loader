@@ -75,8 +75,8 @@ __device__ void renderGridPixel( const hip_demand::vmm::DeviceContext& context, 
         return;
     }
 
-    const hip_demand::vmm::DeviceTextureInfo& texture = *context.textureInfos.ptr[textureId];
-    const MipRegion region = findMipRegion( localX, localY, cellWidth, cellHeight, texture.mipCount );
+    const hip_demand::vmm::DeviceTextureInfo& texture = context.textureInfos.ptr[textureId];
+    const MipRegion region = findMipRegion( localX, localY, cellWidth, cellHeight, texture.mipCount() );
     if( region.width == 0 )
     {
         writePixel( output, outputOffset, 0, 0, 0 );

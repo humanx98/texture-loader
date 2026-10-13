@@ -62,7 +62,7 @@ namespace hip_demand::vmm {
 
 constexpr uint32_t INVALID_TEXTURE        = ~0u;
 constexpr uint32_t INVALID_PAGE           = ~0u;
-constexpr uint32_t MAX_TEXTURE_MIP_LEVELS = 15;
+constexpr uint32_t MAX_TEXTURE_MIP_LEVELS = 9;
 
 struct DeviceMipLevel
 {
@@ -79,55 +79,105 @@ struct DeviceMipLevel
 
 struct DeviceTextureInfo
 {
-    uint32_t        textureId        = INVALID_TEXTURE;
-    uint32_t        width            = 0;
-    uint32_t        height           = 0;
-    uint32_t        tileWidth        = 0;
-    uint32_t        tileHeight       = 0;
-    uint32_t        tileWidthShift   = 0;
-    uint32_t        tileHeightShift  = 0;
-    uint32_t        tileWidthMask    = 0;
-    uint32_t        tileHeightMask   = 0;
-    uint32_t        addressMode[2]   = { hipAddressModeWrap, hipAddressModeWrap };
-    uint32_t        filterMode       = hipFilterModeLinear;
-    uint32_t        mipmapFilterMode = hipFilterModeLinear;
-    uint32_t        normalizedCoords = 1;
-    hipArray_Format format           = HIP_AD_FORMAT_UNSIGNED_INT8;
-    uint32_t        numChannels      = 4;
-    uint32_t        bytesPerTexel    = 4;
-    uint32_t        startPage        = INVALID_PAGE;
+    // Small fields are packed into words; the accessors below unpack them. The sampler reads the whole descriptor
+    // with scalar loads, so fewer words mean fewer loads, and unpacking is scalar ALU.
+    uint32_t width       = 0;  // Zero until the loader has copied the descriptor: the sampler tests it for residency.
+    uint32_t height      = 0;
+    uint32_t sampling    = 0;             // Address modes, filter modes, normalizedCoords, wideOffsets.
+    uint32_t texel       = 0;             // hipArray_Format, channel count, bytes per texel.
+    uint32_t layout      = 0;             // Tile shape shifts, mip count, first mip-tail level.
+    uint32_t startPage   = INVALID_PAGE;  // First page of the texture; the tiled levels and the mip tail follow it.
+    uint32_t mipTailPage = INVALID_PAGE;
 
-    uint32_t mipCount          = 0;
-    uint32_t mipTailFirstLevel = MAX_TEXTURE_MIP_LEVELS;
-    uint32_t mipTailPage       = INVALID_PAGE;
-    uint32_t mipTailSize       = 0;
-    struct
+    // One word per level: the first page of a tiled level, or the byte offset within the mip-tail page of a tail level.
+    uint32_t mips[MAX_TEXTURE_MIP_LEVELS]{};
+
+    // --- sampling ---
+    HIP_DEMAND_INLINE uint32_t addressMode( uint32_t axis ) const { return bits( sampling, 2 * axis, 2 ); }
+    HIP_DEMAND_INLINE uint32_t filterMode() const { return bits( sampling, 4, 1 ); }
+    HIP_DEMAND_INLINE uint32_t mipmapFilterMode() const { return bits( sampling, 5, 1 ); }
+    HIP_DEMAND_INLINE bool     normalizedCoords() const { return bits( sampling, 6, 1 ) != 0; }
+    // The texture's pages span more than 4 GiB; see texelOffsetInTexture().
+    HIP_DEMAND_INLINE bool wideOffsets() const { return bits( sampling, 7, 1 ) != 0; }
+
+    HIP_DEMAND_INLINE void setAddressMode( uint32_t axis, uint32_t mode ) { setBits( sampling, 2 * axis, 2, mode ); }
+    HIP_DEMAND_INLINE void setFilterMode( uint32_t mode ) { setBits( sampling, 4, 1, mode ); }
+    HIP_DEMAND_INLINE void setMipmapFilterMode( uint32_t mode ) { setBits( sampling, 5, 1, mode ); }
+    HIP_DEMAND_INLINE void setNormalizedCoords( bool normalized ) { setBits( sampling, 6, 1, normalized ? 1u : 0u ); }
+    HIP_DEMAND_INLINE void setWideOffsets( bool wide ) { setBits( sampling, 7, 1, wide ? 1u : 0u ); }
+
+    // --- texel ---
+    HIP_DEMAND_INLINE hipArray_Format format() const { return static_cast<hipArray_Format>( bits( texel, 0, 8 ) ); }
+    HIP_DEMAND_INLINE uint32_t        numChannels() const { return bits( texel, 8, 8 ); }
+    HIP_DEMAND_INLINE uint32_t        bytesPerTexel() const { return bits( texel, 16, 16 ); }
+
+    HIP_DEMAND_INLINE void setTexel( hipArray_Format format_, uint32_t numChannels_, uint32_t bytesPerTexel_ )
     {
-        uint32_t startPage = INVALID_PAGE;
-        uint32_t mipTailOffset = 0;  // Byte offset within the 64 KiB mip-tail page; uint32_t keeps each mip descriptor compact.
-    } mips[MAX_TEXTURE_MIP_LEVELS]{};
+        texel = 0;
+        setBits( texel, 0, 8, static_cast<uint32_t>( format_ ) );
+        setBits( texel, 8, 8, numChannels_ );
+        setBits( texel, 16, 16, bytesPerTexel_ );
+    }
+
+    // --- layout ---
+    HIP_DEMAND_INLINE uint32_t tileWidthShift() const { return bits( layout, 0, 8 ); }  // Tiles are power-of-two sized.
+    HIP_DEMAND_INLINE uint32_t tileHeightShift() const { return bits( layout, 8, 8 ); }
+    HIP_DEMAND_INLINE uint32_t mipCount() const { return bits( layout, 16, 8 ); }
+    HIP_DEMAND_INLINE uint32_t mipTailFirstLevel() const
+    {
+        return bits( layout, 24, 8 );
+    }  // Equals mipCount() without a tail.
+
+    HIP_DEMAND_INLINE void setLayout( uint32_t tileWidthShift_, uint32_t tileHeightShift_, uint32_t mipCount_, uint32_t mipTailFirstLevel_ )
+    {
+        layout = 0;
+        setBits( layout, 0, 8, tileWidthShift_ );
+        setBits( layout, 8, 8, tileHeightShift_ );
+        setBits( layout, 16, 8, mipCount_ );
+        setBits( layout, 24, 8, mipTailFirstLevel_ );
+    }
+
+    HIP_DEMAND_INLINE uint32_t tileWidth() const { return 1u << tileWidthShift(); }
+    HIP_DEMAND_INLINE uint32_t tileHeight() const { return 1u << tileHeightShift(); }
+    HIP_DEMAND_INLINE uint32_t tileWidthMask() const { return tileWidth() - 1; }
+    HIP_DEMAND_INLINE uint32_t tileHeightMask() const { return tileHeight() - 1; }
 
     HIP_DEMAND_INLINE uint2 getTileCoords( uint32_t x, uint32_t y ) const
     {
-        return { x >> tileWidthShift, y >> tileHeightShift };
+        return { x >> tileWidthShift(), y >> tileHeightShift() };
     }
 
     HIP_DEMAND_INLINE uint2 getLocalCoords( uint32_t x, uint32_t y ) const
     {
-        return { x & tileWidthMask, y & tileHeightMask };
+        return { x & tileWidthMask(), y & tileHeightMask() };
     }
 
-    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level ) const
+    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level ) const { return getMipLevel( level, mips[level] ); }
+
+    // Takes the level's word of mips[] separately so that it can be read without indexing a local copy of the array.
+    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level, uint32_t pages ) const
     {
         DeviceMipLevel mip{};
-        mip.startPage     = mips[level].startPage;
-        mip.mipTailOffset = mips[level].mipTailOffset;
+        mip.mipTail       = level >= mipTailFirstLevel();
+        mip.startPage     = mip.mipTail ? mipTailPage : pages;
+        mip.mipTailOffset = mip.mipTail ? pages : 0;
         mip.width         = std::max( width >> level, 1u );
         mip.height        = std::max( height >> level, 1u );
-        mip.tilesX        = ( mip.width >> tileWidthShift ) + static_cast<uint32_t>( ( mip.width & tileWidthMask ) != 0 );
-        mip.tilesY        = ( mip.height >> tileHeightShift ) + static_cast<uint32_t>( ( mip.height & tileHeightMask ) != 0 );
-        mip.mipTail       = level >= mipTailFirstLevel;
+        mip.tilesX = ( mip.width >> tileWidthShift() ) + static_cast<uint32_t>( ( mip.width & tileWidthMask() ) != 0 );
+        mip.tilesY = ( mip.height >> tileHeightShift() ) + static_cast<uint32_t>( ( mip.height & tileHeightMask() ) != 0 );
         return mip;
+    }
+
+  private:
+    HIP_DEMAND_INLINE static uint32_t bits( uint32_t word, uint32_t shift, uint32_t count )
+    {
+        return ( word >> shift ) & ( ( 1u << count ) - 1 );
+    }
+
+    HIP_DEMAND_INLINE static void setBits( uint32_t& word, uint32_t shift, uint32_t count, uint32_t value )
+    {
+        const uint32_t mask = ( ( 1u << count ) - 1 ) << shift;
+        word                = ( word & ~mask ) | ( ( value << shift ) & mask );
     }
 };
 
@@ -170,32 +220,20 @@ struct EvictionCandidate
     uint32_t lru    = 0;
 };
 
-struct ProcessedResource
-{
-    uint32_t resourceId = 0;
-    union
-    {
-        struct
-        {
-            DevicePtr<DeviceTextureInfo> ptr;
-        } textureInfo;
-    };
-};
-
 struct DeviceContext
 {
-    ResourceTable                  resourceTable{};
-    DeviceSpan<uint8_t>            pageMemory{};
-    DeviceSpan<uint32_t>           residenceBits{};
-    DeviceSpan<DeviceTextureInfo*> textureInfos{};
-    DeviceSpan<uint32_t>           referenceBits{};
-    DeviceSpan<uint32_t>           requestedResources{};
-    DeviceSpan<EvictionCandidate>  evictionCandidates{};
-    DeviceSpan<ProcessedResource>  processedResources{};
-    DeviceSpan<uint32_t>           lru{};
-    DeviceSpan<uint32_t>           counters{};
-    size_t                         pageSize          = 0;
-    bool                           requestIfResident = false;
+    ResourceTable                 resourceTable{};
+    DeviceSpan<uint8_t>           pageMemory{};
+    DeviceSpan<uint32_t>          residenceBits{};
+    DeviceSpan<DeviceTextureInfo> textureInfos{};
+    DeviceSpan<uint32_t>          referenceBits{};
+    DeviceSpan<uint32_t>          requestedResources{};
+    DeviceSpan<EvictionCandidate> evictionCandidates{};
+    DeviceSpan<uint32_t>          processedResources{};
+    DeviceSpan<uint32_t>          lru{};
+    DeviceSpan<uint32_t>          counters{};
+    size_t                        pageSize          = 0;
+    bool                          requestIfResident = false;
 };
 
 }  // namespace hip_demand::vmm

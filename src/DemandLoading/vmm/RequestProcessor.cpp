@@ -1,5 +1,3 @@
-#pragma once
-
 #include "RequestProcessor.h"
 #include "DemandTextureLoaderImpl.h"
 
@@ -72,9 +70,9 @@ void RequestProcessor::workerLoop()
 
             std::shared_ptr<TicketImpl>& ticket = TicketImpl::getImpl( request.ticket );
             loader_->processRequest( ticket->getStream(), request.resourceId );
-            if (ticket->finishTaskAndClaimFinalization())
+            if( ticket->finishTaskAndClaimFinalization() )
             {
-                loader_->updateProccedResources( ticket->getStream() );
+                loader_->updateProcessedResources( ticket->getStream() );
                 ticket->publishCompletion();
             }
         }
