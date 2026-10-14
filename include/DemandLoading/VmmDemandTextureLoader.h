@@ -15,6 +15,9 @@ struct TextureDescriptor
     hipTextureFilterMode  filterMode       = hipFilterModeLinear;
     hipTextureFilterMode  mipmapFilterMode = hipFilterModeLinear;
     bool                  normalizedCoords = true;
+    /// Maximum number of samples tex2DGrad takes along the major axis of a pixel's footprint, 1 to 16, like
+    /// hipTextureDesc::maxAnisotropy. 1 selects isotropic filtering.
+    unsigned int maxAnisotropy = 1;
 };
 
 class Ticket
@@ -37,7 +40,7 @@ class Ticket
 struct Options
 {
     /// Maximum number of VMM pages in the reserved virtual address space, including texture metadata and image tiles.
-    uint32_t maxVirtualPages  = 64 * 1024 * 1024;
+    uint32_t maxVirtualPages = 64 * 1024 * 1024;
 
     /// Maximum number of physical VMM pages that may be allocated. ~0u applies no loader-imposed limit.
     uint32_t maxPhysicalPages = ~0u;

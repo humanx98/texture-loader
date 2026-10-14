@@ -98,13 +98,15 @@ struct DeviceTextureInfo
     HIP_DEMAND_INLINE uint32_t mipmapFilterMode() const { return bits( sampling, 5, 1 ); }
     HIP_DEMAND_INLINE bool     normalizedCoords() const { return bits( sampling, 6, 1 ) != 0; }
     // The texture's pages span more than 4 GiB; see texelOffsetInTexture().
-    HIP_DEMAND_INLINE bool wideOffsets() const { return bits( sampling, 7, 1 ) != 0; }
+    HIP_DEMAND_INLINE bool     wideOffsets() const { return bits( sampling, 7, 1 ) != 0; }
+    HIP_DEMAND_INLINE uint32_t maxAnisotropy() const { return bits( sampling, 8, 5 ); }  // 1..16; see tex2DGrad().
 
     HIP_DEMAND_INLINE void setAddressMode( uint32_t axis, uint32_t mode ) { setBits( sampling, 2 * axis, 2, mode ); }
     HIP_DEMAND_INLINE void setFilterMode( uint32_t mode ) { setBits( sampling, 4, 1, mode ); }
     HIP_DEMAND_INLINE void setMipmapFilterMode( uint32_t mode ) { setBits( sampling, 5, 1, mode ); }
     HIP_DEMAND_INLINE void setNormalizedCoords( bool normalized ) { setBits( sampling, 6, 1, normalized ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setWideOffsets( bool wide ) { setBits( sampling, 7, 1, wide ? 1u : 0u ); }
+    HIP_DEMAND_INLINE void setMaxAnisotropy( uint32_t samples ) { setBits( sampling, 8, 5, samples ); }
 
     // --- texel ---
     HIP_DEMAND_INLINE hipArray_Format format() const { return static_cast<hipArray_Format>( bits( texel, 0, 8 ) ); }

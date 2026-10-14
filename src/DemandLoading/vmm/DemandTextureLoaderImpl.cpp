@@ -444,6 +444,7 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     info->setFilterMode( texture->descriptor.filterMode );
     info->setMipmapFilterMode( texture->descriptor.mipmapFilterMode );
     info->setNormalizedCoords( texture->descriptor.normalizedCoords );
+    info->setMaxAnisotropy( std::clamp( texture->descriptor.maxAnisotropy, 1u, 16u ) );
     info->setTexel( image.format, image.numChannels, bytesPerTexel );
     info->setLayout( powerOfTwoExponent( tileShape.x ), powerOfTwoExponent( tileShape.y ), image.numMipLevels, mipTail.firstLevel );
     info->width  = image.width;
