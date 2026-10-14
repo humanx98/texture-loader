@@ -32,6 +32,11 @@ struct PageTable
 class PageSystem : NonCopyble
 {
   public:
+    // Fixed page size, matching the OptiX Toolkit tile size. Must be a power of two:
+    // the sampler computes page addresses with shifts.
+    static constexpr size_t PAGE_BYTES = 64 * 1024;
+    static_assert( ( PAGE_BYTES & ( PAGE_BYTES - 1 ) ) == 0, "PAGE_BYTES must be a power of two" );
+
     explicit PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages );
     ~PageSystem();
     void map( uint32_t pageId );
@@ -42,7 +47,6 @@ class PageSystem : NonCopyble
         return DeviceSpan<uint8_t>( virtual_.addressSpace.ptr + pageId * pageBytes_, pageBytes_ );
     }
     DeviceSpan<uint8_t> virtualAddressSpace() const { return virtual_.addressSpace; }
-    size_t              granularity() const { return granularity_; }
     size_t              pageBytes() const { return pageBytes_; }
     int                 device() const { return device_; }
 
@@ -56,7 +60,6 @@ class PageSystem : NonCopyble
     };
 
     int                   device_      = 0;
-    size_t                granularity_ = 0;
     size_t                pageBytes_   = 0;
     hipMemAllocationProp  allocationProp_{};
     std::vector<uint32_t> virtualIdToPhysicalId_{};

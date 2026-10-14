@@ -23,6 +23,7 @@ cmake_install.cmake
 !CMakeLists.txt
 !cmake/FindHIP.cmake
 !cmake/VcpkgBootstrap.cmake
+!cmake/Mempulse.cmake
 !tests/VcpkgBootstrapTests.cmake
 external/vcpkg/
 vcpkg_installed/

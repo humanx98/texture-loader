@@ -312,25 +312,9 @@ if(USE_OIIO)
         TEST_IMAGES_DIR="${PROJECT_SOURCE_DIR}/test_images"
     )
 
-    if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
-        message(FATAL_ERROR "Bundled MemPulse binaries support only Windows x64")
-    endif()
-
-    set(MEMPULSE_ROOT "${PROJECT_SOURCE_DIR}/external/mempulse")
-    add_library(Mempulse::Mempulse SHARED IMPORTED)
-    set_target_properties(Mempulse::Mempulse PROPERTIES
-        IMPORTED_IMPLIB "${MEMPULSE_ROOT}/lib/x64/mempulse.lib"
-        IMPORTED_LOCATION "${MEMPULSE_ROOT}/bin/x64/mempulse.dll"
-        INTERFACE_INCLUDE_DIRECTORIES "${MEMPULSE_ROOT}/include"
-    )
+    include(Mempulse)
     target_link_libraries(vmm_loader_vram_usage PRIVATE Mempulse::Mempulse)
-    add_custom_command(TARGET vmm_loader_vram_usage POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:Mempulse::Mempulse>
-            $<TARGET_FILE_DIR:vmm_loader_vram_usage>
-        COMMENT "Copying MemPulse runtime library"
-        VERBATIM
-    )
+    mempulse_copy_runtime(vmm_loader_vram_usage)
 
     add_custom_command(TARGET vmm_loader_vram_usage_kernel POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -350,7 +334,6 @@ if(USE_OIIO)
     add_dependencies(vmm_loader_sampler_benchmark vmm_loader_sampler_benchmark_kernel)
 
     install(TARGETS vmm_loader_vram_usage vmm_loader_sampler_benchmark RUNTIME DESTINATION bin)
-    install(FILES "${MEMPULSE_ROOT}/bin/x64/mempulse.dll" DESTINATION bin)
     install(FILES
         $<TARGET_PROPERTY:vmm_loader_vram_usage_kernel,HIP_CODE_OBJECT>
         DESTINATION bin

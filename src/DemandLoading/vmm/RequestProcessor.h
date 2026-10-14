@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <mutex>
 #include <queue>
+#include <thread>
 
 namespace hip_demand::vmm {
 

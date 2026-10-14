@@ -8,6 +8,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <hip/hip_runtime.h>
 #include <limits>
 #include <optional>
@@ -144,12 +145,12 @@ inline uint32_t powerOfTwoExponent( uint32_t value )
     return exponent;
 }
 
-inline uint2 tileShapeForGranularity( size_t granularity, uint32_t bytesPerTexel )
+inline uint2 tileShapeForPageBytes( size_t pageBytes, uint32_t bytesPerTexel )
 {
     assert( bytesPerTexel );
-    assert( granularity >= bytesPerTexel );
+    assert( pageBytes >= bytesPerTexel );
 
-    const size_t availableTexels = granularity / bytesPerTexel;
+    const size_t availableTexels = pageBytes / bytesPerTexel;
 
     size_t width = 1;
     while( width <= availableTexels / width / 4 )
@@ -259,7 +260,7 @@ inline void memcpyDtoH( HostSpan<T>& dst, const DeviceSpan<T>& src, size_t count
 }
 
 template <typename T>
-inline void memcpyHtoD( DeviceSpan<T>& dst, const HostSpan<T>& src, size_t count, hipStream_t stream = nullptr )
+inline void memcpyHtoD( const DeviceSpan<T>& dst, const HostSpan<T>& src, size_t count, hipStream_t stream = nullptr )
 {
     size_t size = count * sizeof( T );
     assert( size <= src.sizeInBytes() );
@@ -275,7 +276,7 @@ inline void memcpyDtoH( HostSpan<T>& dst, const DeviceSpan<T>& src, hipStream_t 
 }
 
 template <typename T>
-inline void memcpyHtoD( DeviceSpan<T>& dst, const HostSpan<T>& src, hipStream_t stream = nullptr )
+inline void memcpyHtoD( const DeviceSpan<T>& dst, const HostSpan<T>& src, hipStream_t stream = nullptr )
 {
     assert( dst.sizeInBytes() == src.sizeInBytes() );
     HIP_CHECK( hipMemcpyAsync( dst.ptr, src.ptr, dst.sizeInBytes(), hipMemcpyHostToDevice, stream ) );

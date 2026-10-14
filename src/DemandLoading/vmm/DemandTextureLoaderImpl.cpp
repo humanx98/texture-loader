@@ -434,7 +434,7 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     validateImage( image );
 
     const uint32_t      bytesPerTexel = getBytesPerChannel( image.format ) * image.numChannels;
-    const uint2         tileShape     = tileShapeForGranularity( pageSystem_.granularity(), bytesPerTexel );
+    const uint2         tileShape     = tileShapeForPageBytes( pageSystem_.pageBytes(), bytesPerTexel );
     const MipTailLayout mipTail       = computeMipTailLayout( image, bytesPerTexel, pageSystem_.pageBytes() );
 
     auto info = uploadPool_.acquire<DeviceTextureInfo>( 1, stream );

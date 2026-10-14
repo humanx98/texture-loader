@@ -17,15 +17,17 @@ PageSystem::PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
     allocationProp_.type          = hipMemAllocationTypePinned;
     allocationProp_.location.type = hipMemLocationTypeDevice;
     allocationProp_.location.id   = device_;
-    HIP_CHECK( hipMemGetAllocationGranularity( &granularity_, &allocationProp_, hipMemAllocationGranularityMinimum ) );
-    // The sampler computes page addresses with shifts.
-    if( granularity_ == 0 || ( granularity_ & ( granularity_ - 1 ) ) != 0 )
-        throw std::runtime_error( "hipMemAllocationGranularityMinimum is not a power of two" );
+    
+    size_t granularity = 0;
+    HIP_CHECK( hipMemGetAllocationGranularity( &granularity, &allocationProp_, hipMemAllocationGranularityMinimum ) );
+    // Each page is backed by its own physical allocation, so the page size must be a multiple of the granularity.
+    if( granularity == 0 || PAGE_BYTES % granularity != 0 )
+        throw std::runtime_error( "Page size is not a multiple of hipMemAllocationGranularityMinimum" );
 
-    pageBytes_                = granularity_;
+    pageBytes_                = PAGE_BYTES;
     virtual_.addressSpace.len = static_cast<size_t>( virtual_.maxPages ) * pageBytes_;
     HIP_CHECK( hipMemAddressReserve( reinterpret_cast<void**>( &virtual_.addressSpace.ptr ), virtual_.addressSpace.len,
-                                     granularity_, nullptr, 0 ) );
+                                     pageBytes_, nullptr, 0 ) );
 
     virtualIdToPhysicalId_.assign( virtual_.maxPages, INVALID_PAGE );
 }
