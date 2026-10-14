@@ -50,7 +50,7 @@ class GpuMemoryMonitor
 #ifdef _WIN32
         constexpr MempulseBackend backend = MEMPULSE_BACKEND_D3DKMT;
 #else
-        constexpr MempulseBackend backend = MEMPULSE_BACKEND_ANY;
+        constexpr MempulseBackend backend = MEMPULSE_BACKEND_DRM;
 #endif
         if( MempulseInitialize( &context_, backend ) != MEMPULSE_SUCCESS )
             throw std::runtime_error( "Could not initialize MemPulse" );

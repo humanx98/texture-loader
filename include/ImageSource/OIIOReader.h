@@ -17,7 +17,9 @@ class OIIOReader : public ImageSource
 {
   public:
     /// Constructor
-    explicit OIIOReader( const std::string& filename, std::optional<hipArray_Format> outputFormat = std::nullopt );
+    explicit OIIOReader( const std::string&             filename,
+                         std::optional<hipArray_Format> outputFormat     = std::nullopt,
+                         bool                           generateMipChain = false );
     
     /// Destructor
     ~OIIOReader() override;
@@ -50,6 +52,8 @@ class OIIOReader : public ImageSource
 
     std::string filename_;
     std::optional<hipArray_Format> outputFormat_;
+    bool generateMipChain_ = false;
+    unsigned int authoredMipLevels_ = 0;
     TextureInfo info_;
     bool isOpen_ = false;
     

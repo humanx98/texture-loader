@@ -56,7 +56,7 @@ struct ImageResult
 
 std::shared_ptr<hip_demand::ImageSource> readBenchmarkImage( const fs::path& path )
 {
-    auto                    image = std::make_shared<hip_demand::OIIOReader>( path.string() );
+    auto                    image = std::make_shared<hip_demand::OIIOReader>( path.string(), std::nullopt, true );
     hip_demand::TextureInfo info{};
     image->open( &info );
     if( !info.isValid || info.width == 0 || info.height == 0 )

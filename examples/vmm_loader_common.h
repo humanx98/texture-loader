@@ -62,7 +62,7 @@ inline void saveGpuOutput( const fs::path& outputPath, hipStream_t stream, const
 
 inline std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path )
 {
-    auto image = std::make_shared<hip_demand::OIIOReader>( path.string(), HIP_AD_FORMAT_UNSIGNED_INT8 );
+    auto image = std::make_shared<hip_demand::OIIOReader>( path.string(), HIP_AD_FORMAT_UNSIGNED_INT8, true );
 
     hip_demand::TextureInfo info{};
     image->open( &info );

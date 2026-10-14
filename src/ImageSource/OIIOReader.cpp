@@ -185,9 +185,10 @@ float decodeChannel( const unsigned char* data, hipArray_Format format )
 
 }  // namespace
 
-OIIOReader::OIIOReader( const std::string& filename, std::optional<hipArray_Format> outputFormat )
+OIIOReader::OIIOReader( const std::string& filename, std::optional<hipArray_Format> outputFormat, bool generateMipChain )
     : filename_( filename )
     , outputFormat_( outputFormat )
+    , generateMipChain_( generateMipChain )
 {
 }
 
@@ -227,7 +228,6 @@ void OIIOReader::open( TextureInfo* info )
     info_.width        = spec.width;
     info_.height       = spec.height;
     info_.numChannels  = spec.nchannels;
-    info_.numMipLevels = calculateNumMipLevels( spec.width, spec.height );
     info_.isValid      = true;
     info_.isTiled      = spec.tile_width > 0;
 
@@ -240,6 +240,20 @@ void OIIOReader::open( TextureInfo* info )
         throw std::invalid_argument( "Unsupported requested HIP array format: "
                                      + std::to_string( static_cast<int>( info_.format ) ) );
     }
+
+    // HIP arrays halve dimensions with rounding down. A valid EXR can round up, so keep only
+    // the compatible prefix of the authored levels.
+    const unsigned int fullMipLevels = calculateNumMipLevels( spec.width, spec.height );
+    authoredMipLevels_               = 1;
+    for( ; authoredMipLevels_ < fullMipLevels; ++authoredMipLevels_ )
+    {
+        const OIIO::ImageSpec mipSpec = inp->spec_dimensions( 0, static_cast<int>( authoredMipLevels_ ) );
+        if( mipSpec.width != std::max( 1, spec.width >> authoredMipLevels_ )
+            || mipSpec.height != std::max( 1, spec.height >> authoredMipLevels_ ) || mipSpec.depth != 1
+            || mipSpec.nchannels != spec.nchannels )
+            break;
+    }
+    info_.numMipLevels = generateMipChain_ ? fullMipLevels : authoredMipLevels_;
 
     inp->close();
 
@@ -312,8 +326,7 @@ bool OIIOReader::loadImage()
     mipLevels_.resize( info_.numMipLevels );
     mipLevels_[0] = std::move( baseLevel );
 
-    // Keep mip levels supplied by the file; generate any missing levels for
-    // VMM tile sampling.
+    // Keep mip levels supplied by the file; generate the rest when the full chain is requested.
     int width  = spec.width;
     int height = spec.height;
     unsigned long long bytesRead = baseSize;
@@ -328,13 +341,9 @@ bool OIIOReader::loadImage()
         const size_t levelSize = internal::imageByteSize( width, height, info_.numChannels, bytesPerChannel );
         mipLevels_[level].resize( levelSize );
 
-        OIIO::ImageSpec mipSpec;
-        const bool hasNativeMip = inp->seek_subimage( 0, static_cast<int>( level ), mipSpec )
-            && mipSpec.width == width && mipSpec.height == height && mipSpec.depth == 1
-            && mipSpec.nchannels == static_cast<int>( info_.numChannels );
-        if( hasNativeMip )
+        if( level < authoredMipLevels_ )
         {
-            if( !inp->read_image( 0, static_cast<int>( level ), 0, mipSpec.nchannels, outputFormat,
+            if( !inp->read_image( 0, static_cast<int>( level ), 0, spec.nchannels, outputFormat,
                                   mipLevels_[level].data() ) )
             {
                 inp->close();
@@ -417,6 +426,9 @@ bool OIIOReader::readMipLevelNoLock( char* dest, unsigned int mipLevel, unsigned
 
 bool OIIOReader::readMipLevel( char* dest, unsigned int mipLevel, unsigned int expectedWidth, unsigned int expectedHeight, hipStream_t stream )
 {
+    if( !dest )
+        return false;
+
     for( ;; )
     {
         {
@@ -477,6 +489,9 @@ bool OIIOReader::readTileNoLock( char* dest, unsigned int mipLevel, const Tile& 
 
 bool OIIOReader::readTile( char* dest, unsigned int mipLevel, const Tile& tile, hipStream_t stream )
 {
+    if( !dest )
+        return false;
+
     for( ;; )
     {
         {
@@ -495,6 +510,14 @@ bool OIIOReader::readTile( char* dest, unsigned int mipLevel, const Tile& tile, 
 
 bool OIIOReader::readBaseColor( float4& dest )
 {
+    {
+        // The base color is the 1x1 level, which exists only when the mip chain is complete.
+        std::shared_lock lock( mutex_ );
+        const unsigned int lastLevel = info_.numMipLevels - 1;
+        if( !isOpen_ || std::max( 1u, info_.width >> lastLevel ) != 1 || std::max( 1u, info_.height >> lastLevel ) != 1 )
+            return false;
+    }
+
     for( ;; )
     {
         {
@@ -509,8 +532,8 @@ bool OIIOReader::readBaseColor( float4& dest )
 
                 const unsigned char* data = mip.data();
                 dest.x                    = decodeChannel( data, info_.format );
-                dest.y = info_.numChannels > 1 ? decodeChannel( data + bytesPerChannel, info_.format ) : dest.x;
-                dest.z = info_.numChannels > 2 ? decodeChannel( data + 2 * bytesPerChannel, info_.format ) : dest.x;
+                dest.y = info_.numChannels > 1 ? decodeChannel( data + bytesPerChannel, info_.format ) : 0.0f;
+                dest.z = info_.numChannels > 2 ? decodeChannel( data + 2 * bytesPerChannel, info_.format ) : 0.0f;
                 dest.w = info_.numChannels > 3 ? decodeChannel( data + 3 * bytesPerChannel, info_.format ) : 1.0f;
                 return true;
             }

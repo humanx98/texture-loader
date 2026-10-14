@@ -12,17 +12,12 @@ include(ExternalProject)
 
 set(MEMPULSE_INSTALL_DIR "${CMAKE_BINARY_DIR}/_deps/mempulse")
 
-# MemPulse prefers its DRM backend on Linux and falls back to HIP without libdrm_amdgpu.
+# The examples use the DRM backend on Linux, which needs libdrm_amdgpu (libdrm-dev).
 set(MEMPULSE_BACKEND_DRM OFF)
 if(UNIX AND NOT APPLE)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(LIBDRM_AMDGPU QUIET libdrm_amdgpu)
-        if(LIBDRM_AMDGPU_FOUND)
-            set(MEMPULSE_BACKEND_DRM ON)
-        endif()
-    endif()
-    message(STATUS "MemPulse DRM backend: ${MEMPULSE_BACKEND_DRM}")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBDRM_AMDGPU REQUIRED libdrm_amdgpu)
+    set(MEMPULSE_BACKEND_DRM ON)
 endif()
 
 set(MEMPULSE_CMAKE_ARGS
