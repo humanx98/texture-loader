@@ -19,6 +19,7 @@ extern "C" __global__ void renderUdimTexture( hip_demand::vmm::DeviceContext con
                                               uint32_t                       outputWidth,
                                               uint32_t                       outputHeight,
                                               uint32_t                       textureId,
+                                              uint32_t                       channel,
                                               uint32_t                       udim,
                                               uint32_t                       vdim,
                                               float                          footprintScale )
@@ -36,7 +37,7 @@ extern "C" __global__ void renderUdimTexture( hip_demand::vmm::DeviceContext con
     const float2 ddy            = make_float2( 0.0f, cellsPerPixelY * footprintScale );
 
     bool         resident = false;
-    const float3 color    = hip_demand::vmm::tex2DGradUdim<float3>( context, textureId, u, v, ddx, ddy, resident );
+    const float3 color    = hip_demand::vmm::tex2DGradUdim<float3>( context, textureId, channel, u, v, ddx, ddy, resident );
 
     const size_t offset = ( static_cast<size_t>( y ) * outputWidth + x ) * 4;
     output[offset + 0]  = toUnorm8( color.x );

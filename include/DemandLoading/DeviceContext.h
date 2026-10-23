@@ -100,7 +100,6 @@ struct DeviceTextureInfo
     // The texture's pages span more than 4 GiB; see texelOffsetInTexture().
     HIP_DEMAND_INLINE bool     wideOffsets() const { return bits( sampling, 7, 1 ) != 0; }
     HIP_DEMAND_INLINE uint32_t maxAnisotropy() const { return bits( sampling, 8, 5 ); }  // 1..16; see tex2DGrad().
-    HIP_DEMAND_INLINE bool isUdimBase() const { return bits( sampling, 13, 1 ) != 0; }
     HIP_DEMAND_INLINE bool isEmpty() const { return bits( sampling, 14, 1 ) != 0; }
     HIP_DEMAND_INLINE bool isLoaded() const { return bits( sampling, 15, 1 ) != 0; }
 
@@ -110,7 +109,6 @@ struct DeviceTextureInfo
     HIP_DEMAND_INLINE void setNormalizedCoords( bool normalized ) { setBits( sampling, 6, 1, normalized ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setWideOffsets( bool wide ) { setBits( sampling, 7, 1, wide ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setMaxAnisotropy( uint32_t samples ) { setBits( sampling, 8, 5, samples ); }
-    HIP_DEMAND_INLINE void setUdimBase( bool base ) { setBits( sampling, 13, 1, base ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setEmpty( bool empty ) { setBits( sampling, 14, 1, empty ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setLoaded( bool loaded ) { setBits( sampling, 15, 1, loaded ? 1u : 0u ); }
 
@@ -118,13 +116,15 @@ struct DeviceTextureInfo
     HIP_DEMAND_INLINE bool     isUdim() const { return udimStartTexture != INVALID_TEXTURE; }
     HIP_DEMAND_INLINE uint32_t udim() const { return bits( udimGrid, 0, 16 ); }
     HIP_DEMAND_INLINE uint32_t vdim() const { return bits( udimGrid, 16, 16 ); }
+    HIP_DEMAND_INLINE uint32_t udimChannels() const { return bits( sampling, 16, 8 ); }  // Textures per grid cell.
 
-    HIP_DEMAND_INLINE void setUdimGrid( uint32_t startTexture, uint32_t udim_, uint32_t vdim_ )
+    HIP_DEMAND_INLINE void setUdimGrid( uint32_t startTexture, uint32_t udim_, uint32_t vdim_, uint32_t channels )
     {
         udimStartTexture = startTexture;
         udimGrid         = 0;
         setBits( udimGrid, 0, 16, udim_ );
         setBits( udimGrid, 16, 16, vdim_ );
+        setBits( sampling, 16, 8, channels );
     }
 
     // --- texel ---

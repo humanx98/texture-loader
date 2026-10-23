@@ -80,7 +80,7 @@ class DemandTextureLoader
                                                     const std::vector<TextureDescriptor>&            textureDescs,
                                                     uint32_t                                         udim,
                                                     uint32_t                                         vdim,
-                                                    uint32_t baseTextureId = INVALID_TEXTURE ) = 0;
+                                                    uint32_t numChannels = 1 ) = 0;
     virtual void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext )         = 0;
     virtual Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) = 0;
 };

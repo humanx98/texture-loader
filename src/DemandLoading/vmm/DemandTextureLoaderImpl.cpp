@@ -259,128 +259,52 @@ const DemandTexture& DemandTextureLoaderImpl::createUdimTexture( const std::vect
                                                                  const std::vector<TextureDescriptor>& textureDescs,
                                                                  uint32_t                              udim,
                                                                  uint32_t                              vdim,
-                                                                 uint32_t                              baseTextureId )
+                                                                 uint32_t                              numChannels )
 {
-    // The base texture's descriptor is patched below, which must not interleave with its loading.
     std::scoped_lock lock( mutex_, metadataMutex_ );
 
     constexpr uint32_t maxGridDimension = 0xFFFF;  // DeviceTextureInfo::udimGrid packs udim and vdim into 16 bits each.
+    constexpr uint32_t maxChannels      = 0xFF;    // DeviceTextureInfo packs the channel count and index into 8 bits each.
     if( udim == 0 || vdim == 0 )
         throw std::invalid_argument( "udim and vdim must both be positive" );
     if( udim > maxGridDimension || vdim > maxGridDimension )
         throw std::invalid_argument( "udim and vdim must not exceed " + std::to_string( maxGridDimension ) );
+    if( numChannels == 0 || numChannels > maxChannels )
+        throw std::invalid_argument( "numChannels must be between 1 and " + std::to_string( maxChannels ) );
 
-    const size_t cellCount = static_cast<size_t>( udim ) * vdim;
-    if( imageSources.size() != cellCount )
-        throw std::invalid_argument( "Expected one image source per UDIM grid cell: " + std::to_string( cellCount )
-                                     + ", got " + std::to_string( imageSources.size() ) );
-    if( textureDescs.size() != cellCount )
-        throw std::invalid_argument( "Expected one texture descriptor per UDIM grid cell: " + std::to_string( cellCount )
-                                     + ", got " + std::to_string( textureDescs.size() ) );
-    if( cellCount > options_.maxTextures - textures_.size() )
+    const size_t textureCount = static_cast<size_t>( udim ) * vdim * numChannels;
+    if( imageSources.size() != textureCount )
+        throw std::invalid_argument( "Expected one image source per UDIM grid cell and channel: "
+                                     + std::to_string( textureCount ) + ", got " + std::to_string( imageSources.size() ) );
+    if( textureDescs.size() != textureCount )
+        throw std::invalid_argument( "Expected one texture descriptor per UDIM grid cell and channel: "
+                                     + std::to_string( textureCount ) + ", got " + std::to_string( textureDescs.size() ) );
+    if( textureCount > options_.maxTextures - textures_.size() )
         throw std::runtime_error( "Maximum demand texture count exceeded" );
 
-    for( size_t cell = 0; cell < cellCount; ++cell )
+    // tex2DGradUdim() maps grid coordinates onto subtextures as fractions of their extent.
+    for( size_t i = 0; i < textureCount; ++i )
     {
-        if( imageSources[cell] && !textureDescs[cell].normalizedCoords )
+        if( imageSources[i] && !textureDescs[i].normalizedCoords )
             throw std::invalid_argument( "UDIM subtextures must use normalized coordinates" );
     }
 
-    DemandTextureImpl* baseTexture = nullptr;
-    if( baseTextureId != INVALID_TEXTURE )
+    const uint32_t                    startTextureId = static_cast<uint32_t>( textures_.size() );
+    const DemandTextureImpl::UdimGrid grid{ startTextureId, udim, vdim, numChannels };
+    for( size_t i = 0; i < textureCount; ++i )
     {
-        if( baseTextureId >= textures_.size() )
-            throw std::invalid_argument( "Unknown base texture id " + std::to_string( baseTextureId ) );
-        baseTexture = textures_[baseTextureId].get();
-        if( baseTexture->udim.isUdim() )
-            throw std::invalid_argument( "Base texture " + std::to_string( baseTextureId ) + " already belongs to a UDIM grid" );
-        if( baseTexture->isEmpty() )
-            throw std::invalid_argument( "Base texture " + std::to_string( baseTextureId ) + " has no image" );
-        if( !baseTexture->descriptor.normalizedCoords )
-            throw std::invalid_argument( "A UDIM base texture must use normalized coordinates" );
-    }
-    // Without a base texture the first non-empty cell is the entry point, so there has to be one.
-    else if( std::all_of( imageSources.begin(), imageSources.end(), []( const auto& image ) { return image == nullptr; } ) )
-        throw std::invalid_argument( "A UDIM texture without a base texture needs at least one image source" );
-
-    const uint32_t                startTextureId = static_cast<uint32_t>( textures_.size() );
-    DemandTextureImpl::UdimGrid   grid{ startTextureId, udim, vdim, false };
-    const DemandTextureImpl*      entryTexture = nullptr;
-    for( size_t cell = 0; cell < cellCount; ++cell )
-    {
-        const uint32_t textureId = startTextureId + static_cast<uint32_t>( cell );
-        textures_.emplace_back( std::make_unique<DemandTextureImpl>( textureId, imageSources[cell], textureDescs[cell] ) );
-        DemandTextureImpl& texture = *textures_.back();
-        texture.udim               = grid;
-
-        if( texture.isEmpty() )
-        {
-            // Nothing will ever be requested for the cell, so the loader writes its descriptor itself.
-            LoadedTextureInfo empty{ textureId, {} };
-            empty.info.setLoaded( true );
-            empty.info.setEmpty( true );
-            setUdimFields( empty.info, grid );
-            pendingTextureInfoUpdates_.push_back( empty );
-        }
-        else if( !entryTexture )
-            entryTexture = &texture;
+        const uint32_t textureId = startTextureId + static_cast<uint32_t>( i );
+        textures_.emplace_back( std::make_unique<DemandTextureImpl>( textureId, imageSources[i], textureDescs[i] ) );
+        textures_.back()->udim = grid;
     }
 
-    if( !baseTexture )
-        return *entryTexture;
-
-    grid.isBase       = true;
-    baseTexture->udim = grid;
-    // Metadata already on the device lacks the grid: patch the host copy and re-upload it.
-    if( baseTexture->loadedTextureInfoId != INVALID_TEXTURE )
-    {
-        LoadedTextureInfo& loaded = loadedTextureInfos_[baseTexture->loadedTextureInfoId];
-        setUdimFields( loaded.info, grid );
-        pendingTextureInfoUpdates_.push_back( loaded );
-    }
-    return *baseTexture;
+    return *textures_[startTextureId];
 }
 
 void DemandTextureLoaderImpl::setUdimFields( DeviceTextureInfo& info, const DemandTextureImpl::UdimGrid& udim ) const
 {
-    if( !udim.isUdim() )
-        return;
-    info.setUdimGrid( udim.startTexture, udim.udim, udim.vdim );
-    info.setUdimBase( udim.isBase );
-}
-
-void DemandTextureLoaderImpl::uploadPendingTextureInfoUpdates( hipStream_t stream )
-{
-    std::vector<LoadedTextureInfo> pending;
-    {
-        std::lock_guard lock( metadataMutex_ );
-        pending.swap( pendingTextureInfoUpdates_ );
-    }
-    if( pending.empty() )
-        return;
-
-    // Updates are rare (a new UDIM grid) and small, so unlike tile uploads they do not need pinned memory: they are
-    // copied from pageable memory and the stream is synchronized before the buffer goes out of scope. Ids are mostly
-    // consecutive (the cells of one grid), so runs of them go in one copy.
-    std::sort( pending.begin(), pending.end(),
-               []( const LoadedTextureInfo& a, const LoadedTextureInfo& b ) { return a.textureId < b.textureId; } );
-    std::vector<DeviceTextureInfo> infos( pending.size() );
-    for( size_t i = 0; i < pending.size(); ++i )
-        infos[i] = pending[i].info;
-
-    for( size_t first = 0; first < pending.size(); )
-    {
-        size_t end = first + 1;
-        while( end < pending.size() && pending[end].textureId == pending[end - 1].textureId + 1 )
-            ++end;
-
-        const size_t count = end - first;
-        const auto dst = deviceContext_.textureInfos.subspan( pending[first].textureId, count );
-        HostSpan<DeviceTextureInfo> src( infos.data() + first, count );
-        memcpyHtoD( dst, src, stream );
-        first = end;
-    }
-    HIP_CHECK( hipStreamSynchronize( stream ) );
+    if( udim.isUdim() )
+        info.setUdimGrid( udim.startTexture, udim.udim, udim.vdim, udim.channels );
 }
 
 void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& deviceContext )
@@ -389,7 +313,6 @@ void DemandTextureLoaderImpl::launchPrepare( hipStream_t stream, DeviceContext& 
 
     deviceContext              = deviceContext_;
     deviceContext.textureInfos = deviceContext.textureInfos.subspan( 0, textures_.size() );
-    uploadPendingTextureInfoUpdates( stream );
     clearEvictedPages( stream );
     memset( deviceContext.referenceBits, 0, stream );
 }
@@ -557,7 +480,17 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
         texture = textures_.at( textureId ).get();
     }
 
-    assert( !texture->isEmpty() );
+    // An empty UDIM cell has no image and no pages: its descriptor only marks it loaded and empty, with the grid.
+    if( texture->isEmpty() )
+    {
+        auto info = uploadPool_.acquire<DeviceTextureInfo>( 1, stream );
+        *info     = {};
+        info->setLoaded( true );
+        info->setEmpty( true );
+        setUdimFields( *info, texture->udim );
+        memcpyHtoD( deviceContext_.textureInfos.subspan( textureId, 1 ), info.span(), stream );
+        return;
+    }
 
     TextureInfo image{};
     texture->image->open( &image );
@@ -582,10 +515,10 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     info->height = image.height;
     info->setLoaded( true );
 
-    // The grid fields are read under the same locks createUdimTexture() writes them with, so that a texture becoming
-    // a UDIM entry point either shows up here or finds loadedTextureInfoId set and re-uploads the descriptor.
-    std::scoped_lock lock( mutex_, metadataMutex_ );
+    // The grid fields are set at creation, before any request for the texture can arrive.
     setUdimFields( *info, texture->udim );
+
+    std::lock_guard lock( metadataMutex_ );
 
     // Tiled levels get consecutive pages in level order, followed by one page for the mip tail.
     const uint32_t firstPage = pageTable_.textureTiles.nextAvailablePage;

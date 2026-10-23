@@ -1,10 +1,10 @@
 // Renders a UDIM texture assembled from the test images with the VMM demand loader.
 //
 // The images fill a 3x3 grid with the center cell left empty, repeating when there are fewer images than cells. The
-// smallest image is the base texture, so that it lacks the resolution of the near views and the subtextures are needed.
-// Three views are rendered until every pixel is final and saved as PNG: the grid without a base texture, the grid with
-// a base texture, and a distant view of the grid with a base texture, where the base texture alone has enough
-// resolution. The passes printed for each view show the loading steps: entry-point metadata, subtexture metadata, tiles.
+// grid has two channels: the images as they are, and the same images with inverted colors.
+// Four views are rendered until every pixel is final and saved as PNG: the grid, a distant view of it, which samples
+// the subtextures' mip tails, the inverted channel, and a grid whose cells are all empty, which renders black in one
+// pass. The passes printed for each view show the loading steps: entry-point metadata, subtexture metadata, tiles.
 
 #include <DemandLoading/VmmDemandTextureLoader.h>
 
@@ -29,7 +29,75 @@ constexpr uint32_t blockSize      = 16;
 constexpr uint32_t maxPasses      = 16;
 constexpr uint32_t udim           = 3;
 constexpr uint32_t vdim           = 3;
+constexpr uint32_t numChannels    = 2;  // The images, and the images with inverted colors.
 constexpr uint32_t emptyCell      = 4;  // The center of the grid.
+
+// Inverts the colors of an 8-bit image source, leaving a fourth (alpha) channel alone.
+class InvertedImage : public hip_demand::ImageSource
+{
+  public:
+    explicit InvertedImage( std::shared_ptr<hip_demand::ImageSource> image )
+        : image_( std::move( image ) )
+    {
+    }
+
+    void open( hip_demand::TextureInfo* info ) override
+    {
+        image_->open( info );
+        if( image_->getInfo().format != HIP_AD_FORMAT_UNSIGNED_INT8 )
+            throw std::runtime_error( "InvertedImage needs an 8-bit image" );
+    }
+    void                           close() override { image_->close(); }
+    bool                           isOpen() const override { return image_->isOpen(); }
+    const hip_demand::TextureInfo& getInfo() const override { return image_->getInfo(); }
+    unsigned long long             getNumBytesRead() const override { return image_->getNumBytesRead(); }
+    double                         getTotalReadTime() const override { return image_->getTotalReadTime(); }
+
+    bool readMipLevel( char* dest, unsigned int mipLevel, unsigned int width, unsigned int height, hipStream_t stream ) override
+    {
+        if( !image_->readMipLevel( dest, mipLevel, width, height, stream ) )
+            return false;
+        invert( dest, static_cast<size_t>( width ) * height );
+        return true;
+    }
+
+    bool readTile( char* dest, unsigned int mipLevel, const hip_demand::Tile& tile, hipStream_t stream ) override
+    {
+        if( !image_->readTile( dest, mipLevel, tile, stream ) )
+            return false;
+        invert( dest, static_cast<size_t>( tile.width ) * tile.height );
+        return true;
+    }
+
+    bool readBaseColor( float4& color ) override
+    {
+        if( !image_->readBaseColor( color ) )
+            return false;
+        color = make_float4( 1.0f - color.x, 1.0f - color.y, 1.0f - color.z, color.w );
+        return true;
+    }
+
+  private:
+    void invert( char* texels, size_t texelCount ) const
+    {
+        const unsigned int channels      = getInfo().numChannels;
+        const unsigned int colorChannels = std::min( channels, 3u );
+        for( size_t texel = 0; texel < texelCount; ++texel )
+        {
+            unsigned char* bytes = reinterpret_cast<unsigned char*>( texels ) + texel * channels;
+            for( unsigned int channel = 0; channel < colorChannels; ++channel )
+                bytes[channel] = static_cast<unsigned char>( 255 - bytes[channel] );
+        }
+    }
+
+    std::shared_ptr<hip_demand::ImageSource> image_;
+};
+
+std::shared_ptr<hip_demand::ImageSource> readChannelImage( const fs::path& path, uint32_t channel )
+{
+    std::shared_ptr<hip_demand::ImageSource> image = readImage( path );
+    return channel == 0 ? image : std::make_shared<InvertedImage>( std::move( image ) );
+}
 
 class KernelModule
 {
@@ -59,8 +127,9 @@ class KernelModule
 struct View
 {
     const char* name;
-    bool        useBaseTexture;
     float       footprintScale;
+    uint32_t    channel;
+    bool        allCellsEmpty = false;  // No images at all: every cell of every channel is empty.
 };
 
 hip_demand::vmm::TextureDescriptor makeDescriptor()
@@ -83,11 +152,7 @@ uint32_t countPixels( const std::vector<uint8_t>& pixels, uint8_t alpha )
     return count;
 }
 
-void renderView( const fs::path&              kernelPath,
-                       const std::vector<fs::path>& cellImages,
-                       const fs::path&              baseImage,
-                       const View&                  view,
-                       const fs::path&              outputPath )
+void renderView( const fs::path& kernelPath, const std::vector<fs::path>& cellImages, const View& view, const fs::path& outputPath )
 {
     using namespace hip_demand::vmm;
 
@@ -102,20 +167,20 @@ void renderView( const fs::path&              kernelPath,
     GpuResources gpu( static_cast<size_t>( outputWidth ) * outputHeight * outputChannels );
     auto         loader = createDemandTextureLoader( options );
 
-    uint32_t baseTextureId = INVALID_TEXTURE;
-    if( view.useBaseTexture )
-        baseTextureId = loader->createTexture( readImage( baseImage ), makeDescriptor() ).getId();
-
-    std::vector<std::shared_ptr<hip_demand::ImageSource>> images( udim * vdim );
-    std::vector<TextureDescriptor>                        descriptors( udim * vdim, makeDescriptor() );
-    size_t                                                nextImage = 0;
-    for( uint32_t cell = 0; cell < udim * vdim; ++cell )
+    // The channels of a cell are listed together.
+    std::vector<std::shared_ptr<hip_demand::ImageSource>> images( udim * vdim * numChannels );
+    std::vector<TextureDescriptor>                        descriptors( images.size(), makeDescriptor() );
+    for( uint32_t cell = 0; cell < udim * vdim && !view.allCellsEmpty; ++cell )
     {
-        if( cell != emptyCell )
-            images[cell] = readImage( cellImages[nextImage++ % cellImages.size()] );
+        if( cell == emptyCell )
+            continue;
+        const fs::path& cellImage = cellImages[cell % cellImages.size()];
+        for( uint32_t channel = 0; channel < numChannels; ++channel )
+            images[cell * numChannels + channel] = readChannelImage( cellImage, channel );
     }
 
-    uint32_t textureId   = loader->createUdimTexture( images, descriptors, udim, vdim, baseTextureId ).getId();
+    uint32_t textureId = loader->createUdimTexture( images, descriptors, udim, vdim, numChannels ).getId();
+    uint32_t channel   = view.channel;
     uint32_t renderWidth = outputWidth, renderHeight = outputHeight, gridU = udim, gridV = vdim;
     float    footprintScale = view.footprintScale;
     const uint32_t gridWidth  = ( outputWidth + blockSize - 1 ) / blockSize;
@@ -131,7 +196,7 @@ void renderView( const fs::path&              kernelPath,
     {
         DeviceContext context{};
         loader->launchPrepare( gpu.stream, context );
-        void* arguments[] = { &context, &gpu.output, &renderWidth, &renderHeight, &textureId, &gridU, &gridV, &footprintScale };
+        void* arguments[] = { &context, &gpu.output, &renderWidth, &renderHeight, &textureId, &channel, &gridU, &gridV, &footprintScale };
         HIP_CHECK( hipModuleLaunchKernel( module.kernel(), gridWidth, gridHeight, 1, blockSize, blockSize, 1, 0,
                                           gpu.stream, arguments, nullptr ) );
 
@@ -172,32 +237,17 @@ int main( int argc, char** argv )
         imageDirectory.make_preferred();
 
         std::cout << "VMM loader UDIM texture\n  Image directory: " << imageDirectory.string() << '\n';
-        std::vector<fs::path> imagePaths = findImages( imageDirectory, false );
-        if( imagePaths.size() < 2 )
-            throw std::runtime_error( "The UDIM example needs at least two images" );
-
-        // The smallest image stands in for the whole grid as the base texture; the others fill the cells.
-        const auto pixelCount = []( const fs::path& path ) {
-            const hip_demand::TextureInfo& info = readImage( path )->getInfo();
-            return static_cast<size_t>( info.width ) * info.height;
-        };
-        const auto smallest = std::min_element( imagePaths.begin(), imagePaths.end(), [&]( const fs::path& a, const fs::path& b ) {
-            return pixelCount( a ) < pixelCount( b );
-        } );
-        const fs::path baseImage = *smallest;
-        imagePaths.erase( smallest );
-        std::cout << "  Grid: " << udim << 'x' << vdim << ", cell " << emptyCell << " empty\n  Base image: "
-                  << baseImage.filename().string() << '\n';
+        const std::vector<fs::path> imagePaths = findImages( imageDirectory, false );
+        std::cout << "  Grid: " << udim << 'x' << vdim << ", cell " << emptyCell << " empty\n";
         for( size_t i = 0; i < imagePaths.size(); ++i )
             std::cout << "  Cell image " << i << ": " << imagePaths[i].filename().string() << '\n';
 
-        const std::array<View, 3> views{ { { "no_base", false, 1.0f }, { "base", true, 1.0f }, { "base_far", true, 64.0f } } };
+        const std::array<View, 4> views{ { { "grid", 1.0f, 0 }, { "far", 64.0f, 0 }, { "inverted", 1.0f, 1 }, { "all_empty", 1.0f, 0, true } } };
         for( const View& view : views )
         {
-            std::cout << "\nView " << view.name << " (base texture " << ( view.useBaseTexture ? "on" : "off" )
-                      << ", footprint x" << view.footprintScale << ")\n";
+            std::cout << "\nView " << view.name << " (footprint x" << view.footprintScale << ", channel " << view.channel << ")\n";
             const fs::path outputPath = fs::path( "vmm_loader_udim_" ) += fs::path( view.name ).concat( ".png" );
-            renderView( kernelPath, imagePaths, baseImage, view, outputPath );
+            renderView( kernelPath, imagePaths, view, outputPath );
         }
 
         std::cout << "\nResult: PASS\n";

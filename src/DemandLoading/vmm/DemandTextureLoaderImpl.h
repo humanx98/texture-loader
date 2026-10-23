@@ -90,7 +90,7 @@ class DemandTextureImpl : public DemandTexture, NonCopyble
         uint32_t startTexture = INVALID_TEXTURE;
         uint32_t udim         = 0;
         uint32_t vdim         = 0;
-        bool     isBase       = false;  // The texture covers the whole grid rather than one cell of it.
+        uint32_t channels     = 1;  // Textures per cell.
 
         bool isUdim() const { return startTexture != INVALID_TEXTURE; }
     };
@@ -122,7 +122,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
                                             const std::vector<TextureDescriptor>&            textureDescs,
                                             uint32_t                                         udim,
                                             uint32_t                                         vdim,
-                                            uint32_t                                         baseTextureId ) override;
+                                            uint32_t                                         numChannels ) override;
     void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
 
@@ -147,7 +147,6 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     Resource      decodeResource( uint32_t resourceId ) const;
     LoadedTexture loadedTexture( uint32_t textureId ) const;
-    void          uploadPendingTextureInfoUpdates( hipStream_t stream );
     void          setUdimFields( DeviceTextureInfo& info, const DemandTextureImpl::UdimGrid& udim ) const;
     void          clearEvictedPages( hipStream_t stream );
     void          releaseEvictedPages( uint32_t reusablePageCount );
@@ -169,7 +168,6 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     // Indexed by DemandTextureImpl::loadedTextureInfoId. Textures get their pages when their metadata is loaded, so the
     // list is also ordered by startPage, which decodeResource() relies on.
     std::vector<LoadedTextureInfo> loadedTextureInfos_{};
-    std::vector<LoadedTextureInfo> pendingTextureInfoUpdates_{};
 
     RequestProcessor requestProcessor_;
     PinnedUploadPool uploadPool_;
