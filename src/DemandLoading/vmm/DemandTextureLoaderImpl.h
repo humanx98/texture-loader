@@ -84,18 +84,31 @@ struct ResourceBits
 class DemandTextureImpl : public DemandTexture, NonCopyble
 {
   public:
+    // The UDIM grid a texture is an entry point to; see DeviceTextureInfo::udimStartTexture.
+    struct UdimGrid
+    {
+        uint32_t startTexture = INVALID_TEXTURE;
+        uint32_t udim         = 0;
+        uint32_t vdim         = 0;
+        bool     isBase       = false;  // The texture covers the whole grid rather than one cell of it.
+
+        bool isUdim() const { return startTexture != INVALID_TEXTURE; }
+    };
+
     DemandTextureImpl( uint32_t textureId, std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDescriptor )
         : id( textureId )
-        , image( imageSource )
+        , image( std::move( imageSource ) )
         , descriptor( textureDescriptor )
     {
     }
     uint32_t getId() const override { return id; }
+    bool     isEmpty() const { return image == nullptr; }
 
     uint32_t                     id                  = INVALID_TEXTURE;
     uint32_t                     loadedTextureInfoId = INVALID_TEXTURE;
     std::shared_ptr<ImageSource> image{};
     TextureDescriptor            descriptor;
+    UdimGrid                     udim{};
 };
 
 class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
@@ -105,6 +118,11 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     ~DemandTextureLoaderImpl() override;
 
     const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) override;
+    const DemandTexture& createUdimTexture( const std::vector<std::shared_ptr<ImageSource>>& imageSources,
+                                            const std::vector<TextureDescriptor>&            textureDescs,
+                                            uint32_t                                         udim,
+                                            uint32_t                                         vdim,
+                                            uint32_t                                         baseTextureId ) override;
     void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
 
@@ -129,6 +147,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     Resource      decodeResource( uint32_t resourceId ) const;
     LoadedTexture loadedTexture( uint32_t textureId ) const;
+    void          uploadPendingTextureInfoUpdates( hipStream_t stream );
+    void          setUdimFields( DeviceTextureInfo& info, const DemandTextureImpl::UdimGrid& udim ) const;
     void          clearEvictedPages( hipStream_t stream );
     void          releaseEvictedPages( uint32_t reusablePageCount );
     void          updateLruThreshold();
@@ -149,6 +169,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     // Indexed by DemandTextureImpl::loadedTextureInfoId. Textures get their pages when their metadata is loaded, so the
     // list is also ordered by startPage, which decodeResource() relies on.
     std::vector<LoadedTextureInfo> loadedTextureInfos_{};
+    std::vector<LoadedTextureInfo> pendingTextureInfoUpdates_{};
 
     RequestProcessor requestProcessor_;
     PinnedUploadPool uploadPool_;

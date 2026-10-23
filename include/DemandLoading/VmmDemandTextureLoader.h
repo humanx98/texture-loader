@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace hip_demand::vmm {
 
@@ -74,6 +75,12 @@ class DemandTextureLoader
     virtual ~DemandTextureLoader() = default;
 
     virtual const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) = 0;
+
+    virtual const DemandTexture& createUdimTexture( const std::vector<std::shared_ptr<ImageSource>>& imageSources,
+                                                    const std::vector<TextureDescriptor>&            textureDescs,
+                                                    uint32_t                                         udim,
+                                                    uint32_t                                         vdim,
+                                                    uint32_t baseTextureId = INVALID_TEXTURE ) = 0;
     virtual void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext )         = 0;
     virtual Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) = 0;
 };

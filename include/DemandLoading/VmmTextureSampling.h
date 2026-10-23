@@ -103,13 +103,13 @@ struct TextureMetadata
 
 // Reads a texture's metadata and reports whether it is resident, requesting it otherwise. The metadata array is
 // always allocated, so the descriptor is read first; it is resident once the loader has copied it, which is visible
-// as a non-zero width because the copy and every kernel that can read it are ordered on the same stream.
+// as the loaded bit because the copy and every kernel that can read it are ordered on the same stream.
 HIP_DEMAND_INLINE TextureMetadata loadTextureMetadata( const DeviceContext& context, uint32_t textureId, bool& resident )
 {
     const DeviceTextureInfo* texture  = context.textureInfos.ptr + textureId;
     const TextureMetadata    metadata = { loadGlobal( texture ), texture->mips };
 
-    resident = metadata.info.width != 0;
+    resident = metadata.info.isLoaded();
     if( !resident )
         recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
     return metadata;
@@ -645,39 +645,10 @@ sampleTextureNoInline( const DeviceContext& context, TextureMetadata metadata, f
     return sampleTexture<Sample>( context, metadata, x, y, lod, resident );
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-// Public sampling API
-// ---------------------------------------------------------------------------------------------------------------------
-
 template <class Sample>
-HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& resident )
+HIP_DEMAND_INLINE Sample
+sampleTextureGrad( const DeviceContext& context, const TextureMetadata& metadata, float x, float y, float2 ddx, float2 ddy, bool& resident )
 {
-    // Invalid texture ids are reported as resident so that callers do not wait for them.
-    resident = true;
-    if( textureId >= context.textureInfos.len )
-        return Sample{};
-
-    const TextureMetadata metadata = loadTextureMetadata( context, textureId, resident );
-    if( !resident )
-        return Sample{};
-
-    const Sample sample = sampleTexture<Sample>( context, metadata, x, y, lod, resident );
-    referenceTextureInfo( context, textureId );
-    return sample;
-}
-
-
-template <class Sample>
-HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textureId, float x, float y, float2 ddx, float2 ddy, bool& resident )
-{
-    resident = true;
-    if( textureId >= context.textureInfos.len )
-        return Sample{};
-
-    const TextureMetadata metadata = loadTextureMetadata( context, textureId, resident );
-    if( !resident )
-        return Sample{};
-
     // Footprint axes in level-0 texels; the caller's units are kept for stepping along the major axis.
     float2 axisX = ddx;
     float2 axisY = ddy;
@@ -706,12 +677,9 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
     const float lod          = 0.5f * log2f( fmaxf( majorSquared * samplesScale * samplesScale, 1.0f ) );
 
     if( samples == 1 )
-    {
-        const Sample sample = sampleTexture<Sample>( context, metadata, x, y, lod, resident );
-        referenceTextureInfo( context, textureId );
-        return sample;
-    }
+        return sampleTexture<Sample>( context, metadata, x, y, lod, resident );
 
+    resident = true;
     Sample sum{};
     for( uint32_t i = 0; i < samples; ++i )
     {
@@ -720,14 +688,155 @@ HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textu
         sum += sampleTextureNoInline<Sample>( context, metadata, x + t * majorStep.x, y + t * majorStep.y, lod, sampleResident );
         resident = resident && sampleResident;
     }
-    referenceTextureInfo( context, textureId );
     return sum * samplesScale;
+}
+
+HIP_DEMAND_INLINE void splitUdimCoordinate( float x, uint32_t cells, uint32_t addressMode, uint32_t& cell, float& local )
+{
+    const float extent = static_cast<float>( cells );
+    switch( static_cast<hipTextureAddressMode>( addressMode ) )
+    {
+        case hipAddressModeWrap:
+            x -= floorf( x / extent ) * extent;
+            break;
+        case hipAddressModeMirror:
+        {
+            const float period = 2.0f * extent;
+            x -= floorf( x / period ) * period;
+            x = x > extent ? period - x : x;
+            break;
+        }
+        default:
+            break;
+    }
+    x = std::clamp( x, 0.0f, extent );
+
+    cell  = min( static_cast<uint32_t>( x ), cells - 1 );
+    local = x - static_cast<float>( cell );
+}
+
+HIP_DEMAND_INLINE float2 udimCellsToBase( const DeviceTextureInfo& entry )
+{
+    return make_float2( 1.0f / static_cast<float>( entry.udim() ), 1.0f / static_cast<float>( entry.vdim() ) );
+}
+
+HIP_DEMAND_INLINE bool udimBaseSuffices( const DeviceTextureInfo& entry, float2 ddx, float2 ddy )
+{
+    const float2 scale  = udimCellsToBase( entry );
+    const float  width  = scale.x * static_cast<float>( entry.width );
+    const float  height = scale.y * static_cast<float>( entry.height );
+    const float2 axisX  = make_float2( ddx.x * width, ddx.y * height );
+    const float2 axisY  = make_float2( ddy.x * width, ddy.y * height );
+    return fmaxf( axisX.x * axisX.x + axisX.y * axisX.y, axisY.x * axisY.x + axisY.y * axisY.y ) >= 1.0f;
+}
+
+HIP_DEMAND_INLINE uint32_t udimSubtextureId( const DeviceTextureInfo& entry, float x, float y, float& localX, float& localY )
+{
+    uint32_t u, v;
+    splitUdimCoordinate( x, entry.udim(), entry.addressMode( 0 ), u, localX );
+    splitUdimCoordinate( y, entry.vdim(), entry.addressMode( 1 ), v, localY );
+    return entry.udimStartTexture + v * entry.udim() + u;
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample
+sampleUdimBase( const DeviceContext& context, const TextureMetadata& entry, float x, float y, float2 ddx, float2 ddy, bool& resident )
+{
+    const float2 scale = udimCellsToBase( entry.info );
+    return sampleTextureGrad<Sample>( context, entry, x * scale.x, y * scale.y, make_float2( ddx.x * scale.x, ddx.y * scale.y ),
+                                      make_float2( ddy.x * scale.x, ddy.y * scale.y ), resident );
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample
+sampleUdimCell( const DeviceContext& context, const TextureMetadata& entry, float x, float y, float2 ddx, float2 ddy, bool& resident )
+{
+    float          localX, localY;
+    const uint32_t subTextureId = udimSubtextureId( entry.info, x, y, localX, localY );
+
+    const TextureMetadata subTexture = loadTextureMetadata( context, subTextureId, resident );
+    const bool            emptyCell  = resident && subTexture.info.isEmpty();
+
+    Sample sample{};
+    if( resident && !emptyCell )
+    {
+        sample = sampleTextureGrad<Sample>( context, subTexture, localX, localY, ddx, ddy, resident );
+        referenceTextureInfo( context, subTextureId );
+        if( resident )
+            return sample;
+    }
+    if( !entry.info.isUdimBase() )
+        return sample;
+
+    sample   = sampleUdimBase<Sample>( context, entry, x, y, ddx, ddy, resident );
+    resident = resident && emptyCell;
+    return sample;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Public sampling API
+// ---------------------------------------------------------------------------------------------------------------------
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample tex2DLod( const DeviceContext& context, uint32_t textureId, float x, float y, float lod, bool& resident )
+{
+    // Invalid texture ids are reported as resident so that callers do not wait for them.
+    resident = true;
+    if( textureId >= context.textureInfos.len )
+        return Sample{};
+
+    const TextureMetadata metadata = loadTextureMetadata( context, textureId, resident );
+    if( !resident )
+        return Sample{};
+
+    const Sample sample = sampleTexture<Sample>( context, metadata, x, y, lod, resident );
+    referenceTextureInfo( context, textureId );
+    return sample;
 }
 
 template <class Sample>
 HIP_DEMAND_INLINE Sample tex2D( const DeviceContext& context, uint32_t textureId, float x, float y, bool& resident )
 {
     return tex2DLod<Sample>( context, textureId, x, y, 0.0f, resident );
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample tex2DGrad( const DeviceContext& context, uint32_t textureId, float x, float y, float2 ddx, float2 ddy, bool& resident )
+{
+    resident = true;
+    if( textureId >= context.textureInfos.len )
+        return Sample{};
+
+    const TextureMetadata metadata = loadTextureMetadata( context, textureId, resident );
+    if( !resident )
+        return Sample{};
+
+    const Sample sample = sampleTextureGrad<Sample>( context, metadata, x, y, ddx, ddy, resident );
+    referenceTextureInfo( context, textureId );
+    return sample;
+}
+
+template <class Sample>
+HIP_DEMAND_INLINE Sample tex2DGradUdim( const DeviceContext& context, uint32_t textureId, float x, float y, float2 ddx, float2 ddy, bool& resident )
+{
+    resident = true;
+    if( textureId >= context.textureInfos.len )
+        return Sample{};
+
+    const TextureMetadata entry = loadTextureMetadata( context, textureId, resident );
+    if( !resident )
+        return Sample{};
+
+    Sample sample{};
+    if( !entry.info.isUdim() )
+        sample = sampleTextureGrad<Sample>( context, entry, x, y, ddx, ddy, resident );
+    else if( entry.info.isUdimBase() && udimBaseSuffices( entry.info, ddx, ddy ) )
+        sample = sampleUdimBase<Sample>( context, entry, x, y, ddx, ddy, resident );
+    else
+        sample = sampleUdimCell<Sample>( context, entry, x, y, ddx, ddy, resident );
+
+    referenceTextureInfo( context, textureId );
+    return sample;
 }
 
 }  // namespace hip_demand::vmm

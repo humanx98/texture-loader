@@ -79,15 +79,15 @@ struct DeviceMipLevel
 
 struct DeviceTextureInfo
 {
-    // Small fields are packed into words; the accessors below unpack them. The sampler reads the whole descriptor
-    // with scalar loads, so fewer words mean fewer loads, and unpacking is scalar ALU.
-    uint32_t width       = 0;  // Zero until the loader has copied the descriptor: the sampler tests it for residency.
+    uint32_t width       = 0;
     uint32_t height      = 0;
-    uint32_t sampling    = 0;             // Address modes, filter modes, normalizedCoords, wideOffsets.
-    uint32_t texel       = 0;             // hipArray_Format, channel count, bytes per texel.
-    uint32_t layout      = 0;             // Tile shape shifts, mip count, first mip-tail level.
-    uint32_t startPage   = INVALID_PAGE;  // First page of the texture; the tiled levels and the mip tail follow it.
+    uint32_t sampling    = 0;
+    uint32_t texel       = 0;
+    uint32_t layout      = 0;
+    uint32_t startPage   = INVALID_PAGE;
     uint32_t mipTailPage = INVALID_PAGE;
+    uint32_t udimStartTexture = INVALID_TEXTURE;
+    uint32_t udimGrid         = 0;
 
     // One word per level: the first page of a tiled level, or the byte offset within the mip-tail page of a tail level.
     uint32_t mips[MAX_TEXTURE_MIP_LEVELS]{};
@@ -100,6 +100,9 @@ struct DeviceTextureInfo
     // The texture's pages span more than 4 GiB; see texelOffsetInTexture().
     HIP_DEMAND_INLINE bool     wideOffsets() const { return bits( sampling, 7, 1 ) != 0; }
     HIP_DEMAND_INLINE uint32_t maxAnisotropy() const { return bits( sampling, 8, 5 ); }  // 1..16; see tex2DGrad().
+    HIP_DEMAND_INLINE bool isUdimBase() const { return bits( sampling, 13, 1 ) != 0; }
+    HIP_DEMAND_INLINE bool isEmpty() const { return bits( sampling, 14, 1 ) != 0; }
+    HIP_DEMAND_INLINE bool isLoaded() const { return bits( sampling, 15, 1 ) != 0; }
 
     HIP_DEMAND_INLINE void setAddressMode( uint32_t axis, uint32_t mode ) { setBits( sampling, 2 * axis, 2, mode ); }
     HIP_DEMAND_INLINE void setFilterMode( uint32_t mode ) { setBits( sampling, 4, 1, mode ); }
@@ -107,6 +110,22 @@ struct DeviceTextureInfo
     HIP_DEMAND_INLINE void setNormalizedCoords( bool normalized ) { setBits( sampling, 6, 1, normalized ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setWideOffsets( bool wide ) { setBits( sampling, 7, 1, wide ? 1u : 0u ); }
     HIP_DEMAND_INLINE void setMaxAnisotropy( uint32_t samples ) { setBits( sampling, 8, 5, samples ); }
+    HIP_DEMAND_INLINE void setUdimBase( bool base ) { setBits( sampling, 13, 1, base ? 1u : 0u ); }
+    HIP_DEMAND_INLINE void setEmpty( bool empty ) { setBits( sampling, 14, 1, empty ? 1u : 0u ); }
+    HIP_DEMAND_INLINE void setLoaded( bool loaded ) { setBits( sampling, 15, 1, loaded ? 1u : 0u ); }
+
+    // --- udim ---
+    HIP_DEMAND_INLINE bool     isUdim() const { return udimStartTexture != INVALID_TEXTURE; }
+    HIP_DEMAND_INLINE uint32_t udim() const { return bits( udimGrid, 0, 16 ); }
+    HIP_DEMAND_INLINE uint32_t vdim() const { return bits( udimGrid, 16, 16 ); }
+
+    HIP_DEMAND_INLINE void setUdimGrid( uint32_t startTexture, uint32_t udim_, uint32_t vdim_ )
+    {
+        udimStartTexture = startTexture;
+        udimGrid         = 0;
+        setBits( udimGrid, 0, 16, udim_ );
+        setBits( udimGrid, 16, 16, vdim_ );
+    }
 
     // --- texel ---
     HIP_DEMAND_INLINE hipArray_Format format() const { return static_cast<hipArray_Format>( bits( texel, 0, 8 ) ); }

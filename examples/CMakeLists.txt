@@ -289,8 +289,18 @@ if(USE_OIIO)
         DEPENDS ${VMM_DEVICE_DEPS}
     )
 
+    hip_add_executable(
+        TARGET vmm_loader_udim_kernel
+        SOURCES vmm_loader_udim.hip
+        ARCHITECTURES ${HIP_ARCHITECTURES}
+        OPTIONS -O3 --std=c++17 -DHIP_ENABLE_WARP_SYNC_BUILTINS
+        INCLUDES ${PROJECT_SOURCE_DIR}/include
+        DEPENDS ${VMM_DEVICE_DEPS}
+    )
+
     add_executable(vmm_loader_vram_usage vmm_loader_vram_usage.cpp)
     add_executable(vmm_loader_sampler_benchmark vmm_loader_sampler_benchmark.cpp)
+    add_executable(vmm_loader_udim vmm_loader_udim.cpp)
 
     target_include_directories(vmm_loader_vram_usage PRIVATE
         ${PROJECT_SOURCE_DIR}/include
@@ -301,13 +311,23 @@ if(USE_OIIO)
         ${STB_INCLUDE_DIR}
     )
 
+    target_include_directories(vmm_loader_udim PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${STB_INCLUDE_DIR}
+    )
+
     target_link_libraries(vmm_loader_vram_usage PRIVATE hip_demand_texture)
     target_link_libraries(vmm_loader_sampler_benchmark PRIVATE hip_demand_texture)
+    target_link_libraries(vmm_loader_udim PRIVATE hip_demand_texture)
     target_compile_definitions(vmm_loader_vram_usage PRIVATE
         __HIP_PLATFORM_AMD__
         TEST_IMAGES_DIR="${PROJECT_SOURCE_DIR}/test_images"
     )
     target_compile_definitions(vmm_loader_sampler_benchmark PRIVATE
+        __HIP_PLATFORM_AMD__
+        TEST_IMAGES_DIR="${PROJECT_SOURCE_DIR}/test_images"
+    )
+    target_compile_definitions(vmm_loader_udim PRIVATE
         __HIP_PLATFORM_AMD__
         TEST_IMAGES_DIR="${PROJECT_SOURCE_DIR}/test_images"
     )
@@ -330,10 +350,23 @@ if(USE_OIIO)
         COMMENT "Copying VMM sampler benchmark HIP kernel code object"
         VERBATIM
     )
+    add_custom_command(TARGET vmm_loader_udim_kernel POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_PROPERTY:vmm_loader_udim_kernel,HIP_CODE_OBJECT>
+            $<TARGET_FILE_DIR:vmm_loader_udim>/vmm_loader_udim_kernel.co
+        COMMENT "Copying VMM UDIM HIP kernel code object"
+        VERBATIM
+    )
     add_dependencies(vmm_loader_vram_usage vmm_loader_vram_usage_kernel)
     add_dependencies(vmm_loader_sampler_benchmark vmm_loader_sampler_benchmark_kernel)
+    add_dependencies(vmm_loader_udim vmm_loader_udim_kernel)
 
-    install(TARGETS vmm_loader_vram_usage vmm_loader_sampler_benchmark RUNTIME DESTINATION bin)
+    install(TARGETS vmm_loader_vram_usage vmm_loader_sampler_benchmark vmm_loader_udim RUNTIME DESTINATION bin)
+    install(FILES
+        $<TARGET_PROPERTY:vmm_loader_udim_kernel,HIP_CODE_OBJECT>
+        DESTINATION bin
+        RENAME vmm_loader_udim_kernel.co
+    )
     install(FILES
         $<TARGET_PROPERTY:vmm_loader_vram_usage_kernel,HIP_CODE_OBJECT>
         DESTINATION bin

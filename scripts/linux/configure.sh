@@ -15,4 +15,5 @@ cmake -S "$root_dir" -B "$root_dir/build" \
     -DBUILD_EXAMPLES=ON \
     -DUSE_VCPKG=ON \
     -DUSE_OIIO=ON \
+    -DBUILD_TESTS=ON \
     -DHIP_ARCHITECTURES=gfx1031
