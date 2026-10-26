@@ -84,12 +84,13 @@ struct DeviceTextureInfo
     uint32_t sampling    = 0;
     uint32_t texel       = 0;
     uint32_t layout      = 0;
-    uint32_t startPage   = INVALID_PAGE;
-    uint32_t mipTailPage = INVALID_PAGE;
+    uint32_t cascadeLevel     = 0;
+    uint32_t mipTailPage      = INVALID_PAGE;
     uint32_t udimStartTexture = INVALID_TEXTURE;
     uint32_t udimGrid         = 0;
 
     // One word per level: the first page of a tiled level, or the byte offset within the mip-tail page of a tail level.
+    // Tiled levels finer than cascadeLevel have no pages and their word is unset.
     uint32_t mips[MAX_TEXTURE_MIP_LEVELS]{};
 
     // --- sampling ---
@@ -97,7 +98,7 @@ struct DeviceTextureInfo
     HIP_DEMAND_INLINE uint32_t filterMode() const { return bits( sampling, 4, 1 ); }
     HIP_DEMAND_INLINE uint32_t mipmapFilterMode() const { return bits( sampling, 5, 1 ); }
     HIP_DEMAND_INLINE bool     normalizedCoords() const { return bits( sampling, 6, 1 ) != 0; }
-    // The texture's pages span more than 4 GiB; see texelOffsetInTexture().
+    // A mip level's pages span more than 4 GiB; see texelOffsetInLevel().
     HIP_DEMAND_INLINE bool     wideOffsets() const { return bits( sampling, 7, 1 ) != 0; }
     HIP_DEMAND_INLINE uint32_t maxAnisotropy() const { return bits( sampling, 8, 5 ); }  // 1..16; see tex2DGrad().
     HIP_DEMAND_INLINE bool isEmpty() const { return bits( sampling, 14, 1 ) != 0; }
@@ -224,8 +225,10 @@ struct ResourceTable
 
     Range textureTiles{};
     Range textureInfos{};
+    // MAX_TEXTURE_MIP_LEVELS per texture: a request for the texture to get pages down to that level.
+    Range cascades{};
 
-    HIP_DEMAND_INLINE uint32_t count() const { return textureTiles.count + textureInfos.count; }
+    HIP_DEMAND_INLINE uint32_t count() const { return textureTiles.count + textureInfos.count + cascades.count; }
 };
 
 enum class CounterIndex : uint32_t

@@ -55,6 +55,11 @@ struct Options
     /// Enables LRU tracking and eviction of resident image-tile pages. Texture metadata is not evicted.
     bool enableEviction = true;
 
+    /// Gives textures virtual pages for their mip levels on demand, starting from the mip tail, instead of for all
+    /// levels at once. Saves virtual pages on textures seen only from afar; costs one extra pass the first time a
+    /// finer level is sampled.
+    bool enableCascades = false;
+
     /// Maximum number of eviction candidates collected per pass. A value of zero disables eviction.
     uint32_t maxEvictedPages = 8192;
 

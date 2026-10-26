@@ -20,7 +20,8 @@ struct Resource
     {
         TextureId,
         Tile,
-        MipTail
+        MipTail,
+        Cascade
     };
 
     struct Tile
@@ -38,12 +39,20 @@ struct Resource
         uint32_t pageId    = 0;
     };
 
+    // A request for the texture to get pages down to the given mip level; see DeviceTextureInfo::cascadeLevel.
+    struct Cascade
+    {
+        uint32_t textureId = 0;
+        uint32_t level     = 0;
+    };
+
     Type type;
     union
     {
         uint32_t textureId;
         Tile     tile;
         MipTail  mipTail;
+        Cascade  cascade;
     };
 
     explicit Resource( uint32_t id )
@@ -61,6 +70,12 @@ struct Resource
     explicit Resource( MipTail value )
         : type( Type::MipTail )
         , mipTail( value )
+    {
+    }
+
+    explicit Resource( Cascade value )
+        : type( Type::Cascade )
+        , cascade( value )
     {
     }
 };
@@ -104,10 +119,10 @@ class DemandTextureImpl : public DemandTexture, NonCopyble
     uint32_t getId() const override { return id; }
     bool     isEmpty() const { return image == nullptr; }
 
-    uint32_t                     id                  = INVALID_TEXTURE;
-    uint32_t                     loadedTextureInfoId = INVALID_TEXTURE;
+    uint32_t                     id = INVALID_TEXTURE;
     std::shared_ptr<ImageSource> image{};
-    TextureDescriptor            descriptor;
+    TextureDescriptor            descriptor{};
+    DeviceTextureInfo            info{};
     UdimGrid                     udim{};
 };
 
@@ -132,21 +147,16 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     int  device() const { return pageSystem_.device(); }
 
   private:
-    struct LoadedTexture
+    struct PageRange
     {
-        std::shared_ptr<ImageSource> image;
-        DeviceTextureInfo            info;
+        uint32_t           startPage = INVALID_PAGE;
+        uint32_t           level     = 0;
+        DemandTextureImpl* texture   = nullptr;
     };
 
-    // The device descriptor does not carry the texture id; the host keeps it next to its copy.
-    struct LoadedTextureInfo
-    {
-        uint32_t          textureId = INVALID_TEXTURE;
-        DeviceTextureInfo info;
-    };
-
-    Resource      decodeResource( uint32_t resourceId ) const;
-    LoadedTexture loadedTexture( uint32_t textureId ) const;
+    Resource           decodeResource( uint32_t resourceId ) const;
+    DemandTextureImpl& getTexture( uint32_t textureId );
+    DeviceTextureInfo  textureInfo( const DemandTextureImpl& texture ) const;
     void          setUdimFields( DeviceTextureInfo& info, const DemandTextureImpl::UdimGrid& udim ) const;
     void          clearEvictedPages( hipStream_t stream );
     void          releaseEvictedPages( uint32_t reusablePageCount );
@@ -154,6 +164,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     void          processTextureInfo( hipStream_t stream, uint32_t textureId );
     void          processTile( hipStream_t stream, const Resource::Tile& tile );
     void          processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
+    void          processCascade( hipStream_t stream, const Resource::Cascade& cascade );
+    void          assignLevelPages( DemandTextureImpl& texture, uint32_t firstLevel, uint32_t endLevel );
 
     mutable std::mutex mutex_;
     Options            options_{};
@@ -161,13 +173,15 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
 
     std::vector<std::unique_ptr<DemandTextureImpl>> textures_{};
 
-    // metadata
+    // Guards the layout of textures over the virtual pages: pageTable_.textureTiles.nextAvailablePage (the page
+    // allocator), pageRanges_, and DemandTextureImpl::info of every texture, which encodes that layout for the device.
+    // resourceTable_ is fixed at construction and needs no lock.
     mutable std::mutex metadataMutex_;
     ResourceTable      resourceTable_{};
     PageTable          pageTable_{};
-    // Indexed by DemandTextureImpl::loadedTextureInfoId. Textures get their pages when their metadata is loaded, so the
-    // list is also ordered by startPage, which decodeResource() relies on.
-    std::vector<LoadedTextureInfo> loadedTextureInfos_{};
+    // Levels get their pages from one growing range, when their texture's metadata is loaded or when the texture is
+    // extended to finer levels (processCascade), so the list is ordered by startPage, which decodeResource() relies on.
+    std::vector<PageRange> pageRanges_{};
 
     RequestProcessor requestProcessor_;
     PinnedUploadPool uploadPool_;

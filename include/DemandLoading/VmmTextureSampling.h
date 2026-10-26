@@ -58,6 +58,11 @@ HIP_DEMAND_INLINE void referenceTextureInfo( const DeviceContext& context, uint3
         recordRequest( context, context.resourceTable.textureInfos.getResourceId( textureId ) );
 }
 
+HIP_DEMAND_INLINE void requestCascade( const DeviceContext& context, uint32_t textureId, uint32_t level )
+{
+    recordRequest( context, context.resourceTable.cascades.getResourceId( textureId * MAX_TEXTURE_MIP_LEVELS + level ) );
+}
+
 // Reads a value from device global memory through a global address space pointer. A generic pointer loaded from memory
 // can only be read with flat loads, which the compiler never turns into scalar loads, even for wave-uniform addresses.
 template <class T>
@@ -88,6 +93,7 @@ struct TextureMetadata
 {
     DeviceTextureInfo info;
     const uint32_t*   mips = nullptr;
+    uint32_t          id   = INVALID_TEXTURE;
 
     HIP_DEMAND_INLINE DeviceMipLevel mipLevel( uint32_t level ) const
     {
@@ -107,7 +113,7 @@ struct TextureMetadata
 HIP_DEMAND_INLINE TextureMetadata loadTextureMetadata( const DeviceContext& context, uint32_t textureId, bool& resident )
 {
     const DeviceTextureInfo* texture  = context.textureInfos.ptr + textureId;
-    const TextureMetadata    metadata = { loadGlobal( texture ), texture->mips };
+    const TextureMetadata    metadata = { loadGlobal( texture ), texture->mips, textureId };
 
     resident = metadata.info.isLoaded();
     if( !resident )
@@ -172,7 +178,7 @@ struct Footprint
     static constexpr uint32_t numTaps = NumTaps;
 
     uint32_t pageId[NumTaps];
-    uint32_t texelOffset[NumTaps];  // Low 32 bits of the byte offset from the texture's first page; see texelOffsetInTexture().
+    uint32_t texelOffset[NumTaps];  // Low 32 bits of the byte offset from the level's first page; see texelOffsetInLevel().
     bool  singlePage = true;  // All taps are in pageId[0].
     float fracX      = 0.0f;  // Bilinear weights of the right column and the bottom row.
     float fracY      = 0.0f;
@@ -181,30 +187,32 @@ struct Footprint
 using PointFootprint    = Footprint<1>;
 using BilinearFootprint = Footprint<4>;
 
-// Texel addresses are kept as 32-bit offsets from the texture's first page, so that loads can use a wave-uniform base
-// address with a 32-bit per-lane offset instead of 64-bit address arithmetic per tap. For a texture whose pages span
-// more than 4 GiB (DeviceTextureInfo::wideOffsets) the upper 32 bits are recovered from the page id when filtering.
-HIP_DEMAND_INLINE uint32_t texelOffsetInTexture( const DeviceTextureInfo& texture, uint32_t pageShift, uint32_t pageId, uint32_t byteOffset )
+// Texel addresses are kept as 32-bit offsets from the first page of their mip level, so that loads can use a
+// wave-uniform base address with a 32-bit per-lane offset instead of 64-bit address arithmetic per tap. Levels have
+// pages of their own because a texture may get them level by level (see DeviceTextureInfo::cascadeLevel). For a level
+// whose pages span more than 4 GiB (DeviceTextureInfo::wideOffsets) the upper 32 bits are recovered from the page id
+// when filtering.
+HIP_DEMAND_INLINE uint32_t texelOffsetInLevel( const DeviceMipLevel& mip, uint32_t pageShift, uint32_t pageId, uint32_t byteOffset )
 {
-    return ( ( pageId - texture.startPage ) << pageShift ) + byteOffset;
+    return ( ( pageId - mip.startPage ) << pageShift ) + byteOffset;
 }
 
 // Texel address for the low offset bits in a footprint. The in-page offset never carries into the page bits, so the
 // upper 32 bits of the full offset are simply the upper bits of the page offset.
 template <bool Wide>
-HIP_DEMAND_INLINE const uint8_t* texelAddress( const uint8_t*           textureMemory,
-                                               const DeviceTextureInfo& texture,
-                                               uint32_t                 pageShift,
-                                               uint32_t                 pageId,
-                                               uint32_t                 texelOffset )
+HIP_DEMAND_INLINE const uint8_t* texelAddress( const uint8_t*        levelMemory,
+                                               const DeviceMipLevel& mip,
+                                               uint32_t              pageShift,
+                                               uint32_t              pageId,
+                                               uint32_t              texelOffset )
 {
     if constexpr( Wide )
     {
-        const size_t high = static_cast<size_t>( ( pageId - texture.startPage ) >> ( 32 - pageShift ) );
-        return textureMemory + ( ( high << 32 ) | texelOffset );
+        const size_t high = static_cast<size_t>( ( pageId - mip.startPage ) >> ( 32 - pageShift ) );
+        return levelMemory + ( ( high << 32 ) | texelOffset );
     }
     else
-        return textureMemory + texelOffset;
+        return levelMemory + texelOffset;
 }
 
 HIP_DEMAND_INLINE float2 texelCoordinates( const DeviceTextureInfo& texture, const DeviceMipLevel& mip, float x, float y )
@@ -236,7 +244,7 @@ makePointFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& mip,
 
     PointFootprint footprint{};
     footprint.pageId[0]      = pageId;
-    footprint.texelOffset[0] = texelOffsetInTexture( texture, pageShift, pageId, byteOffset );
+    footprint.texelOffset[0] = texelOffsetInLevel( mip, pageShift, pageId, byteOffset );
     return footprint;
 }
 
@@ -271,7 +279,7 @@ makeBilinearFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& m
             const uint32_t rowBytes = texture.tileWidth() * bytesPerTexel;
             const uint32_t offset   = local.y * rowBytes + local.x * bytesPerTexel;
 
-            const uint32_t texel00 = texelOffsetInTexture( texture, pageShift, pageId, offset );
+            const uint32_t texel00 = texelOffsetInLevel( mip, pageShift, pageId, offset );
             footprint.pageId[0] = footprint.pageId[1] = footprint.pageId[2] = footprint.pageId[3] = pageId;
             footprint.texelOffset[0]                                                              = texel00;
             footprint.texelOffset[1] = texel00 + bytesPerTexel;
@@ -302,12 +310,11 @@ makeBilinearFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& m
         const uint32_t column0  = static_cast<uint32_t>( x0 ) * bytesPerTexel;
         const uint32_t column1  = static_cast<uint32_t>( x1 ) * bytesPerTexel;
 
-        const uint32_t page = texelOffsetInTexture( texture, pageShift, texture.mipTailPage, 0 );
         footprint.pageId[0] = footprint.pageId[1] = footprint.pageId[2] = footprint.pageId[3] = texture.mipTailPage;
-        footprint.texelOffset[0]                                                              = page + row0 + column0;
-        footprint.texelOffset[1]                                                              = page + row0 + column1;
-        footprint.texelOffset[2]                                                              = page + row1 + column0;
-        footprint.texelOffset[3]                                                              = page + row1 + column1;
+        footprint.texelOffset[0]                                                              = row0 + column0;
+        footprint.texelOffset[1]                                                              = row0 + column1;
+        footprint.texelOffset[2]                                                              = row1 + column0;
+        footprint.texelOffset[3]                                                              = row1 + column1;
         return footprint;
     }
 
@@ -330,10 +337,10 @@ makeBilinearFootprint( const DeviceTextureInfo& texture, const DeviceMipLevel& m
     footprint.pageId[1]      = pageRow0 + tile11.x;  // tap (x1, y0)
     footprint.pageId[2]      = pageRow1 + tile00.x;  // tap (x0, y1)
     footprint.pageId[3]      = pageRow1 + tile11.x;  // tap (x1, y1)
-    footprint.texelOffset[0] = texelOffsetInTexture( texture, pageShift, footprint.pageId[0], row0 + column0 );
-    footprint.texelOffset[1] = texelOffsetInTexture( texture, pageShift, footprint.pageId[1], row0 + column1 );
-    footprint.texelOffset[2] = texelOffsetInTexture( texture, pageShift, footprint.pageId[2], row1 + column0 );
-    footprint.texelOffset[3] = texelOffsetInTexture( texture, pageShift, footprint.pageId[3], row1 + column1 );
+    footprint.texelOffset[0] = texelOffsetInLevel( mip, pageShift, footprint.pageId[0], row0 + column0 );
+    footprint.texelOffset[1] = texelOffsetInLevel( mip, pageShift, footprint.pageId[1], row0 + column1 );
+    footprint.texelOffset[2] = texelOffsetInLevel( mip, pageShift, footprint.pageId[2], row1 + column0 );
+    footprint.texelOffset[3] = texelOffsetInLevel( mip, pageShift, footprint.pageId[3], row1 + column1 );
     footprint.singlePage     = tile00.x == tile11.x && tile00.y == tile11.y;
     return footprint;
 }
@@ -516,26 +523,26 @@ HIP_DEMAND_INLINE Sample toSample( float4 value )
 // Filtering
 // ---------------------------------------------------------------------------------------------------------------------
 
-// textureMemory is the address of the texture's first page.
+// levelMemory is the address of the mip level's first page.
 template <class Format, bool Wide>
-HIP_DEMAND_INLINE float4 filterFootprint( const uint8_t*           textureMemory,
-                                          const DeviceTextureInfo& texture,
-                                          uint32_t                 pageShift,
-                                          const PointFootprint&    footprint )
+HIP_DEMAND_INLINE float4 filterFootprint( const uint8_t*        levelMemory,
+                                          const DeviceMipLevel& mip,
+                                          uint32_t              pageShift,
+                                          const PointFootprint& footprint )
 {
-    return Format::normalize( Format::load(
-        texelAddress<Wide>( textureMemory, texture, pageShift, footprint.pageId[0], footprint.texelOffset[0] ) ) );
+    return Format::normalize(
+        Format::load( texelAddress<Wide>( levelMemory, mip, pageShift, footprint.pageId[0], footprint.texelOffset[0] ) ) );
 }
 
 template <class Format, bool Wide>
-HIP_DEMAND_INLINE float4 filterFootprint( const uint8_t*           textureMemory,
-                                          const DeviceTextureInfo& texture,
+HIP_DEMAND_INLINE float4 filterFootprint( const uint8_t*           levelMemory,
+                                          const DeviceMipLevel&    mip,
                                           uint32_t                 pageShift,
                                           const BilinearFootprint& footprint )
 {
     const uint8_t* texels[4];
     for( uint32_t tap = 0; tap < 4; ++tap )
-        texels[tap] = texelAddress<Wide>( textureMemory, texture, pageShift, footprint.pageId[tap], footprint.texelOffset[tap] );
+        texels[tap] = texelAddress<Wide>( levelMemory, mip, pageShift, footprint.pageId[tap], footprint.texelOffset[tap] );
 
     const float4 value00 = Format::load( texels[0] );
     const float4 value10 = Format::load( texels[1] );
@@ -561,24 +568,37 @@ HIP_DEMAND_INLINE Footprint makeFootprint( const DeviceTextureInfo& texture, con
 }
 
 template <class Sample, class Footprint, uint32_t NumLevels, bool Wide>
-HIP_DEMAND_INLINE Sample filterLevels( const uint8_t*           textureMemory,
+HIP_DEMAND_INLINE Sample filterLevels( const DeviceContext&     context,
                                        const DeviceTextureInfo& texture,
                                        uint32_t                 pageShift,
+                                       const DeviceMipLevel ( &mips )[NumLevels],
                                        const Footprint ( &footprints )[NumLevels],
                                        float t )
 {
+    static_assert( NumLevels == 1 || NumLevels == 2, "A sample blends at most two mip levels" );
+
+    const uint8_t* levelMemory[NumLevels];
+    for( uint32_t level = 0; level < NumLevels; ++level )
+        levelMemory[level] = context.pageMemory.ptr + ( static_cast<size_t>( mips[level].startPage ) << pageShift );
+
     return dispatchTexelFormat<Sample>( texture.format(), texture.numChannels(), [&]( auto texelFormat ) {
         using Format = decltype( texelFormat );
-        float4 value = filterFootprint<Format, Wide>( textureMemory, texture, pageShift, footprints[0] );
+        float4 value = filterFootprint<Format, Wide>( levelMemory[0], mips[0], pageShift, footprints[0] );
         if constexpr( NumLevels == 2 )
-            value = ( 1.0f - t ) * value + t * filterFootprint<Format, Wide>( textureMemory, texture, pageShift, footprints[1] );
+            value = ( 1.0f - t ) * value + t * filterFootprint<Format, Wide>( levelMemory[1], mips[1], pageShift, footprints[1] );
         return toSample<Sample>( value );
     } );
 }
 
 template <class Sample, class Footprint, uint32_t NumLevels>
-HIP_DEMAND_INLINE Sample
-sampleMipLevels( const DeviceContext& context, const TextureMetadata& texture, uint32_t mipLevel, float t, float x, float y, bool& resident )
+HIP_DEMAND_INLINE Sample sampleMipLevels( const DeviceContext&   context,
+                                          const TextureMetadata& texture,
+                                          uint32_t               mipLevel,
+                                          float                  t,
+                                          float                  x,
+                                          float                  y,
+                                          uint32_t               requestedLevel,
+                                          bool&                  resident )
 {
     const uint32_t pageShift = pageSizeShift( context );
 
@@ -594,17 +614,23 @@ sampleMipLevels( const DeviceContext& context, const TextureMetadata& texture, u
     for( uint32_t level = 0; level < NumLevels; ++level )
         residenceWords[level] = loadPageResidenceWord( context, footprints[level].pageId[0] );
 
-    // Every level must be referenced, so the residence results are combined without short-circuiting.
-    resident = true;
+    // Requests, for the missing level and for the pages of every footprint, are recorded only after every load of the
+    // metadata: the compiler does not reorder loads across an atomic, and would read the metadata with per-lane loads
+    // afterwards. Every level must be referenced, so the residence results are combined without short-circuiting.
+    const bool fallback = requestedLevel < texture.info.cascadeLevel;
+    if( fallback )
+        requestCascade( context, texture.id, requestedLevel );
+
+    bool pagesResident = true;
     for( uint32_t level = 0; level < NumLevels; ++level )
-        resident = referenceFootprint( context, footprints[level], residenceWords[level] ) && resident;
-    if( !resident )
+        pagesResident = referenceFootprint( context, footprints[level], residenceWords[level] ) && pagesResident;
+    resident = pagesResident && !fallback;
+    if( !pagesResident )
         return Sample{};
 
-    const uint8_t* textureMemory = context.pageMemory.ptr + ( static_cast<size_t>( texture.info.startPage ) << pageShift );
     if( texture.info.wideOffsets() )
-        return filterLevels<Sample, Footprint, NumLevels, true>( textureMemory, texture.info, pageShift, footprints, t );
-    return filterLevels<Sample, Footprint, NumLevels, false>( textureMemory, texture.info, pageShift, footprints, t );
+        return filterLevels<Sample, Footprint, NumLevels, true>( context, texture.info, pageShift, mips, footprints, t );
+    return filterLevels<Sample, Footprint, NumLevels, false>( context, texture.info, pageShift, mips, footprints, t );
 }
 
 template <class Sample, class Footprint>
@@ -612,18 +638,24 @@ HIP_DEMAND_INLINE Sample sampleLod( const DeviceContext& context, const TextureM
 {
     const uint32_t mipCount = texture.info.mipCount();
     lod                     = std::clamp( lod, 0.0f, static_cast<float>( mipCount - 1 ) );
-    if( texture.info.mipmapFilterMode() == hipFilterModePoint )
+
+    const bool pointMipmap = texture.info.mipmapFilterMode() == hipFilterModePoint;
+    uint32_t   mipLevel    = static_cast<uint32_t>( floorf( pointMipmap ? lod + 0.5f : lod ) );
+    float      t           = pointMipmap ? 0.0f : lod - static_cast<float>( mipLevel );
+
+    // The finest level the filter reads is the one the texture must have pages for. Without them, the sample comes
+    // from the finest level that has pages, as a fallback, and the loader is asked to extend the texture.
+    const uint32_t requestedLevel = mipLevel;
+    if( mipLevel < texture.info.cascadeLevel )
     {
-        const uint32_t mipLevel = static_cast<uint32_t>( floorf( lod + 0.5f ) );
-        return sampleMipLevels<Sample, Footprint, 1>( context, texture, mipLevel, 0.0f, x, y, resident );
+        mipLevel = texture.info.cascadeLevel;
+        t        = 0.0f;
     }
 
-    const uint32_t mipLevel = static_cast<uint32_t>( floorf( lod ) );
-    const float    t        = lod - static_cast<float>( mipLevel );
     // The next mip level cannot affect an exact-level sample or its residency.
     if( mipLevel + 1 >= mipCount || t == 0.0f )
-        return sampleMipLevels<Sample, Footprint, 1>( context, texture, mipLevel, 0.0f, x, y, resident );
-    return sampleMipLevels<Sample, Footprint, 2>( context, texture, mipLevel, t, x, y, resident );
+        return sampleMipLevels<Sample, Footprint, 1>( context, texture, mipLevel, 0.0f, x, y, requestedLevel, resident );
+    return sampleMipLevels<Sample, Footprint, 2>( context, texture, mipLevel, t, x, y, requestedLevel, resident );
 }
 
 template <class Sample>

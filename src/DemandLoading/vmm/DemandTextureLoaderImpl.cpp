@@ -93,9 +93,12 @@ ResourceTable createResourceTable( const Options& options )
     ResourceTable table{};
     table.textureTiles = ResourceTable::Range( 0, options.maxVirtualPages );
     table.textureInfos = ResourceTable::Range( table.textureTiles.end(), options.maxTextures );
+    const uint32_t cascadeCount = options.enableCascades ? options.maxTextures * MAX_TEXTURE_MIP_LEVELS : 0;
+    table.cascades              = ResourceTable::Range( table.textureInfos.end(), cascadeCount );
 
     uint32_t resourceCount = 0;
-    if( !safeAdd( table.textureTiles.count, table.textureInfos.count, resourceCount ) )
+    if( !safeAdd( table.textureTiles.count, table.textureInfos.count, resourceCount )
+        || !safeAdd( resourceCount, table.cascades.count, resourceCount ) )
         throw std::overflow_error(
             "Cannot create demand texture loader: total resource count exceeds the uint32_t limit" );
 
@@ -449,6 +452,9 @@ void DemandTextureLoaderImpl::processRequest( hipStream_t stream, uint32_t resou
             case Resource::Type::MipTail:
                 processMipTail( stream, resource.mipTail );
                 break;
+            case Resource::Type::Cascade:
+                processCascade( stream, resource.cascade );
+                break;
             default:
                 throw std::logic_error( "Unhandled resource type: " + std::to_string( static_cast<uint32_t>( resource.type ) ) );
         }
@@ -472,28 +478,40 @@ void DemandTextureLoaderImpl::processRequest( hipStream_t stream, uint32_t resou
     }
 }
 
+DemandTextureImpl& DemandTextureLoaderImpl::getTexture( uint32_t textureId )
+{
+    std::lock_guard lock( mutex_ );
+    return *textures_.at( textureId );
+}
+
+DeviceTextureInfo DemandTextureLoaderImpl::textureInfo( const DemandTextureImpl& texture ) const
+{
+    std::lock_guard lock( metadataMutex_ );
+    return texture.info;
+}
+
 void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t textureId )
 {
-    DemandTextureImpl* texture = nullptr;
-    {
-        std::lock_guard lock( mutex_ );
-        texture = textures_.at( textureId ).get();
-    }
+    DemandTextureImpl& texture = getTexture( textureId );
+    auto               upload  = uploadPool_.acquire<DeviceTextureInfo>( 1, stream );
 
     // An empty UDIM cell has no image and no pages: its descriptor only marks it loaded and empty, with the grid.
-    if( texture->isEmpty() )
+    if( texture.isEmpty() )
     {
-        auto info = uploadPool_.acquire<DeviceTextureInfo>( 1, stream );
-        *info     = {};
-        info->setLoaded( true );
-        info->setEmpty( true );
-        setUdimFields( *info, texture->udim );
-        memcpyHtoD( deviceContext_.textureInfos.subspan( textureId, 1 ), info.span(), stream );
+        DeviceTextureInfo info{};
+        info.setLoaded( true );
+        info.setEmpty( true );
+        setUdimFields( info, texture.udim );
+
+        std::lock_guard lock( metadataMutex_ );
+        texture.info = info;
+        *upload      = info;
+        memcpyHtoD( deviceContext_.textureInfos.subspan( textureId, 1 ), upload.span(), stream );
         return;
     }
 
     TextureInfo image{};
-    texture->image->open( &image );
+    texture.image->open( &image );
     image.numMipLevels = std::min( image.numMipLevels, MAX_TEXTURE_MIP_LEVELS );
     validateImage( image );
 
@@ -501,76 +519,105 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     const uint2         tileShape     = tileShapeForPageBytes( pageSystem_.pageBytes(), bytesPerTexel );
     const MipTailLayout mipTail       = computeMipTailLayout( image, bytesPerTexel, pageSystem_.pageBytes() );
 
-    auto info = uploadPool_.acquire<DeviceTextureInfo>( 1, stream );
-    *info     = {};
-    info->setAddressMode( 0, texture->descriptor.addressMode[0] );
-    info->setAddressMode( 1, texture->descriptor.addressMode[1] );
-    info->setFilterMode( texture->descriptor.filterMode );
-    info->setMipmapFilterMode( texture->descriptor.mipmapFilterMode );
-    info->setNormalizedCoords( texture->descriptor.normalizedCoords );
-    info->setMaxAnisotropy( std::clamp( texture->descriptor.maxAnisotropy, 1u, 16u ) );
-    info->setTexel( image.format, image.numChannels, bytesPerTexel );
-    info->setLayout( powerOfTwoExponent( tileShape.x ), powerOfTwoExponent( tileShape.y ), image.numMipLevels, mipTail.firstLevel );
-    info->width  = image.width;
-    info->height = image.height;
-    info->setLoaded( true );
+    DeviceTextureInfo info{};
+    info.setAddressMode( 0, texture.descriptor.addressMode[0] );
+    info.setAddressMode( 1, texture.descriptor.addressMode[1] );
+    info.setFilterMode( texture.descriptor.filterMode );
+    info.setMipmapFilterMode( texture.descriptor.mipmapFilterMode );
+    info.setNormalizedCoords( texture.descriptor.normalizedCoords );
+    info.setMaxAnisotropy( std::clamp( texture.descriptor.maxAnisotropy, 1u, 16u ) );
+    info.setTexel( image.format, image.numChannels, bytesPerTexel );
+    info.setLayout( powerOfTwoExponent( tileShape.x ), powerOfTwoExponent( tileShape.y ), image.numMipLevels, mipTail.firstLevel );
+    info.width  = image.width;
+    info.height = image.height;
+    info.setLoaded( true );
 
     // The grid fields are set at creation, before any request for the texture can arrive.
-    setUdimFields( *info, texture->udim );
+    setUdimFields( info, texture.udim );
+
+    for( uint32_t level = mipTail.firstLevel; level < info.mipCount(); ++level )
+        info.mips[level] = mipTail.offsets[level];
+
+    std::lock_guard lock( metadataMutex_ );
+    texture.info = info;
+
+    const uint32_t firstLevel = options_.enableCascades ? std::min( mipTail.firstLevel, info.mipCount() - 1 ) : 0;
+    assignLevelPages( texture, firstLevel, info.mipCount() );
+
+    *upload = texture.info;
+    memcpyHtoD( deviceContext_.textureInfos.subspan( textureId, 1 ), upload.span(), stream );
+}
+
+void DemandTextureLoaderImpl::assignLevelPages( DemandTextureImpl& texture, uint32_t firstLevel, uint32_t endLevel )
+{
+    DeviceTextureInfo& info = texture.info;
+    assert( firstLevel < endLevel && endLevel <= info.mipCount() );
+
+    const uint32_t tailFirstLevel = info.mipTailFirstLevel();
+    const uint32_t tiledEndLevel  = std::min( endLevel, tailFirstLevel );
+    const bool     withTail       = endLevel > tailFirstLevel;
+
+    uint32_t pageCount = withTail ? 1 : 0;
+    for( uint32_t level = firstLevel; level < tiledEndLevel; ++level )
+        pageCount += info.getMipLevel( level ).pageCount();
+
+    // TODO_BS: how to handle it?
+    PageTable::Range& pages = pageTable_.textureTiles;
+    if( pageCount > pages.startPage + pages.pageCount - pages.nextAvailablePage )
+        throw std::runtime_error( "Maximum demand virtual page count exceeded" );
+
+    uint32_t page = pages.nextAvailablePage;
+    for( uint32_t level = firstLevel; level < tiledEndLevel; ++level )
+    {
+        info.mips[level] = page;
+        pageRanges_.push_back( { page, level, &texture } );
+        page += info.getMipLevel( level ).pageCount();
+    }
+    if( withTail )
+    {
+        info.mipTailPage = page;
+        pageRanges_.push_back( { page, tailFirstLevel, &texture } );
+        page++;
+    }
+    pages.nextAvailablePage = page;
+    info.cascadeLevel       = firstLevel;
+
+    // The sampler addresses texels with 32-bit offsets from a level's first page unless a level is larger than that.
+    // The finest level has the most pages.
+    if( firstLevel < tiledEndLevel
+        && static_cast<uint64_t>( info.getMipLevel( firstLevel ).pageCount() ) * pageSystem_.pageBytes() > ( uint64_t( 1 ) << 32 ) )
+        info.setWideOffsets( true );
+}
+
+void DemandTextureLoaderImpl::processCascade( hipStream_t stream, const Resource::Cascade& cascade )
+{
+    DemandTextureImpl& texture = getTexture( cascade.textureId );
+    assert( texture.info.isLoaded() );
+
+    auto upload = uploadPool_.acquire<DeviceTextureInfo>( 1, stream );
 
     std::lock_guard lock( metadataMutex_ );
 
-    // Tiled levels get consecutive pages in level order, followed by one page for the mip tail.
-    const uint32_t firstPage = pageTable_.textureTiles.nextAvailablePage;
-    uint32_t       pageCount = 0;
-    info->startPage          = firstPage;
-    for( uint32_t level = 0; level < info->mipTailFirstLevel(); ++level )
-    {
-        info->mips[level] = firstPage + pageCount;
-        pageCount += info->getMipLevel( level ).pageCount();
-    }
+    // The requests of one pass are processed in any order: a coarser one may find the texture extended already.
+    if( cascade.level >= texture.info.cascadeLevel )
+        return;
 
-    if( info->mipTailFirstLevel() < info->mipCount() )
-    {
-        info->mipTailPage = firstPage + pageCount;
-        pageCount++;
-
-        for( uint32_t level = info->mipTailFirstLevel(); level < info->mipCount(); ++level )
-            info->mips[level] = mipTail.offsets[level];
-    }
-
-    // TODO_BS: how to handle it?
-    const uint32_t end = pageTable_.textureTiles.startPage + pageTable_.textureTiles.pageCount;
-    if( pageCount > end - firstPage )
-        throw std::runtime_error( "Maximum demand virtual page count exceeded" );
-
-    // The sampler addresses texels with 32-bit offsets from the texture's first page unless the texture is larger.
-    info->setWideOffsets( static_cast<uint64_t>( pageCount ) * pageSystem_.pageBytes() > ( uint64_t( 1 ) << 32 ) );
-
-    texture->loadedTextureInfoId = static_cast<uint32_t>( loadedTextureInfos_.size() );
-    loadedTextureInfos_.push_back( { textureId, *info } );
-    pageTable_.textureTiles.nextAvailablePage += pageCount;
-
-    memcpyHtoD( deviceContext_.textureInfos.subspan( textureId, 1 ), info.span(), stream );
-}
-
-DemandTextureLoaderImpl::LoadedTexture DemandTextureLoaderImpl::loadedTexture( uint32_t textureId ) const
-{
-    std::scoped_lock         lock( mutex_, metadataMutex_ );
-    const DemandTextureImpl& texture = *textures_.at( textureId );
-    return { texture.image, loadedTextureInfos_.at( texture.loadedTextureInfoId ).info };
+    assignLevelPages( texture, cascade.level, texture.info.cascadeLevel );
+    *upload = texture.info;
+    memcpyHtoD( deviceContext_.textureInfos.subspan( cascade.textureId, 1 ), upload.span(), stream );
 }
 
 void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::Tile& tile )
 {
-    const LoadedTexture texture = loadedTexture( tile.textureId );
+    const DemandTextureImpl& texture = getTexture( tile.textureId );
+    const DeviceTextureInfo  info    = textureInfo( texture );
 
     Tile region{};
     region.x      = tile.tileX;
     region.y      = tile.tileY;
-    region.width  = texture.info.tileWidth();
-    region.height = texture.info.tileHeight();
-    assert( static_cast<size_t>( region.width ) * region.height * texture.info.bytesPerTexel() <= pageSystem_.pageBytes() );
+    region.width  = info.tileWidth();
+    region.height = info.tileHeight();
+    assert( static_cast<size_t>( region.width ) * region.height * info.bytesPerTexel() <= pageSystem_.pageBytes() );
 
     auto pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
     if( !texture.image->readTile( reinterpret_cast<char*>( pageBuffer.span().ptr ), tile.mipLevel, region, stream ) )
@@ -586,14 +633,15 @@ void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::T
 
 void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource::MipTail& mipTail )
 {
-    const LoadedTexture texture = loadedTexture( mipTail.textureId );
-    assert( texture.info.mipTailFirstLevel() < texture.info.mipCount() );
+    const DemandTextureImpl& texture = getTexture( mipTail.textureId );
+    const DeviceTextureInfo  info    = textureInfo( texture );
+    assert( info.mipTailFirstLevel() < info.mipCount() );
 
     auto pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
     std::memset( pageBuffer.span().ptr, 0, pageBuffer.span().sizeInBytes() );
-    for( uint32_t level = texture.info.mipTailFirstLevel(); level < texture.info.mipCount(); ++level )
+    for( uint32_t level = info.mipTailFirstLevel(); level < info.mipCount(); ++level )
     {
-        const DeviceMipLevel mip = texture.info.getMipLevel( level );
+        const DeviceMipLevel mip = info.getMipLevel( level );
         char*                dst = reinterpret_cast<char*>( pageBuffer.span().ptr + mip.mipTailOffset );
         if( !texture.image->readMipLevel( dst, level, mip.width, mip.height, stream ) )
         {
@@ -613,33 +661,39 @@ Resource DemandTextureLoaderImpl::decodeResource( uint32_t resourceId ) const
     if( resourceTable_.textureInfos.contains( resourceId ) )
         return Resource( resourceTable_.textureInfos.getLocalId( resourceId ) );
 
-    // Find the texture owning the page: the last one starting at or before it.
+    if( resourceTable_.cascades.contains( resourceId ) )
+    {
+        const uint32_t cascadeId = resourceTable_.cascades.getLocalId( resourceId );
+        return Resource( Resource::Cascade{ cascadeId / MAX_TEXTURE_MIP_LEVELS, cascadeId % MAX_TEXTURE_MIP_LEVELS } );
+    }
+
+    // Find the level owning the page: the last range starting at or before it.
     const uint32_t pageId = resourceTable_.textureTiles.getLocalId( resourceId );
-    const auto     next =
-        std::upper_bound( loadedTextureInfos_.cbegin(), loadedTextureInfos_.cend(), pageId,
-                          []( uint32_t page, const LoadedTextureInfo& loaded ) { return page < loaded.info.startPage; } );
-    if( next == loadedTextureInfos_.cbegin() )
+    const auto     next   = std::upper_bound( pageRanges_.cbegin(), pageRanges_.cend(), pageId,
+                                              []( uint32_t page, const PageRange& range ) { return page < range.startPage; } );
+    if( next == pageRanges_.cbegin() )
         throw std::out_of_range( "Cannot decode resourceId " + std::to_string( resourceId )
                                  + ": it does not belong to any registered texture" );
 
-    const LoadedTextureInfo& loaded = *std::prev( next );
-    const DeviceTextureInfo& info   = loaded.info;
-    if( pageId == info.mipTailPage )
-        return Resource( Resource::MipTail{ loaded.textureId, pageId } );
-
-    for( uint32_t level = 0; level < info.mipTailFirstLevel(); ++level )
+    const PageRange&         range   = *std::prev( next );
+    const DemandTextureImpl& texture = *range.texture;
+    const DeviceTextureInfo& info    = texture.info;
+    if( range.level >= info.mipTailFirstLevel() )
     {
-        const DeviceMipLevel mip = info.getMipLevel( level );
-        if( mip.startPage <= pageId && pageId < mip.startPage + mip.pageCount() )
-        {
-            const uint32_t pageInLevel = pageId - mip.startPage;
-            return Resource( Resource::Tile{ loaded.textureId, level, pageInLevel % mip.tilesX, pageInLevel / mip.tilesX, pageId } );
-        }
+        if( pageId == info.mipTailPage )
+            return Resource( Resource::MipTail{ texture.id, pageId } );
+    }
+    else
+    {
+        const DeviceMipLevel mip         = info.getMipLevel( range.level );
+        const uint32_t       pageInLevel = pageId - mip.startPage;
+        if( pageInLevel < mip.pageCount() )
+            return Resource( Resource::Tile{ texture.id, range.level, pageInLevel % mip.tilesX, pageInLevel / mip.tilesX, pageId } );
     }
 
     // we should never be here!
     throw std::out_of_range( "Cannot decode resourceId " + std::to_string( resourceId )
-                             + ": it is outside the mip ranges of texture " + std::to_string( loaded.textureId ) );
+                             + ": it is outside the mip ranges of texture " + std::to_string( texture.id ) );
 }
 
 void DemandTextureLoaderImpl::updateProcessedResources( hipStream_t stream )
