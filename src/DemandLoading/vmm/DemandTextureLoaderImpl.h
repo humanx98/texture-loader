@@ -132,6 +132,8 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     explicit DemandTextureLoaderImpl( const Options& options );
     ~DemandTextureLoaderImpl() override;
 
+    void init();
+
     const DemandTexture& createTexture( std::shared_ptr<ImageSource> imageSource, const TextureDescriptor& textureDesc ) override;
     const DemandTexture& createUdimTexture( const std::vector<std::shared_ptr<ImageSource>>& imageSources,
                                             const std::vector<TextureDescriptor>&            textureDescs,

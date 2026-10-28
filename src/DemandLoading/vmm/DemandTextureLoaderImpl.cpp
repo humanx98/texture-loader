@@ -179,15 +179,20 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     , uploadPool_( requestProcessor_.threadCount() * 3 )
     , bits_( resourceTable_.count() )
 {
+}
+
+void DemandTextureLoaderImpl::init()
+{
+    assert( !kernels_.module );
+
     if( options_.maxRequests == 0 )
         throw std::invalid_argument( "maxRequests cannot be 0" );
 
     const std::filesystem::path kernelsPath = getLibraryDirectory() / "hip_demand_texture_kernels.co";
     HIP_CHECK( hipModuleLoad( &kernels_.module, kernelsPath.string().c_str() ) );
-    HIP_CHECK( hipModuleGetFunction( &kernels_.collectRequests, kernels_.module, "collectRequestsKernel" ) );
-    HIP_CHECK(
-        hipModuleGetFunction( &kernels_.updateProcessedResources, kernels_.module, "updateProcessedResourcesKernel" ) );
-    HIP_CHECK( hipModuleGetFunction( &kernels_.updateEvictedPages, kernels_.module, "updateEvictedPagesKernel" ) );
+    HIP_CHECK( hipModuleGetFunction( &kernels_.collectRequests, kernels_.module, "collectRequestsAndEvictionCandidates" ) );
+    HIP_CHECK( hipModuleGetFunction( &kernels_.updateProcessedResources, kernels_.module, "updateProcessedResources" ) );
+    HIP_CHECK( hipModuleGetFunction( &kernels_.updateEvictedPages, kernels_.module, "updateEvictedPages" ) );
 
     options_.enableEviction = options_.enableEviction && options_.maxEvictedPages > 0;
 
@@ -195,18 +200,18 @@ DemandTextureLoaderImpl::DemandTextureLoaderImpl( const Options& options )
     deviceContext_.resourceTable      = resourceTable_;
     deviceContext_.pageSize           = pageSystem_.pageBytes();
     deviceContext_.pageMemory         = pageSystem_.virtualAddressSpace();
-    deviceContext_.residenceBits      = allocArray<uint32_t>( bits_.wordCount(), true, stream );
-    deviceContext_.textureInfos       = allocArray<DeviceTextureInfo>( options_.maxTextures, true, stream );
-    deviceContext_.referenceBits      = allocArray<uint32_t>( bits_.wordCount(), true, stream );
-    deviceContext_.requestedResources = allocArray<uint32_t>( options_.maxRequests, false, stream );
-    deviceContext_.counters = allocArray<uint32_t>( static_cast<size_t>( CounterIndex::NumCounters ), true, stream );
-    deviceContext_.processedResources = allocArray<uint32_t>( options_.maxRequests, false, stream );
+    deviceContext_.residenceBits      = deviceAllocArray<uint32_t>( bits_.wordCount(), true, stream );
+    deviceContext_.textureInfos       = deviceAllocArray<DeviceTextureInfo>( options_.maxTextures, true, stream );
+    deviceContext_.referenceBits      = deviceAllocArray<uint32_t>( bits_.wordCount(), true, stream );
+    deviceContext_.requestedResources = deviceAllocArray<uint32_t>( options_.maxRequests, false, stream );
+    deviceContext_.counters = deviceAllocArray<uint32_t>( static_cast<size_t>( CounterIndex::NumCounters ), true, stream );
+    deviceContext_.processedResources = deviceAllocArray<uint32_t>( options_.maxRequests, false, stream );
     if( options_.enableEviction )
     {
         deviceContext_.requestIfResident  = true;
-        deviceContext_.evictionCandidates = allocArray<EvictionCandidate>( options_.maxEvictedPages, false, stream );
+        deviceContext_.evictionCandidates = deviceAllocArray<EvictionCandidate>( options_.maxEvictedPages, false, stream );
         // 4 bits per resource, 8 values per uint32_t
-        deviceContext_.lru = allocArray<uint32_t>( ceilDiv( resourceTable_.textureTiles.count, 8u ), true, stream );
+        deviceContext_.lru = deviceAllocArray<uint32_t>( ceilDiv( resourceTable_.textureTiles.count, 8u ), true, stream );
     }
     HIP_CHECK( hipStreamSynchronize( stream ) );
 
@@ -228,14 +233,14 @@ DemandTextureLoaderImpl::~DemandTextureLoaderImpl()
         kernels_ = {};
     }
 
-    freeArray( deviceContext_.residenceBits );
-    freeArray( deviceContext_.lru );
-    freeArray( deviceContext_.textureInfos );
-    freeArray( deviceContext_.referenceBits );
-    freeArray( deviceContext_.requestedResources );
-    freeArray( deviceContext_.evictionCandidates );
-    freeArray( deviceContext_.processedResources );
-    freeArray( deviceContext_.counters );
+    deviceFreeArray( deviceContext_.residenceBits );
+    deviceFreeArray( deviceContext_.lru );
+    deviceFreeArray( deviceContext_.textureInfos );
+    deviceFreeArray( deviceContext_.referenceBits );
+    deviceFreeArray( deviceContext_.requestedResources );
+    deviceFreeArray( deviceContext_.evictionCandidates );
+    deviceFreeArray( deviceContext_.processedResources );
+    deviceFreeArray( deviceContext_.counters );
 
     hostFreeArray( requestedResources_ );
     hostFreeArray( counters_ );
@@ -714,7 +719,9 @@ void DemandTextureLoaderImpl::updateProcessedResources( hipStream_t stream )
 
 std::unique_ptr<DemandTextureLoader> createDemandTextureLoader( const Options& options )
 {
-    return std::make_unique<DemandTextureLoaderImpl>( options );
+    auto loader = std::make_unique<DemandTextureLoaderImpl>( options );
+    loader->init();
+    return loader;
 }
 
 }  // namespace hip_demand::vmm

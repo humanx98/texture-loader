@@ -149,7 +149,8 @@ HIP_DEMAND_INLINE void collectEvictionCandidates( DeviceContext& context,
     }
 }
 
-HIP_DEMAND_INLINE void collectRequestsAndEvictionCandidates( DeviceContext& context, uint32_t launchNum, uint32_t lruThreshold )
+// Kernels use C linkage so that the host can look them up by name in the code object.
+extern "C" __global__ void collectRequestsAndEvictionCandidates( DeviceContext context, uint32_t launchNum, uint32_t lruThreshold )
 {
     uint32_t wordIdx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -168,7 +169,7 @@ HIP_DEMAND_INLINE void collectRequestsAndEvictionCandidates( DeviceContext& cont
     }
 }
 
-HIP_DEMAND_INLINE void updateProcessedResources( DeviceContext& context, uint32_t processedCount )
+extern "C" __global__ void updateProcessedResources( DeviceContext context, uint32_t processedCount )
 {
     uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
     while( globalIdx < processedCount )
@@ -186,7 +187,7 @@ HIP_DEMAND_INLINE void updateProcessedResources( DeviceContext& context, uint32_
     }
 }
 
-HIP_DEMAND_INLINE void updateEvictedPages( DeviceContext& context, uint32_t evictionCount )
+extern "C" __global__ void updateEvictedPages( DeviceContext context, uint32_t evictionCount )
 {
     uint32_t globalIdx = blockIdx.x * blockDim.x + threadIdx.x;
     while( globalIdx < evictionCount )
@@ -198,19 +199,4 @@ HIP_DEMAND_INLINE void updateEvictedPages( DeviceContext& context, uint32_t evic
     }
 }
 
-}
-
-extern "C" __global__ void collectRequestsKernel( hip_demand::vmm::DeviceContext context, uint32_t launchNum, uint32_t lruThreshold )
-{
-    hip_demand::vmm::collectRequestsAndEvictionCandidates(context, launchNum, lruThreshold);
-}
-
-extern "C" __global__ void updateProcessedResourcesKernel( hip_demand::vmm::DeviceContext context, uint32_t processedCount )
-{
-    hip_demand::vmm::updateProcessedResources(context, processedCount);
-}
-
-extern "C" __global__ void updateEvictedPagesKernel( hip_demand::vmm::DeviceContext context, uint32_t evictionCount )
-{
-    hip_demand::vmm::updateEvictedPages(context, evictionCount);
 }

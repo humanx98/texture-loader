@@ -48,37 +48,7 @@ class PinnedUploadPool : NonCopyble
             , stream_( stream )
         {
         }
-        ~Buffer() { reset(); }
-
-        Buffer( const Buffer& )            = delete;
-        Buffer& operator=( const Buffer& ) = delete;
-
-        Buffer( Buffer&& other ) noexcept
-            : pool_( std::exchange( other.pool_, nullptr ) )
-            , memory_( std::exchange( other.memory_, {} ) )
-            , stream_( std::exchange( other.stream_, nullptr ) )
-        {
-        }
-
-        Buffer& operator=( Buffer&& other ) noexcept
-        {
-            if( this != &other )
-            {
-                reset();
-                pool_   = std::exchange( other.pool_, nullptr );
-                memory_ = std::exchange( other.memory_, {} );
-                stream_ = std::exchange( other.stream_, nullptr );
-            }
-            return *this;
-        }
-
-        HostSpan<T> span() const noexcept { return memory_; }
-        T*          operator->() noexcept { return memory_.ptr; }
-        T&          operator*() noexcept { return *memory_.ptr; }
-
-      private:
-
-        void reset()
+        ~Buffer()
         {
             if( pool_ && memory_.ptr )
                 pool_->retire( memory_, stream_ );
@@ -86,6 +56,17 @@ class PinnedUploadPool : NonCopyble
             memory_ = {};
             stream_ = nullptr;
         }
+
+        Buffer( const Buffer& )                      = delete;
+        Buffer& operator=( const Buffer& )           = delete;
+        Buffer( Buffer&& other )            noexcept = delete;
+        Buffer& operator=( Buffer&& other ) noexcept = delete;
+
+        HostSpan<T> span() const noexcept { return memory_; }
+        T*          operator->() noexcept { return memory_.ptr; }
+        T&          operator*() noexcept { return *memory_.ptr; }
+
+      private:
 
         PinnedUploadPool* pool_{};
         HostSpan<T>       memory_{};

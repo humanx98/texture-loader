@@ -174,7 +174,7 @@ inline uint2 mipDimensions( uint2 dimensions, uint32_t mipLevel )
 }
 
 template <typename T>
-inline DeviceSpan<T> allocArray( size_t count, bool zero = false, hipStream_t stream = nullptr )
+inline DeviceSpan<T> deviceAllocArray( size_t count, bool zero = false, hipStream_t stream = nullptr )
 {
     const size_t size = count * sizeof( T );
     if( size == 0 )
@@ -191,10 +191,10 @@ inline DeviceSpan<T> allocArray( size_t count, bool zero = false, hipStream_t st
 }
 
 template <typename T>
-inline void freeArray( DeviceSpan<T>& span )
+inline void deviceFreeArray( DeviceSpan<T>& span )
 {
     if( span.ptr )
-        HIP_CHECK( hipFree( span.ptr ) );
+        HIP_WARN( hipFree( span.ptr ) );
 
     span.ptr = nullptr;
     span.len = 0;
@@ -244,7 +244,7 @@ template <typename T>
 inline void hostFreeArray( HostSpan<T>& span )
 {
     if( span.ptr )
-        HIP_CHECK( hipHostFree( span.ptr ) );
+        HIP_WARN( hipHostFree( span.ptr ) );
 
     span.ptr = nullptr;
     span.len = 0;
