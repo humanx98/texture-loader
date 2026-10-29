@@ -31,11 +31,13 @@ class MipMapImageSource : public WrappedImageSource
 
     bool readTile( char* dest, uint32_t mipLevel, const Tile& tile, hipStream_t stream ) override;
     bool readMipLevel( char* dest, uint32_t mipLevel, uint32_t expectedWidth, uint32_t expectedHeight, hipStream_t stream = 0 ) override;
+    bool readMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims, hipStream_t stream ) override;
     unsigned long long getNumTilesRead() const override;
 
   private:
     void cacheBaseInfo();
     bool buildLevels( hipStream_t stream );
+    bool copyMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims ) const;
 
     mutable std::shared_mutex      mutex_;
     bool                           mipMappedBase_ = false;

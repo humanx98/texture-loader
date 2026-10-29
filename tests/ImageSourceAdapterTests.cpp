@@ -241,6 +241,90 @@ TEST(MipMapImageSource, ConcurrentReadersBuildTheChainOnce) {
     EXPECT_EQ(base->levelReads, 1u);
 }
 
+// Reads levels first..numMipLevels-1 of image through readMipTail() and checks them against the base pattern.
+void expectMipTail(hip_demand::ImageSource& image, unsigned int first, unsigned int channels) {
+    const hip_demand::TextureInfo& info = image.getInfo();
+    std::vector<uint2> dims(info.numMipLevels);
+    size_t texels = 0;
+    for (unsigned int level = 0; level < info.numMipLevels; ++level) {
+        dims[level] = make_uint2(std::max(1u, info.width >> level), std::max(1u, info.height >> level));
+        if (level >= first) texels += static_cast<size_t>(dims[level].x) * dims[level].y;
+    }
+    std::vector<uint8_t> tail(texels * channels, 0xa5);
+    ASSERT_TRUE(image.readMipTail(reinterpret_cast<char*>(tail.data()), first, info.numMipLevels, dims.data(), nullptr));
+    size_t offset = 0;
+    for (unsigned int level = first; level < info.numMipLevels; ++level) {
+        for (unsigned int y = 0; y < dims[level].y; ++y)
+            for (unsigned int x = 0; x < dims[level].x; ++x)
+                for (unsigned int c = 0; c < channels; ++c)
+                    ASSERT_EQ(tail[offset + (static_cast<size_t>(y) * dims[level].x + x) * channels + c], patternValue(x, y, level, c))
+                        << "level " << level << " pixel " << x << ',' << y;
+        offset += static_cast<size_t>(dims[level].x) * dims[level].y * channels;
+    }
+    EXPECT_EQ(offset, tail.size());
+}
+
+TEST(ImageSource, DefaultReadMipTailPacksLevelReads) {
+    LevelOnlyImage image(20, 12, 3, HIP_AD_FORMAT_UNSIGNED_INT8, 4, false);
+    image.open(nullptr);
+    expectMipTail(image, 1, 3);
+    EXPECT_EQ(image.levelReads, 3u);
+
+    // A level whose size differs from the image's fails the read.
+    uint2 dims[4] = {make_uint2(20, 12), make_uint2(10, 6), make_uint2(5, 3), make_uint2(1, 1)};
+    std::vector<uint8_t> tail(20 * 12 * 3);
+    EXPECT_FALSE(image.readMipTail(reinterpret_cast<char*>(tail.data()), 2, 4, dims, nullptr));
+}
+
+TEST(TiledImageSource, ReadsTheMipTailFromItsLevels) {
+    auto base = std::make_shared<LevelOnlyImage>(40, 24, 2, HIP_AD_FORMAT_UNSIGNED_INT8, 3, false);
+    std::shared_ptr<hip_demand::ImageSource> image = hip_demand::createTiledImageSource(base);
+    ASSERT_NE(image, base);
+    expectMipTail(*image, 1, 2);
+    EXPECT_EQ(base->levelReads, 2u);
+    // Levels loaded for the tail serve tiles without another base read.
+    expectTile<uint8_t>(*image, 1, 2, hip_demand::Tile{0, 0, 16, 16}, 1.f, true);
+    EXPECT_EQ(base->levelReads, 2u);
+    uint2 dims[3] = {make_uint2(40, 24), make_uint2(20, 12), make_uint2(10, 6)};
+    std::vector<uint8_t> tail(40 * 24 * 2);
+    EXPECT_FALSE(image->readMipTail(reinterpret_cast<char*>(tail.data()), 3, 3, dims, nullptr));
+    EXPECT_FALSE(image->readMipTail(reinterpret_cast<char*>(tail.data()), 1, 4, dims, nullptr));
+    EXPECT_FALSE(image->readMipTail(nullptr, 1, 3, dims, nullptr));
+
+    // A tiled base image answers the tail itself.
+    auto tiledBase = std::make_shared<LevelOnlyImage>(8, 8, 1, HIP_AD_FORMAT_UNSIGNED_INT8, 2, true);
+    hip_demand::TiledImageSource wrapped(tiledBase);
+    wrapped.open(nullptr);
+    expectMipTail(wrapped, 0, 1);
+    EXPECT_EQ(tiledBase->levelReads, 2u);
+}
+
+TEST(MipMapImageSource, ReadsTheMipTailFromTheGeneratedChain) {
+    auto base = std::make_shared<LevelOnlyImage>(16, 8, 1, HIP_AD_FORMAT_UNSIGNED_INT8, 1, false);
+    std::shared_ptr<hip_demand::ImageSource> image = hip_demand::createMipMapImageSource(base);
+    ASSERT_NE(image, base);
+    const hip_demand::TextureInfo& info = image->getInfo();
+    ASSERT_EQ(info.numMipLevels, 5u);
+    std::vector<uint2> dims(5);
+    for (unsigned int level = 0; level < 5; ++level) dims[level] = make_uint2(std::max(1u, 16u >> level), std::max(1u, 8u >> level));
+
+    std::vector<uint8_t> tail(4 * 2 + 2 * 1 + 1 * 1, 0xa5);
+    ASSERT_TRUE(image->readMipTail(reinterpret_cast<char*>(tail.data()), 2, 5, dims.data(), nullptr));
+    EXPECT_EQ(base->levelReads, 1u);
+    // Each tail level matches the same level read on its own.
+    size_t offset = 0;
+    for (unsigned int level = 2; level < 5; ++level) {
+        std::vector<uint8_t> single(static_cast<size_t>(dims[level].x) * dims[level].y);
+        ASSERT_TRUE(image->readMipLevel(reinterpret_cast<char*>(single.data()), level, dims[level].x, dims[level].y));
+        EXPECT_TRUE(std::equal(single.begin(), single.end(), tail.begin() + offset)) << "level " << level;
+        offset += single.size();
+    }
+    EXPECT_EQ(offset, tail.size());
+    EXPECT_FALSE(image->readMipTail(reinterpret_cast<char*>(tail.data()), 2, 6, dims.data(), nullptr));
+    dims[4] = make_uint2(2, 2);
+    EXPECT_FALSE(image->readMipTail(reinterpret_cast<char*>(tail.data()), 4, 5, dims.data(), nullptr));
+}
+
 TEST(ImageData, HalfConversionRoundTrips) {
     const float values[] = {0.f, -0.f, 1.f, -1.f, 0.5f, 0.25f, 65504.f, 1.f / 1024.f, 6.103515625e-05f, 5.9604644775390625e-08f, 3.14159f};
     for (const float value : values) {

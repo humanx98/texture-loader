@@ -36,6 +36,11 @@ class WrappedImageSource : public ImageSource
         return imageSource_->readTile( dest, mipLevel, tile, stream );
     }
 
+    bool readMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims, hipStream_t stream ) override
+    {
+        return imageSource_->readMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims, stream );
+    }
+
     bool               readBaseColor( float4& dest ) override { return imageSource_->readBaseColor( dest ); }
     unsigned long long getNumTilesRead() const override { return imageSource_->getNumTilesRead(); }
     unsigned long long getNumBytesRead() const override { return imageSource_->getNumBytesRead(); }

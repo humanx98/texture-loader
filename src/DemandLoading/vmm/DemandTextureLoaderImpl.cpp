@@ -642,17 +642,23 @@ void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource
     const DeviceTextureInfo  info    = textureInfo( texture );
     assert( info.mipTailFirstLevel() < info.mipCount() );
 
-    auto pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
-    std::memset( pageBuffer.span().ptr, 0, pageBuffer.span().sizeInBytes() );
+    // The tail levels are packed one after another, which is the layout readMipTail() writes.
+    std::array<uint2, MAX_TEXTURE_MIP_LEVELS> levelDims{};
+    size_t                                    packedOffset = 0;
     for( uint32_t level = info.mipTailFirstLevel(); level < info.mipCount(); ++level )
     {
         const DeviceMipLevel mip = info.getMipLevel( level );
-        char*                dst = reinterpret_cast<char*>( pageBuffer.span().ptr + mip.mipTailOffset );
-        if( !texture.image->readMipLevel( dst, level, mip.width, mip.height, stream ) )
-        {
-            throw std::runtime_error( "Failed to read mip tail level " + std::to_string( level ) + " for texture "
-                                      + std::to_string( mipTail.textureId ) );
-        }
+        assert( mip.mipTailOffset == packedOffset );
+        levelDims[level] = make_uint2( mip.width, mip.height );
+        packedOffset += static_cast<size_t>( mip.width ) * mip.height * info.bytesPerTexel();
+    }
+
+    auto pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
+    std::memset( pageBuffer.span().ptr, 0, pageBuffer.span().sizeInBytes() );
+    if( !texture.image->readMipTail( reinterpret_cast<char*>( pageBuffer.span().ptr ), info.mipTailFirstLevel(),
+                                     info.mipCount(), levelDims.data(), stream ) )
+    {
+        throw std::runtime_error( "Failed to read mip tail for texture " + std::to_string( mipTail.textureId ) );
     }
 
     pageSystem_.map( mipTail.pageId );

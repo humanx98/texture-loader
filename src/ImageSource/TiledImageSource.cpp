@@ -100,6 +100,46 @@ bool TiledImageSource::copyTile( char* dest, uint32_t mipLevel, const Tile& tile
     return true;
 }
 
+bool TiledImageSource::readMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims, hipStream_t stream )
+{
+    {
+        std::shared_lock lock( mutex_ );
+        if( baseIsTiled_ )
+            return WrappedImageSource::readMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims, stream );
+    }
+    if( !dest || !mipLevelDims || mipTailFirstLevel >= numMipLevels )
+        return false;
+
+    {
+        std::unique_lock lock( mutex_ );
+        for( uint32_t level = mipTailFirstLevel; level < numMipLevels; ++level )
+        {
+            if( !loadLevel( level, stream ) )
+                return false;
+        }
+    }
+    std::shared_lock lock( mutex_ );
+    return copyMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims );
+}
+
+bool TiledImageSource::copyMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims ) const
+{
+    if( numMipLevels > levels_.size() )
+        return false;
+    const size_t bytesPerPixel = static_cast<size_t>( getBytesPerChannel( info_.format ) ) * info_.numChannels;
+    size_t       offset        = 0;
+    for( uint32_t level = mipTailFirstLevel; level < numMipLevels; ++level )
+    {
+        const std::vector<char>& data = levels_[level];
+        const size_t             bytes = static_cast<size_t>( mipLevelDims[level].x ) * mipLevelDims[level].y * bytesPerPixel;
+        if( data.size() != bytes )  // Closed in between, or the caller's level size differs from the image's.
+            return false;
+        std::copy( data.begin(), data.end(), dest + offset );
+        offset += bytes;
+    }
+    return true;
+}
+
 unsigned long long TiledImageSource::getNumTilesRead() const
 {
     std::shared_lock lock( mutex_ );

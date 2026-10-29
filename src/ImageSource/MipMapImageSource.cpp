@@ -243,6 +243,47 @@ bool MipMapImageSource::readMipLevel( char* dest, uint32_t mipLevel, uint32_t ex
     return !levels_.empty() && copy( levels_ );
 }
 
+bool MipMapImageSource::readMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims, hipStream_t stream )
+{
+    {
+        std::shared_lock lock( mutex_ );
+        if( mipMappedBase_ )
+            return WrappedImageSource::readMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims, stream );
+    }
+    if( !dest || !mipLevelDims || mipTailFirstLevel >= numMipLevels )
+        return false;
+
+    {
+        std::shared_lock lock( mutex_ );
+        if( !levels_.empty() )
+            return copyMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims );
+    }
+    {
+        std::unique_lock lock( mutex_ );
+        if( !buildLevels( stream ) )
+            return false;
+    }
+    std::shared_lock lock( mutex_ );
+    return !levels_.empty() && copyMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims );  // The chain may have been closed in between.
+}
+
+bool MipMapImageSource::copyMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims ) const
+{
+    if( numMipLevels > levels_.size() )
+        return false;
+    size_t offset = 0;
+    for( uint32_t level = mipTailFirstLevel; level < numMipLevels; ++level )
+    {
+        const std::vector<char>& data  = levels_[level];
+        const size_t             bytes = static_cast<size_t>( mipLevelDims[level].x ) * mipLevelDims[level].y * bytesPerPixel_;
+        if( data.size() != bytes )  // The caller's level size differs from the image's.
+            return false;
+        std::copy( data.begin(), data.end(), dest + offset );
+        offset += bytes;
+    }
+    return true;
+}
+
 unsigned long long MipMapImageSource::getNumTilesRead() const
 {
     std::shared_lock lock( mutex_ );

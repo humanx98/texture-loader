@@ -63,6 +63,17 @@ class InvertedImage : public hip_demand::WrappedImageSource
         return true;
     }
 
+    bool readMipTail( char* dest, unsigned int mipTailFirstLevel, unsigned int numMipLevels, const uint2* mipLevelDims, hipStream_t stream ) override
+    {
+        if( !WrappedImageSource::readMipTail( dest, mipTailFirstLevel, numMipLevels, mipLevelDims, stream ) )
+            return false;
+        size_t texelCount = 0;
+        for( unsigned int level = mipTailFirstLevel; level < numMipLevels; ++level )
+            texelCount += static_cast<size_t>( mipLevelDims[level].x ) * mipLevelDims[level].y;
+        invert( dest, texelCount );
+        return true;
+    }
+
     bool readBaseColor( float4& color ) override
     {
         if( !WrappedImageSource::readBaseColor( color ) )

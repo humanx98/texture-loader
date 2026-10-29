@@ -29,6 +29,7 @@ class TiledImageSource : public WrappedImageSource
     const TextureInfo& getInfo() const override;
 
     bool readTile( char* dest, uint32_t mipLevel, const Tile& tile, hipStream_t stream ) override;
+    bool readMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims, hipStream_t stream ) override;
 
     /// Number of tiles served, by the base image when it is tiled or by this adapter otherwise.
     unsigned long long getNumTilesRead() const override;
@@ -37,6 +38,7 @@ class TiledImageSource : public WrappedImageSource
     void cacheBaseInfo();
     bool loadLevel( uint32_t mipLevel, hipStream_t stream );
     bool copyTile( char* dest, uint32_t mipLevel, const Tile& tile );
+    bool copyMipTail( char* dest, uint32_t mipTailFirstLevel, uint32_t numMipLevels, const uint2* mipLevelDims ) const;
 
     mutable std::shared_mutex      mutex_;
     bool                           baseIsTiled_ = false;
