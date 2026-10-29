@@ -80,6 +80,8 @@ set(TEXTURE_LOADER_SOURCES
     src/DemandLoading/Ticket.cpp
     src/DemandLoading/Logging.cpp
     src/DemandLoading/stb_image_impl.cpp
+    src/ImageSource/MipMapImageSource.cpp
+    src/ImageSource/TiledImageSource.cpp
 )
 
 set(TEXTURE_LOADER_HEADERS

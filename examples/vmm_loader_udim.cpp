@@ -11,6 +11,8 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "vmm_loader_common.h"
 
+#include <ImageSource/WrappedImageSource.h>
+
 #include <array>
 #include <cstring>
 
@@ -33,29 +35,21 @@ constexpr uint32_t numChannels    = 2;  // The images, and the images with inver
 constexpr uint32_t emptyCell      = 4;  // The center of the grid.
 
 // Inverts the colors of an 8-bit image source, leaving a fourth (alpha) channel alone.
-class InvertedImage : public hip_demand::ImageSource
+class InvertedImage : public hip_demand::WrappedImageSource
 {
   public:
-    explicit InvertedImage( std::shared_ptr<hip_demand::ImageSource> image )
-        : image_( std::move( image ) )
-    {
-    }
+    using WrappedImageSource::WrappedImageSource;
 
     void open( hip_demand::TextureInfo* info ) override
     {
-        image_->open( info );
-        if( image_->getInfo().format != HIP_AD_FORMAT_UNSIGNED_INT8 )
+        WrappedImageSource::open( info );
+        if( getInfo().format != HIP_AD_FORMAT_UNSIGNED_INT8 )
             throw std::runtime_error( "InvertedImage needs an 8-bit image" );
     }
-    void                           close() override { image_->close(); }
-    bool                           isOpen() const override { return image_->isOpen(); }
-    const hip_demand::TextureInfo& getInfo() const override { return image_->getInfo(); }
-    unsigned long long             getNumBytesRead() const override { return image_->getNumBytesRead(); }
-    double                         getTotalReadTime() const override { return image_->getTotalReadTime(); }
 
     bool readMipLevel( char* dest, unsigned int mipLevel, unsigned int width, unsigned int height, hipStream_t stream ) override
     {
-        if( !image_->readMipLevel( dest, mipLevel, width, height, stream ) )
+        if( !WrappedImageSource::readMipLevel( dest, mipLevel, width, height, stream ) )
             return false;
         invert( dest, static_cast<size_t>( width ) * height );
         return true;
@@ -63,7 +57,7 @@ class InvertedImage : public hip_demand::ImageSource
 
     bool readTile( char* dest, unsigned int mipLevel, const hip_demand::Tile& tile, hipStream_t stream ) override
     {
-        if( !image_->readTile( dest, mipLevel, tile, stream ) )
+        if( !WrappedImageSource::readTile( dest, mipLevel, tile, stream ) )
             return false;
         invert( dest, static_cast<size_t>( tile.width ) * tile.height );
         return true;
@@ -71,7 +65,7 @@ class InvertedImage : public hip_demand::ImageSource
 
     bool readBaseColor( float4& color ) override
     {
-        if( !image_->readBaseColor( color ) )
+        if( !WrappedImageSource::readBaseColor( color ) )
             return false;
         color = make_float4( 1.0f - color.x, 1.0f - color.y, 1.0f - color.z, color.w );
         return true;
@@ -89,8 +83,6 @@ class InvertedImage : public hip_demand::ImageSource
                 bytes[channel] = static_cast<unsigned char>( 255 - bytes[channel] );
         }
     }
-
-    std::shared_ptr<hip_demand::ImageSource> image_;
 };
 
 std::shared_ptr<hip_demand::ImageSource> readChannelImage( const fs::path& path, uint32_t channel )

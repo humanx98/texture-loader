@@ -1,21 +1,21 @@
 #include <hip/hip_runtime.h>
 #include "ImageSource/OIIOReader.h"
-#include "../DemandLoading/Internal/ImageData.h"
-#include <OpenImageIO/half.h>
+
 #include <OpenImageIO/imageio.h>
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
-#include <cstdint>
 #include <cstring>
-#include <mutex>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 namespace hip_demand {
 
 namespace {
 
-hipArray_Format getHipFormat( OIIO::TypeDesc::BASETYPE format )
+inline hipArray_Format getHipFormat( OIIO::TypeDesc::BASETYPE format )
 {
     switch( format )
     {
@@ -36,13 +36,11 @@ hipArray_Format getHipFormat( OIIO::TypeDesc::BASETYPE format )
         case OIIO::TypeDesc::FLOAT:
             return HIP_AD_FORMAT_FLOAT;
         default:
-            // HIP textures do not support OIIO's 64-bit integer and double
-            // formats, so retain their dynamic range by converting to float.
             return HIP_AD_FORMAT_FLOAT;
     }
 }
 
-OIIO::TypeDesc getOiioFormat( hipArray_Format format )
+inline OIIO::TypeDesc getOiioFormat( hipArray_Format format )
 {
     switch( format )
     {
@@ -67,128 +65,61 @@ OIIO::TypeDesc getOiioFormat( hipArray_Format format )
     }
 }
 
-template <typename T>
-T loadSample( const unsigned char* data )
+class Stopwatch
 {
-    T value{};
-    std::memcpy( &value, data, sizeof( value ) );
-    return value;
-}
+  public:
+    double elapsed() const { return std::chrono::duration<double>( std::chrono::steady_clock::now() - start_ ).count(); }
 
-template <>
-Imath::half loadSample<Imath::half>( const unsigned char* data )
+  private:
+    std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+};
+
+// Selects the OpenEXR Core backend, which lets threads read tiles of one EXR file in parallel. The setting is global
+// and is read when a file is opened, so it is made once up front. Core needs OpenEXR 3.1.10; an older one is reported.
+void preferExrCoreReader()
 {
-    uint16_t bits{};
-    std::memcpy( &bits, data, sizeof( bits ) );
-    return Imath::half( Imath::half::FromBits, bits );
-}
+    static std::once_flag once;
+    std::call_once( once, [] {
+        OIIO::attribute( "openexr:core", 1 );
 
-template <typename T>
-void storeSample( unsigned char* data, T value )
-{
-    std::memcpy( data, &value, sizeof( value ) );
-}
+        std::string libs = OIIO::get_string_attribute( "library_list" );
+        std::transform( libs.begin(), libs.end(), libs.begin(), []( unsigned char c ) { return static_cast<char>( std::tolower( c ) ); } );
 
-template <>
-void storeSample( unsigned char* data, Imath::half value )
-{
-    const uint16_t bits = value.bits();
-    std::memcpy( data, &bits, sizeof( bits ) );
-}
-
-template <typename T>
-double sampleToDouble( T value )
-{
-    return static_cast<double>( value );
-}
-
-template <>
-double sampleToDouble( Imath::half value )
-{
-    return static_cast<float>( value );
-}
-
-template <typename T>
-T sampleFromDouble( double value )
-{
-    return static_cast<T>( value );
-}
-
-template <>
-Imath::half sampleFromDouble( double value )
-{
-    return Imath::half( static_cast<float>( value ) );
-}
-
-template <typename T>
-void generateMipLevelTyped( const unsigned char* srcData, int srcWidth, int srcHeight, unsigned char* dstData,
-                            int dstWidth, int dstHeight, int channels )
-{
-    constexpr size_t SAMPLE_BYTES = sizeof( T );
-
-    for( int y = 0; y < dstHeight; ++y )
-    {
-        for( int x = 0; x < dstWidth; ++x )
+        // Entries look like "openexr:openexr 3.3.2" and are separated by ';'.
+        const std::string key     = "openexr:";
+        const size_t      pos     = libs.find( key );
+        std::string       version = "unknown";
+        if( pos != std::string::npos )
         {
-            const int srcX = x * 2;
-            const int srcY = y * 2;
-
-            for( int channel = 0; channel < channels; ++channel )
+            const size_t      start = pos + key.size();
+            const size_t      end   = libs.find( ';', start );
+            const std::string entry = libs.substr( start, end == std::string::npos ? std::string::npos : end - start );
+            const size_t      digit = entry.find_first_of( "0123456789" );
+            if( digit != std::string::npos )
             {
-                double sum   = 0.0;
-                int    count = 0;
-
-                for( int dy = 0; dy < 2 && srcY + dy < srcHeight; ++dy )
-                {
-                    for( int dx = 0; dx < 2 && srcX + dx < srcWidth; ++dx )
-                    {
-                        const size_t srcSample =
-                            ( ( static_cast<size_t>( srcY + dy ) * srcWidth + srcX + dx ) * channels + channel )
-                            * SAMPLE_BYTES;
-                        sum += sampleToDouble( loadSample<T>( srcData + srcSample ) );
-                        ++count;
-                    }
-                }
-
-                const size_t dstSample =
-                    ( ( static_cast<size_t>( y ) * dstWidth + x ) * channels + channel ) * SAMPLE_BYTES;
-                storeSample( dstData + dstSample, sampleFromDouble<T>( sum / count ) );
+                version = entry.substr( digit );
+                int major = 0, minor = 0, patch = 0;
+                if( std::sscanf( version.c_str(), "%d.%d.%d", &major, &minor, &patch ) >= 2
+                    && ( major > 3 || ( major == 3 && ( minor > 1 || ( minor == 1 && patch >= 10 ) ) ) ) )
+                    return;
             }
         }
-    }
-}
-
-float decodeChannel( const unsigned char* data, hipArray_Format format )
-{
-    switch( format )
-    {
-        case HIP_AD_FORMAT_UNSIGNED_INT8:
-            return loadSample<uint8_t>( data ) / 255.0f;
-        case HIP_AD_FORMAT_SIGNED_INT8:
-            return std::max( -1.0f, loadSample<int8_t>( data ) / 127.0f );
-        case HIP_AD_FORMAT_UNSIGNED_INT16:
-            return loadSample<uint16_t>( data ) / 65535.0f;
-        case HIP_AD_FORMAT_SIGNED_INT16:
-            return std::max( -1.0f, loadSample<int16_t>( data ) / 32767.0f );
-        case HIP_AD_FORMAT_UNSIGNED_INT32:
-            return static_cast<float>( loadSample<uint32_t>( data ) ) / 4294967295.0f;
-        case HIP_AD_FORMAT_SIGNED_INT32:
-            return std::max( -1.0f, static_cast<float>( loadSample<int32_t>( data ) ) / 2147483647.0f );
-        case HIP_AD_FORMAT_HALF:
-            return static_cast<float>( loadSample<Imath::half>( data ) );
-        case HIP_AD_FORMAT_FLOAT:
-            return loadSample<float>( data );
-        default:
-            return 0.0f;
-    }
+        std::cerr << "OIIOReader: OpenEXR " << version << " has no Core backend (needs 3.1.10); EXR tile reads will serialize.\n";
+    } );
 }
 
 }  // namespace
 
-OIIOReader::OIIOReader( const std::string& filename, std::optional<hipArray_Format> outputFormat, bool generateMipChain )
+struct OIIOReader::File
+{
+    std::unique_ptr<OIIO::ImageInput> input;
+    OIIO::TypeDesc                    pixelFormat;  // Format of the pixels in the file, the same on every level.
+    OIIO::TypeDesc                    readFormat;   // Format OIIO converts to while reading; pixelFormat unless unsupported.
+};
+
+OIIOReader::OIIOReader( const std::string& filename, bool readBaseColor )
     : filename_( filename )
-    , outputFormat_( outputFormat )
-    , generateMipChain_( generateMipChain )
+    , readBaseColor_( readBaseColor )
 {
 }
 
@@ -199,88 +130,90 @@ OIIOReader::~OIIOReader()
 
 void OIIOReader::open( TextureInfo* info )
 {
-    std::unique_lock lock( mutex_ );
+    preferExrCoreReader();
 
-    if( isOpen_ )
+    std::lock_guard<std::mutex> lock( mutex_ );
+
+    if( !file_ )
     {
-        if( info )
-            *info = info_;
-        return;
+        auto file   = std::make_shared<File>();
+        file->input = OIIO::ImageInput::open( filename_ );
+        if( !file->input )
+            throw std::runtime_error( "Failed to open image " + filename_ + ": " + OIIO::geterror() );
+        OIIO::ImageInput& input = *file->input;
+
+        const OIIO::ImageSpec spec = input.spec_dimensions( 0, 0 );
+        if( spec.width <= 0 || spec.height <= 0 || spec.depth != 1 || spec.nchannels < 1 || spec.nchannels > 4 )
+            throw std::runtime_error( "Unsupported image dimensions or channel count: " + filename_ );
+
+        TextureInfo textureInfo{};
+        textureInfo.width       = static_cast<uint32_t>( spec.width );
+        textureInfo.height      = static_cast<uint32_t>( spec.height );
+        textureInfo.numChannels = static_cast<uint32_t>( spec.nchannels );
+        textureInfo.format      = getHipFormat( static_cast<OIIO::TypeDesc::BASETYPE>( spec.format.basetype ) );
+        textureInfo.isTiled     = spec.tile_width > 0 && spec.tile_height > 0;
+        textureInfo.isValid     = true;
+
+        file->pixelFormat = spec.format;
+        file->readFormat  = getOiioFormat( textureInfo.format );
+        bytesPerPixel_    = static_cast<uint32_t>( file->readFormat.size() ) * textureInfo.numChannels;
+        if( file->readFormat == OIIO::TypeDesc::UNKNOWN || bytesPerPixel_ == 0 )
+            throw std::runtime_error( "Unsupported pixel format " + std::string( spec.format.c_str() ) + ": " + filename_ );
+
+        std::vector<uint2> levelSizes, tileSizes;
+        for( int level = 0;; ++level )
+        {
+            const OIIO::ImageSpec levelSpec = level == 0 ? spec : input.spec_dimensions( 0, level );
+            if( levelSpec.format == OIIO::TypeDesc::UNKNOWN || levelSpec.width <= 0 || levelSpec.height <= 0 )
+                break;
+            // HIP halves level dimensions rounding down. A file may round up instead (EXR allows it), and its levels
+            // from the first mismatch on would be sampled with the wrong size, so only the matching prefix is kept.
+            if( levelSpec.width != std::max( 1, spec.width >> level ) || levelSpec.height != std::max( 1, spec.height >> level ) )
+                break;
+            if( levelSpec.format != file->pixelFormat || levelSpec.nchannels != spec.nchannels || levelSpec.depth != 1 )
+                throw std::runtime_error( "Mip levels differ in pixel format, channel count or depth: " + filename_ );
+
+            levelSizes.push_back( { static_cast<uint32_t>( levelSpec.width ), static_cast<uint32_t>( levelSpec.height ) } );
+            tileSizes.push_back( { static_cast<uint32_t>( std::max( 0, levelSpec.tile_width ) ),
+                                   static_cast<uint32_t>( std::max( 0, levelSpec.tile_height ) ) } );
+        }
+        textureInfo.numMipLevels = static_cast<uint32_t>( levelSizes.size() );
+
+        file_         = std::move( file );
+        info_         = textureInfo;
+        levelSizes_   = std::move( levelSizes );
+        tileSizes_    = std::move( tileSizes );
+
+        // The base color is the 1x1 level, which exists when the mip chain is complete or the image itself is 1x1.
+        // OIIO converts the pixel to float while reading, normalizing integer formats.
+        const uint32_t lastLevel = info_.numMipLevels - 1;
+        if( readBaseColor_ && levelSizes_[lastLevel].x == 1 && levelSizes_[lastLevel].y == 1 )
+        {
+            float channels[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            if( !input.read_image( 0, static_cast<int>( lastLevel ), 0, spec.nchannels, OIIO::TypeDesc::FLOAT, channels ) )
+                throw std::runtime_error( "Failed to read the base color of " + filename_ + ": " + input.geterror() );
+            baseColor_        = float4{ channels[0], channels[1], channels[2], channels[3] };
+            baseColorWasRead_ = true;
+        }
     }
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // Open image with OIIO
-    auto inp = OIIO::ImageInput::open( filename_ );
-    if( !inp )
-    {
-        throw std::runtime_error( "Failed to open image: " + filename_ );
-    }
-
-    const OIIO::ImageSpec& spec = inp->spec();
-    if( spec.width <= 0 || spec.height <= 0 || spec.depth != 1 || spec.nchannels < 1 || spec.nchannels > 4 )
-    {
-        inp->close();
-        throw std::runtime_error( "Unsupported OIIO texture dimensions or channels: " + filename_ );
-    }
-
-    // Fill texture info
-    info_.width        = spec.width;
-    info_.height       = spec.height;
-    info_.numChannels  = spec.nchannels;
-    info_.isValid      = true;
-    info_.isTiled      = spec.tile_width > 0;
-
-    const hipArray_Format sourceFormat =
-        getHipFormat( static_cast<OIIO::TypeDesc::BASETYPE>( spec.format.basetype ) );
-    info_.format = outputFormat_.value_or( sourceFormat );
-    if( getOiioFormat( info_.format ) == OIIO::TypeDesc::UNKNOWN )
-    {
-        inp->close();
-        throw std::invalid_argument( "Unsupported requested HIP array format: "
-                                     + std::to_string( static_cast<int>( info_.format ) ) );
-    }
-
-    // HIP arrays halve dimensions with rounding down. A valid EXR can round up, so keep only
-    // the compatible prefix of the authored levels.
-    const unsigned int fullMipLevels = calculateNumMipLevels( spec.width, spec.height );
-    authoredMipLevels_               = 1;
-    for( ; authoredMipLevels_ < fullMipLevels; ++authoredMipLevels_ )
-    {
-        const OIIO::ImageSpec mipSpec = inp->spec_dimensions( 0, static_cast<int>( authoredMipLevels_ ) );
-        if( mipSpec.width != std::max( 1, spec.width >> authoredMipLevels_ )
-            || mipSpec.height != std::max( 1, spec.height >> authoredMipLevels_ ) || mipSpec.depth != 1
-            || mipSpec.nchannels != spec.nchannels )
-            break;
-    }
-    info_.numMipLevels = generateMipChain_ ? fullMipLevels : authoredMipLevels_;
-
-    inp->close();
-
-    isOpen_ = true;
 
     if( info )
         *info = info_;
-
-    auto end = std::chrono::high_resolution_clock::now();
-    totalReadTime_ += std::chrono::duration<double>( end - start ).count();
 }
 
 void OIIOReader::close()
 {
-    std::unique_lock lock( mutex_ );
-
-    if( !isOpen_ )
-        return;
-
-    mipLevels_.clear();
-    isOpen_ = false;
+    // Only the reference is dropped; the OIIO input closes the file in its destructor, which runs once the last
+    // in-flight read releases its copy.
+    std::lock_guard<std::mutex> lock( mutex_ );
+    file_.reset();
+    baseColorWasRead_ = false;
 }
 
 bool OIIOReader::isOpen() const
 {
-    std::shared_lock lock( mutex_ );
-    return isOpen_;
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return static_cast<bool>( file_ );
 }
 
 const TextureInfo& OIIOReader::getInfo() const
@@ -288,283 +221,147 @@ const TextureInfo& OIIOReader::getInfo() const
     return info_;
 }
 
-bool OIIOReader::loadImage()
+std::shared_ptr<OIIOReader::File> OIIOReader::acquireFile() const
 {
-    if( !isOpen_ )
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return file_;
+}
+
+void OIIOReader::addStats( unsigned long long tiles, unsigned long long bytes, double seconds )
+{
+    std::lock_guard<std::mutex> lock( statsMutex_ );
+    numTilesRead_ += tiles;
+    numBytesRead_ += bytes;
+    totalReadTime_ += seconds;
+}
+
+bool OIIOReader::readTile( char* dest, uint32_t mipLevel, const Tile& tile, hipStream_t /*stream*/ )
+{
+    if( !dest || tile.width == 0 || tile.height == 0 )
         return false;
 
-    auto start = std::chrono::high_resolution_clock::now();
-
-    // Open image
-    auto inp = OIIO::ImageInput::open( filename_ );
-    if( !inp )
+    const std::shared_ptr<File> file = acquireFile();
+    if( !file || mipLevel >= info_.numMipLevels )
         return false;
+    OIIO::ImageInput& input = *file->input;
 
-    const OIIO::ImageSpec& spec = inp->spec();
+    const Stopwatch stopwatch;
 
-    // Read base level (level 0)
-    const size_t bytesPerChannel = getBytesPerChannel( info_.format );
-    const size_t baseSize = internal::imageByteSize( spec.width, spec.height, info_.numChannels, bytesPerChannel );
-    std::vector<unsigned char> baseLevel( baseSize );
+    const uint32_t levelWidth  = levelSizes_[mipLevel].x;
+    const uint32_t levelHeight = levelSizes_[mipLevel].y;
+    const uint32_t fileTileW   = tileSizes_[mipLevel].x;
+    const uint32_t fileTileH   = tileSizes_[mipLevel].y;
+    const uint32_t rowPitch    = tile.width * bytesPerPixel_;
 
-    const OIIO::TypeDesc outputFormat = getOiioFormat( info_.format );
-    if( outputFormat == OIIO::TypeDesc::UNKNOWN )
+    const uint32_t x0 = tile.x * tile.width;
+    const uint32_t y0 = tile.y * tile.height;
+    if( x0 >= levelWidth || y0 >= levelHeight )
+        return false;
+    const uint32_t x1 = std::min( x0 + tile.width, levelWidth );
+    const uint32_t y1 = std::min( y0 + tile.height, levelHeight );
+
+    // Pixels outside the level are zero. The reads fill only the in-bounds rectangle, so the tile is cleared first
+    // when it crosses the right or bottom edge.
+    if( x1 - x0 < tile.width || y1 - y0 < tile.height )
+        std::memset( dest, 0, static_cast<size_t>( tile.height ) * rowPitch );
+
+    unsigned long long bytesRead = 0;
+    if( fileTileW != 0 && fileTileH != 0 )
     {
-        inp->close();
-        return false;
-    }
-
-    const bool success = inp->read_image( 0, 0, 0, spec.nchannels, outputFormat, baseLevel.data() );
-
-    if( !success )
-    {
-        inp->close();
-        return false;
-    }
-
-    // Store base level
-    mipLevels_.resize( info_.numMipLevels );
-    mipLevels_[0] = std::move( baseLevel );
-
-    // Keep mip levels supplied by the file; generate the rest when the full chain is requested.
-    int width  = spec.width;
-    int height = spec.height;
-    unsigned long long bytesRead = baseSize;
-
-    for( unsigned int level = 1; level < info_.numMipLevels; ++level )
-    {
-        int prevWidth  = width;
-        int prevHeight = height;
-        width          = std::max( 1, width / 2 );
-        height         = std::max( 1, height / 2 );
-
-        const size_t levelSize = internal::imageByteSize( width, height, info_.numChannels, bytesPerChannel );
-        mipLevels_[level].resize( levelSize );
-
-        if( level < authoredMipLevels_ )
+        // The requested tile must be a whole multiple of the file's tile so that one read_tiles() call covers it.
+        if( fileTileW > tile.width || tile.width % fileTileW != 0 || fileTileH > tile.height || tile.height % fileTileH != 0 )
         {
-            if( !inp->read_image( 0, static_cast<int>( level ), 0, spec.nchannels, outputFormat,
-                                  mipLevels_[level].data() ) )
+            std::ostringstream message;
+            message << "Unsupported file tile size " << fileTileW << 'x' << fileTileH << " for a " << tile.width << 'x'
+                    << tile.height << " tile: the file tile must divide the requested tile (" << filename_ << ')';
+            throw std::runtime_error( message.str() );
+        }
+
+        // The region is clamped to the level so that no nonexistent edge tiles are requested; OIIO places each file
+        // tile at its destination offset through the strides.
+        if( !input.read_tiles( 0, static_cast<int>( mipLevel ), static_cast<int>( x0 ), static_cast<int>( x1 ),
+                               static_cast<int>( y0 ), static_cast<int>( y1 ), 0, 1, 0, static_cast<int>( info_.numChannels ),
+                               file->readFormat, dest, bytesPerPixel_, rowPitch ) )
+        {
+            throw std::runtime_error( "Failed to read tile from " + filename_ + ": " + input.geterror() );
+        }
+        const unsigned long long fileTiles = static_cast<unsigned long long>( ( x1 - x0 + fileTileW - 1 ) / fileTileW )
+                                             * ( ( y1 - y0 + fileTileH - 1 ) / fileTileH );
+        bytesRead = fileTiles * fileTileW * fileTileH * file->pixelFormat.size() * info_.numChannels;
+    }
+    else
+    {
+        // Scanline file: the tile's rows are read one at a time and the tile's columns copied out of each.
+        const size_t      filePixelBytes = file->pixelFormat.size() * info_.numChannels;
+        std::vector<char> row( static_cast<size_t>( levelWidth ) * bytesPerPixel_ );
+        for( uint32_t y = y0; y < y1; ++y )
+        {
+            if( !input.read_scanlines( 0, static_cast<int>( mipLevel ), static_cast<int>( y ), static_cast<int>( y + 1 ), 0,
+                                       0, static_cast<int>( info_.numChannels ), file->readFormat, row.data() ) )
             {
-                inp->close();
-                mipLevels_.clear();
-                return false;
+                throw std::runtime_error( "Failed to read scanline from " + filename_ + ": " + input.geterror() );
             }
-            bytesRead += levelSize;
+            std::memcpy( dest + static_cast<size_t>( y - y0 ) * rowPitch, row.data() + static_cast<size_t>( x0 ) * bytesPerPixel_,
+                         static_cast<size_t>( x1 - x0 ) * bytesPerPixel_ );
         }
-        else
-        {
-            generateMipLevel( mipLevels_[level - 1].data(), prevWidth, prevHeight, mipLevels_[level].data(), width,
-                              height, info_.numChannels );
-        }
+        bytesRead = static_cast<unsigned long long>( y1 - y0 ) * levelWidth * filePixelBytes;
     }
 
-    inp->close();
-    bytesRead_ += bytesRead;
-
-    auto end = std::chrono::high_resolution_clock::now();
-    totalReadTime_ += std::chrono::duration<double>( end - start ).count();
-
+    addStats( 1, bytesRead, stopwatch.elapsed() );
     return true;
 }
 
-void OIIOReader::generateMipLevel( const unsigned char* srcData, int srcWidth, int srcHeight, unsigned char* dstData,
-                                   int dstWidth, int dstHeight, int channels )
-{
-    switch( info_.format )
-    {
-        case HIP_AD_FORMAT_UNSIGNED_INT8:
-            generateMipLevelTyped<uint8_t>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_SIGNED_INT8:
-            generateMipLevelTyped<int8_t>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_UNSIGNED_INT16:
-            generateMipLevelTyped<uint16_t>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_SIGNED_INT16:
-            generateMipLevelTyped<int16_t>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_UNSIGNED_INT32:
-            generateMipLevelTyped<uint32_t>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_SIGNED_INT32:
-            generateMipLevelTyped<int32_t>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_HALF:
-            generateMipLevelTyped<Imath::half>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        case HIP_AD_FORMAT_FLOAT:
-            generateMipLevelTyped<float>( srcData, srcWidth, srcHeight, dstData, dstWidth, dstHeight, channels );
-            return;
-        default:
-            throw std::runtime_error( "Cannot generate mip level for unsupported HIP array format: "
-                                      + std::to_string( static_cast<int>( info_.format ) ) );
-    }
-}
-
-bool OIIOReader::readMipLevelNoLock( char* dest, unsigned int mipLevel, unsigned int expectedWidth, unsigned int expectedHeight )
-{
-    assert( dest );
-
-    if( mipLevel >= mipLevels_.size() )
-        return false;
-
-    unsigned int w = info_.width >> mipLevel;
-    unsigned int h = info_.height >> mipLevel;
-    w              = std::max( 1u, w );
-    h              = std::max( 1u, h );
-
-    if( w != expectedWidth || h != expectedHeight )
-        return false;
-
-    // Copy data
-    const size_t bytesPerTexel = static_cast<size_t>( getBytesPerChannel( info_.format ) ) * info_.numChannels;
-    std::memcpy( dest, mipLevels_[mipLevel].data(), bytesPerTexel * w * h );
-    return true;
-}
-
-bool OIIOReader::readMipLevel( char* dest, unsigned int mipLevel, unsigned int expectedWidth, unsigned int expectedHeight, hipStream_t stream )
+bool OIIOReader::readMipLevel( char* dest, uint32_t mipLevel, uint32_t expectedWidth, uint32_t expectedHeight, hipStream_t /*stream*/ )
 {
     if( !dest )
         return false;
 
-    for( ;; )
-    {
-        {
-            std::shared_lock lock( mutex_ );
-            if( !mipLevels_.empty() )
-                return readMipLevelNoLock(dest, mipLevel, expectedWidth, expectedHeight);
-        }
+    const std::shared_ptr<File> file = acquireFile();
+    if( !file || mipLevel >= info_.numMipLevels )
+        return false;
+    OIIO::ImageInput& input = *file->input;
 
-        {
-            std::unique_lock lock( mutex_ );
-            if( mipLevels_.empty() && !loadImage() )
-                return false;
-        }
-    }
-}
-
-bool OIIOReader::readTileNoLock( char* dest, unsigned int mipLevel, const Tile& tile )
-{
-    assert( dest );
-
-    if( mipLevel >= mipLevels_.size() )
+    const uint32_t levelWidth  = levelSizes_[mipLevel].x;
+    const uint32_t levelHeight = levelSizes_[mipLevel].y;
+    if( levelWidth != expectedWidth || levelHeight != expectedHeight )
         return false;
 
-    const size_t mipWidth  = std::max( 1u, info_.width >> mipLevel );
-    const size_t mipHeight = std::max( 1u, info_.height >> mipLevel );
-    const size_t firstX    = static_cast<size_t>( tile.x ) * tile.width;
-    const size_t firstY    = static_cast<size_t>( tile.y ) * tile.height;
+    const Stopwatch stopwatch;
+    if( !input.read_image( 0, static_cast<int>( mipLevel ), 0, static_cast<int>( info_.numChannels ), file->readFormat, dest ) )
+        throw std::runtime_error( "Failed to read mip level " + std::to_string( mipLevel ) + " from " + filename_ + ": " + input.geterror() );
 
-    if( firstX >= mipWidth || firstY >= mipHeight )
-        return false;
-
-    const size_t bytesPerTexel = static_cast<size_t>( getBytesPerChannel( info_.format ) ) * info_.numChannels;
-    if( bytesPerTexel == 0 )
-        return false;
-
-    const size_t copyWidth    = std::min( static_cast<size_t>( tile.width ), mipWidth - firstX );
-    const size_t copyHeight   = std::min( static_cast<size_t>( tile.height ), mipHeight - firstY );
-    const size_t tileRowBytes = static_cast<size_t>( tile.width ) * bytesPerTexel;
-
-    const std::vector<unsigned char>& source = mipLevels_[mipLevel];
-    if( source.size() < mipWidth * mipHeight * bytesPerTexel )
-        return false;
-
-    // Edge tiles are padded with zeroes so data left in a reused page buffer
-    // cannot leak into the unused part of the tile.
-    if( copyWidth < tile.width || copyHeight < tile.height )
-        std::memset( dest, 0, static_cast<size_t>( tile.height ) * tileRowBytes );
-
-    for( size_t row = 0; row < copyHeight; ++row )
-    {
-        const size_t sourceOffset = ( ( firstY + row ) * mipWidth + firstX ) * bytesPerTexel;
-        const size_t destOffset   = row * tileRowBytes;
-        std::memcpy( dest + destOffset, source.data() + sourceOffset, copyWidth * bytesPerTexel );
-    }
-
+    const unsigned long long bytesRead = static_cast<unsigned long long>( levelWidth ) * levelHeight * file->pixelFormat.size() * info_.numChannels;
+    addStats( 1, bytesRead, stopwatch.elapsed() );
     return true;
-}
-
-bool OIIOReader::readTile( char* dest, unsigned int mipLevel, const Tile& tile, hipStream_t stream )
-{
-    if( !dest )
-        return false;
-
-    for( ;; )
-    {
-        {
-            std::shared_lock lock( mutex_ );
-            if( !mipLevels_.empty() )
-                return readTileNoLock( dest, mipLevel, tile );
-        }
-
-        {
-            std::unique_lock lock( mutex_ );
-            if( mipLevels_.empty() && !loadImage() )
-                return false;
-        }
-    }
 }
 
 bool OIIOReader::readBaseColor( float4& dest )
 {
-    {
-        // The base color is the 1x1 level, which exists only when the mip chain is complete.
-        std::shared_lock lock( mutex_ );
-        const unsigned int lastLevel = info_.numMipLevels - 1;
-        if( !isOpen_ || std::max( 1u, info_.width >> lastLevel ) != 1 || std::max( 1u, info_.height >> lastLevel ) != 1 )
-            return false;
-    }
-
-    for( ;; )
-    {
-        {
-            std::shared_lock lock( mutex_ );
-            if( !mipLevels_.empty() )
-            {
-                const unsigned int lastLevel       = info_.numMipLevels - 1;
-                const size_t       bytesPerChannel = getBytesPerChannel( info_.format );
-                const auto&        mip             = mipLevels_[lastLevel];
-                if( bytesPerChannel == 0 || mip.size() < bytesPerChannel * info_.numChannels )
-                    return false;
-
-                const unsigned char* data = mip.data();
-                dest.x                    = decodeChannel( data, info_.format );
-                dest.y = info_.numChannels > 1 ? decodeChannel( data + bytesPerChannel, info_.format ) : 0.0f;
-                dest.z = info_.numChannels > 2 ? decodeChannel( data + 2 * bytesPerChannel, info_.format ) : 0.0f;
-                dest.w = info_.numChannels > 3 ? decodeChannel( data + 3 * bytesPerChannel, info_.format ) : 1.0f;
-                return true;
-            }
-        }
-
-        {
-            std::unique_lock lock( mutex_ );
-            if( mipLevels_.empty() && !loadImage() )
-                return false;
-        }
-    }
-
-    return true;
+    std::lock_guard<std::mutex> lock( mutex_ );
+    dest = baseColor_;
+    return baseColorWasRead_;
 }
 
 unsigned long long OIIOReader::getNumBytesRead() const
 {
-    std::shared_lock lock( mutex_ );
-    return bytesRead_;
+    std::lock_guard<std::mutex> lock( statsMutex_ );
+    return numBytesRead_;
 }
 
 double OIIOReader::getTotalReadTime() const
 {
-    std::shared_lock lock( mutex_ );
+    std::lock_guard<std::mutex> lock( statsMutex_ );
     return totalReadTime_;
+}
+
+unsigned long long OIIOReader::getNumTilesRead() const
+{
+    std::lock_guard<std::mutex> lock( statsMutex_ );
+    return numTilesRead_;
 }
 
 unsigned long long OIIOReader::getHash( hipStream_t /*stream*/ ) const
 {
-    // Hash the filename for content-based deduplication
-    // Two ImageSource objects with the same filename should return the same hash
     return static_cast<unsigned long long>( std::hash<std::string>{}( filename_ ) );
 }
 

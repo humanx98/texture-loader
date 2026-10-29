@@ -33,6 +33,7 @@ add_executable(texture_loader_tests
     ThreadPoolTests.cpp
     MemoryPoolTests.cpp
     TicketTests.cpp
+    ImageSourceAdapterTests.cpp
 )
 
 target_include_directories(texture_loader_tests

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <ImageSource/MipMapImageSource.h>
 #include <ImageSource/OIIOReader.h>
 #include <ImageSource/TextureInfo.h>
+#include <ImageSource/TiledImageSource.h>
 
 #include "hip_check.h"
 #include "stb_image_write.h"
@@ -60,12 +62,15 @@ inline void saveGpuOutput( const fs::path& outputPath, hipStream_t stream, const
     std::cout << "  Image saved: " << fs::absolute( outputPath ).string() << '\n';
 }
 
+// Opens the image for the VMM loader: tiles come straight from a tiled, mipmapped file (a .tx or tiled TIFF/EXR),
+// while a file without mip levels gets a chain built in memory and a file without tiles gets its levels cached.
 inline std::shared_ptr<hip_demand::ImageSource> readImage( const fs::path& path )
 {
-    auto image = std::make_shared<hip_demand::OIIOReader>( path.string(), HIP_AD_FORMAT_UNSIGNED_INT8, true );
+    std::shared_ptr<hip_demand::ImageSource> image = std::make_shared<hip_demand::OIIOReader>( path.string() );
+    image                                          = hip_demand::createMipMapImageSource( std::move( image ) );
+    image                                          = hip_demand::createTiledImageSource( std::move( image ) );
 
-    hip_demand::TextureInfo info{};
-    image->open( &info );
+    const hip_demand::TextureInfo& info = image->getInfo();
     if( !info.isValid || info.width == 0 || info.height == 0 )
         throw std::runtime_error( "Invalid image: " + path.string() );
 

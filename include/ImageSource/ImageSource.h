@@ -52,6 +52,9 @@ class ImageSource
     /// Read the base color (1x1 mip level) as float4. Returns true on success.
     virtual bool readBaseColor( float4& dest ) = 0;
 
+    /// Returns the number of tiles read, counting a whole level as one. Zero when not tracked.
+    virtual unsigned long long getNumTilesRead() const { return 0; }
+
     /// Returns the number of bytes read from disk.
     virtual unsigned long long getNumBytesRead() const = 0;
 
