@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <hip/hip_runtime.h>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace hip_demand::vmm {
@@ -62,7 +63,7 @@ class PageSystem : NonCopyble
     int                   device_      = 0;
     size_t                pageBytes_   = 0;
     hipMemAllocationProp  allocationProp_{};
-    std::vector<uint32_t> virtualIdToPhysicalId_{};
+    std::unordered_map<uint32_t, uint32_t> virtualIdToPhysicalId_{};
     struct
     {
         uint32_t                  maxPages;

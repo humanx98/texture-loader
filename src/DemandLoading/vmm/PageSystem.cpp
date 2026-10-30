@@ -1,5 +1,7 @@
 #include "PageSystem.h"
 #include "../Internal/HipCheck.h"
+#include <stdexcept>
+#include <string>
 
 namespace hip_demand::vmm {
 
@@ -28,8 +30,6 @@ PageSystem::PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
     virtual_.addressSpace.len = static_cast<size_t>( virtual_.maxPages ) * pageBytes_;
     HIP_CHECK( hipMemAddressReserve( reinterpret_cast<void**>( &virtual_.addressSpace.ptr ), virtual_.addressSpace.len,
                                      pageBytes_, nullptr, 0 ) );
-
-    virtualIdToPhysicalId_.assign( virtual_.maxPages, INVALID_PAGE );
 }
 
 PageSystem::~PageSystem()
@@ -52,11 +52,14 @@ PageSystem::~PageSystem()
 
 void PageSystem::map( uint32_t pageId )
 {
+    if( pageId >= virtual_.maxPages )
+        throw std::out_of_range( "Virtual page id " + std::to_string( pageId ) + " is outside the reserved address space" );
+
     std::lock_guard<std::mutex> lock( mutex_ );
 
     processPendingEvictedPages();
 
-    if( virtualIdToPhysicalId_.at( pageId ) != INVALID_PAGE )
+    if( virtualIdToPhysicalId_.find( pageId ) != virtualIdToPhysicalId_.end() )
         return;
 
     uint32_t physicalPageId = INVALID_PAGE;
@@ -94,8 +97,8 @@ void PageSystem::map( uint32_t pageId )
     access.flags         = hipMemAccessFlagsProtReadWrite;
     HIP_CHECK( hipMemSetAccess( virtualPage.ptr, virtualPage.len, &access, 1 ) );
 
-    virtualIdToPhysicalId_.at( pageId ) = physicalPageId;
-    physicalPage.virtualPageId          = pageId;
+    virtualIdToPhysicalId_[pageId] = physicalPageId;
+    physicalPage.virtualPageId     = pageId;
 }
 
 void PageSystem::enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, uint32_t reusablePageCount )
@@ -117,14 +120,15 @@ void PageSystem::processPendingEvictedPages()
             virtual_.pendingReusableEvictedPageCount - std::min( requestedReusablePages, availableReusablePages );
         for( size_t i = 0; i < virtual_.pendingEvictedPages.size(); i++ )
         {
-            const uint32_t virtualPageId  = virtual_.pendingEvictedPages.at( i );
-            const uint32_t physicalPageId = virtualIdToPhysicalId_.at( virtualPageId );
-            if( physicalPageId == INVALID_PAGE )
+            const uint32_t virtualPageId = virtual_.pendingEvictedPages.at( i );
+            const auto     mapping       = virtualIdToPhysicalId_.find( virtualPageId );
+            if( mapping == virtualIdToPhysicalId_.end() )
                 continue;
+            const uint32_t physicalPageId = mapping->second;
 
             const DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
             HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
-            virtualIdToPhysicalId_.at( virtualPageId ) = INVALID_PAGE;
+            virtualIdToPhysicalId_.erase( mapping );
 
             PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );
             physicalPage.virtualPageId = INVALID_PAGE;
