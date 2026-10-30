@@ -60,7 +60,7 @@ HIP_DEMAND_INLINE void referenceTextureInfo( const DeviceContext& context, uint3
 
 HIP_DEMAND_INLINE void requestCascade( const DeviceContext& context, uint32_t textureId, uint32_t level )
 {
-    recordRequest( context, context.resourceTable.cascades.getResourceId( textureId * MAX_TEXTURE_MIP_LEVELS + level ) );
+    recordRequest( context, context.resourceTable.cascades.getResourceId( textureId * MAX_TILED_MIP_LEVELS + level ) );
 }
 
 // Reads a value from device global memory through a global address space pointer. A generic pointer loaded from memory
@@ -103,7 +103,9 @@ struct TextureMetadata
         // whole array to scratch memory and read the entry back through it, on every sample. A direct load of the one
         // entry is a single scalar load for a wave-uniform level. The copy of info.mips is never read, so the compiler
         // drops those loads from loadGlobal() and nothing is loaded twice.
-        return info.getMipLevel( level, loadGlobal( mips + level ) );
+        // A tail level has no entry: its page is info.mipTailPage, and its index may exceed the array.
+        const uint32_t startPage = level < info.mipTailFirstLevel() ? loadGlobal( mips + level ) : INVALID_PAGE;
+        return info.getMipLevel( level, startPage );
     }
 };
 

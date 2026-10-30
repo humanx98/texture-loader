@@ -60,9 +60,9 @@ struct DeviceSpan
 
 namespace hip_demand::vmm {
 
-constexpr uint32_t INVALID_TEXTURE        = ~0u;
-constexpr uint32_t INVALID_PAGE           = ~0u;
-constexpr uint32_t MAX_TEXTURE_MIP_LEVELS = 9;
+constexpr uint32_t INVALID_TEXTURE      = ~0u;
+constexpr uint32_t INVALID_PAGE         = ~0u;
+constexpr uint32_t MAX_TILED_MIP_LEVELS = 9;
 
 struct DeviceMipLevel
 {
@@ -89,9 +89,9 @@ struct DeviceTextureInfo
     uint32_t udimStartTexture = INVALID_TEXTURE;
     uint32_t udimGrid         = 0;
 
-    // One word per level: the first page of a tiled level, or the byte offset within the mip-tail page of a tail level.
-    // Tiled levels finer than cascadeLevel have no pages and their word is unset.
-    uint32_t mips[MAX_TEXTURE_MIP_LEVELS]{};
+    // The first page of each tiled level. Tiled levels finer than cascadeLevel have no pages and their word is unset.
+    // Tail levels have no word: they share mipTailPage at the offsets mipTailLevelOffset() computes.
+    uint32_t mips[MAX_TILED_MIP_LEVELS]{};
 
     // --- sampling ---
     HIP_DEMAND_INLINE uint32_t addressMode( uint32_t axis ) const { return bits( sampling, 2 * axis, 2 ); }
@@ -174,17 +174,31 @@ struct DeviceTextureInfo
         return { x & tileWidthMask(), y & tileHeightMask() };
     }
 
-    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level ) const { return getMipLevel( level, mips[level] ); }
+    HIP_DEMAND_INLINE uint32_t levelWidth( uint32_t level ) const { return std::max( width >> level, 1u ); }
+    HIP_DEMAND_INLINE uint32_t levelHeight( uint32_t level ) const { return std::max( height >> level, 1u ); }
 
-    // Takes the level's word of mips[] separately so that it can be read without indexing a local copy of the array.
-    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level, uint32_t pages ) const
+    HIP_DEMAND_INLINE uint32_t mipTailLevelOffset( uint32_t level ) const
+    {
+        uint32_t offset = 0;
+        for( uint32_t tailLevel = mipTailFirstLevel(); tailLevel < level; ++tailLevel )
+            offset += levelWidth( tailLevel ) * levelHeight( tailLevel ) * bytesPerTexel();
+        return offset;
+    }
+
+    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level ) const
+    {
+        return getMipLevel( level, level < mipTailFirstLevel() ? mips[level] : INVALID_PAGE );
+    }
+
+    HIP_DEMAND_INLINE DeviceMipLevel getMipLevel( uint32_t level, uint32_t startPage ) const
     {
         DeviceMipLevel mip{};
-        mip.mipTail       = level >= mipTailFirstLevel();
-        mip.startPage     = mip.mipTail ? mipTailPage : pages;
-        mip.mipTailOffset = mip.mipTail ? pages : 0;
-        mip.width         = std::max( width >> level, 1u );
-        mip.height        = std::max( height >> level, 1u );
+        mip.mipTail   = level >= mipTailFirstLevel();
+        mip.startPage = mip.mipTail ? mipTailPage : startPage;
+        if( mip.mipTail )
+            mip.mipTailOffset = mipTailLevelOffset( level );
+        mip.width  = levelWidth( level );
+        mip.height = levelHeight( level );
         mip.tilesX = ( mip.width >> tileWidthShift() ) + static_cast<uint32_t>( ( mip.width & tileWidthMask() ) != 0 );
         mip.tilesY = ( mip.height >> tileHeightShift() ) + static_cast<uint32_t>( ( mip.height & tileHeightMask() ) != 0 );
         return mip;
@@ -225,7 +239,7 @@ struct ResourceTable
 
     Range textureTiles{};
     Range textureInfos{};
-    // MAX_TEXTURE_MIP_LEVELS per texture: a request for the texture to get pages down to that level.
+    // MAX_TILED_MIP_LEVELS per texture: a request for the texture to get pages down to that level.
     Range cascades{};
 
     HIP_DEMAND_INLINE uint32_t count() const { return textureTiles.count + textureInfos.count + cascades.count; }

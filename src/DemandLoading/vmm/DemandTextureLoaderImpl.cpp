@@ -84,6 +84,7 @@ class ProcessRequestCallback : public HipCallback
 };
 
 constexpr uint32_t maxTexturesLimit = 1024 * 1024;
+constexpr uint32_t maxMipLevels = 32;
 
 ResourceTable createResourceTable( const Options& options )
 {
@@ -93,7 +94,7 @@ ResourceTable createResourceTable( const Options& options )
     ResourceTable table{};
     table.textureTiles = ResourceTable::Range( 0, options.maxVirtualPages );
     table.textureInfos = ResourceTable::Range( table.textureTiles.end(), options.maxTextures );
-    const uint32_t cascadeCount = options.enableCascades ? options.maxTextures * MAX_TEXTURE_MIP_LEVELS : 0;
+    const uint32_t cascadeCount = options.enableCascades ? options.maxTextures * MAX_TILED_MIP_LEVELS : 0;
     table.cascades              = ResourceTable::Range( table.textureInfos.end(), cascadeCount );
 
     uint32_t resourceCount = 0;
@@ -133,39 +134,21 @@ void validateImage( const TextureInfo& image )
         throw std::runtime_error( "Unsupported channel count: " + std::to_string( image.numChannels ) );
 }
 
-struct MipTailLayout
+uint32_t computeMipTailFirstLevel( const TextureInfo& image, uint32_t bytesPerTexel, size_t pageBytes )
 {
-    uint32_t                                     firstLevel = 0;
-    std::array<uint32_t, MAX_TEXTURE_MIP_LEVELS> offsets{};
-    uint32_t                                     size = 0;  // Bytes used in the mip-tail page.
-};
-
-MipTailLayout computeMipTailLayout( const TextureInfo& image, uint32_t bytesPerTexel, size_t pageBytes )
-{
-    const auto levelBytes = [&]( uint32_t level ) {
-        const uint2 dimensions = mipDimensions( make_uint2( image.width, image.height ), level );
-        return static_cast<size_t>( bytesPerTexel ) * dimensions.x * dimensions.y;
-    };
-
-    MipTailLayout layout{};
-    layout.firstLevel = image.numMipLevels;
-    size_t tailBytes  = 0;
+    uint32_t firstLevel = image.numMipLevels;
+    size_t   tailBytes  = 0;
     for( uint32_t level = image.numMipLevels; level-- > 0; )
     {
-        const size_t bytes = levelBytes( level );
+        const uint2  dimensions = mipDimensions( make_uint2( image.width, image.height ), level );
+        const size_t bytes      = static_cast<size_t>( bytesPerTexel ) * dimensions.x * dimensions.y;
         if( bytes > pageBytes - tailBytes )
             break;
 
         tailBytes += bytes;
-        layout.firstLevel = level;
+        firstLevel = level;
     }
-
-    for( uint32_t level = layout.firstLevel; level < image.numMipLevels; ++level )
-    {
-        layout.offsets[level] = layout.size;
-        layout.size += static_cast<uint32_t>( levelBytes( level ) );
-    }
-    return layout;
+    return firstLevel;
 }
 
 }  // namespace
@@ -517,12 +500,17 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
 
     TextureInfo image{};
     texture.image->open( &image );
-    image.numMipLevels = std::min( image.numMipLevels, MAX_TEXTURE_MIP_LEVELS );
     validateImage( image );
+    image.numMipLevels = std::min( image.numMipLevels, maxMipLevels );
 
-    const uint32_t      bytesPerTexel = getBytesPerChannel( image.format ) * image.numChannels;
-    const uint2         tileShape     = tileShapeForPageBytes( pageSystem_.pageBytes(), bytesPerTexel );
-    const MipTailLayout mipTail       = computeMipTailLayout( image, bytesPerTexel, pageSystem_.pageBytes() );
+    const uint32_t bytesPerTexel = getBytesPerChannel( image.format ) * image.numChannels;
+    const uint2    tileShape     = tileShapeForPageBytes( pageSystem_.pageBytes(), bytesPerTexel );
+    uint32_t       mipTailFirstLevel = computeMipTailFirstLevel( image, bytesPerTexel, pageSystem_.pageBytes() );
+
+    // Only the tiled levels have a word in DeviceTextureInfo::mips; the tail holds any number of levels. A texture
+    // with more tiled levels than words keeps the finest ones and loses its tail.
+    if( mipTailFirstLevel > MAX_TILED_MIP_LEVELS )
+        image.numMipLevels = mipTailFirstLevel = MAX_TILED_MIP_LEVELS;
 
     DeviceTextureInfo info{};
     info.setAddressMode( 0, texture.descriptor.addressMode[0] );
@@ -532,7 +520,7 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     info.setNormalizedCoords( texture.descriptor.normalizedCoords );
     info.setMaxAnisotropy( std::clamp( texture.descriptor.maxAnisotropy, 1u, 16u ) );
     info.setTexel( image.format, image.numChannels, bytesPerTexel );
-    info.setLayout( powerOfTwoExponent( tileShape.x ), powerOfTwoExponent( tileShape.y ), image.numMipLevels, mipTail.firstLevel );
+    info.setLayout( powerOfTwoExponent( tileShape.x ), powerOfTwoExponent( tileShape.y ), image.numMipLevels, mipTailFirstLevel );
     info.width  = image.width;
     info.height = image.height;
     info.setLoaded( true );
@@ -540,13 +528,10 @@ void DemandTextureLoaderImpl::processTextureInfo( hipStream_t stream, uint32_t t
     // The grid fields are set at creation, before any request for the texture can arrive.
     setUdimFields( info, texture.udim );
 
-    for( uint32_t level = mipTail.firstLevel; level < info.mipCount(); ++level )
-        info.mips[level] = mipTail.offsets[level];
-
     std::lock_guard lock( metadataMutex_ );
     texture.info = info;
 
-    const uint32_t firstLevel = options_.enableCascades ? std::min( mipTail.firstLevel, info.mipCount() - 1 ) : 0;
+    const uint32_t firstLevel = options_.enableCascades ? std::min( mipTailFirstLevel, info.mipCount() - 1 ) : 0;
     assignLevelPages( texture, firstLevel, info.mipCount() );
 
     *upload = texture.info;
@@ -642,16 +627,11 @@ void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource
     const DeviceTextureInfo  info    = textureInfo( texture );
     assert( info.mipTailFirstLevel() < info.mipCount() );
 
-    // The tail levels are packed one after another, which is the layout readMipTail() writes.
-    std::array<uint2, MAX_TEXTURE_MIP_LEVELS> levelDims{};
-    size_t                                    packedOffset = 0;
+    assert( info.mipTailLevelOffset( info.mipCount() ) <= pageSystem_.pageBytes() );
+    assert( info.mipCount() <= maxMipLevels );
+    std::array<uint2, maxMipLevels> levelDims{};
     for( uint32_t level = info.mipTailFirstLevel(); level < info.mipCount(); ++level )
-    {
-        const DeviceMipLevel mip = info.getMipLevel( level );
-        assert( mip.mipTailOffset == packedOffset );
-        levelDims[level] = make_uint2( mip.width, mip.height );
-        packedOffset += static_cast<size_t>( mip.width ) * mip.height * info.bytesPerTexel();
-    }
+        levelDims[level] = make_uint2( info.levelWidth( level ), info.levelHeight( level ) );
 
     auto pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
     std::memset( pageBuffer.span().ptr, 0, pageBuffer.span().sizeInBytes() );
@@ -675,7 +655,7 @@ Resource DemandTextureLoaderImpl::decodeResource( uint32_t resourceId ) const
     if( resourceTable_.cascades.contains( resourceId ) )
     {
         const uint32_t cascadeId = resourceTable_.cascades.getLocalId( resourceId );
-        return Resource( Resource::Cascade{ cascadeId / MAX_TEXTURE_MIP_LEVELS, cascadeId % MAX_TEXTURE_MIP_LEVELS } );
+        return Resource( Resource::Cascade{ cascadeId / MAX_TILED_MIP_LEVELS, cascadeId % MAX_TILED_MIP_LEVELS } );
     }
 
     // Find the level owning the page: the last range starting at or before it.
