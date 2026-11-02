@@ -40,7 +40,10 @@ class PageSystem : NonCopyble
 
     explicit PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages );
     ~PageSystem();
-    void map( uint32_t pageId );
+
+    uint32_t map( uint32_t pageId );
+    void mapAlias( uint32_t pageId, uint32_t physicalPageId );
+    void retain( uint32_t physicalPageId );
     void enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, uint32_t reusablePageCount );
 
     DeviceSpan<uint8_t> page( uint32_t pageId ) const
@@ -50,14 +53,24 @@ class PageSystem : NonCopyble
     DeviceSpan<uint8_t> virtualAddressSpace() const { return virtual_.addressSpace; }
     size_t              pageBytes() const { return pageBytes_; }
     int                 device() const { return device_; }
+    uint32_t physicalPageCount() const;
+    uint32_t mappedPageCount() const;
+
+    /// Makes the device pick up changed page mappings. On Linux, ROCm's hipMemMap()/hipMemUnmap() do not invalidate
+    /// the GPU TLB (the amdgpu kernel driver skips it, see ROCm/rocm-systems#13106), so a virtual page that is unmapped
+    /// and then mapped to another physical page keeps reading and writing the old one until its translation happens
+    /// to be evicted. Mapping host memory for the GPU goes through the kernel driver, which does invalidate the TLB.
+    /// Windows is not affected, and the call does nothing there.
+    static void invalidateDeviceTlb();
 
   private:
     void processPendingEvictedPages();
 
     struct PhysicalPage
     {
-        hipMemGenericAllocationHandle_t handle        = nullptr;
-        uint32_t                        virtualPageId = INVALID_PAGE;
+        hipMemGenericAllocationHandle_t handle   = nullptr;
+        uint32_t                        useCount = 0;  // Virtual pages mapped to the page, plus one if retained.
+        bool                            retained = false;
     };
 
     int                   device_      = 0;
@@ -67,6 +80,7 @@ class PageSystem : NonCopyble
     struct
     {
         uint32_t                  maxPages;
+        uint32_t                  allocatedCount;
         std::vector<PhysicalPage> pages;
         std::vector<uint32_t>     reusablePages;
         std::vector<uint32_t>     unallocatedPages;

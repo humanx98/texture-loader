@@ -1,4 +1,5 @@
 #include "DemandTextureLoaderImpl.h"
+#include "WhiteBlackTile.h"
 #include <ImageSource/TextureInfo.h>
 
 #include <algorithm>
@@ -617,6 +618,25 @@ void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::T
                                   + std::to_string( tile.tileX ) + ", " + std::to_string( tile.tileY ) + ")" );
     }
 
+    std::string key;
+    if( options_.coalesceWhiteBlackTiles
+        && whiteBlackTileKey( pageBuffer.span().ptr, pageBuffer.span().len, info.format(), info.numChannels(), key ) )
+    {
+        std::lock_guard lock( whiteBlack_.mutex );
+        const auto      shared = whiteBlack_.pages.find( key );
+        if( shared != whiteBlack_.pages.end() )
+        {
+            pageSystem_.mapAlias( tile.pageId, shared->second );
+            return;
+        }
+
+        const uint32_t physicalPageId = pageSystem_.map( tile.pageId );
+        pageSystem_.retain( physicalPageId );
+        memcpyHtoD( pageSystem_.page( tile.pageId ), pageBuffer.span(), stream );
+        whiteBlack_.pages.emplace( std::move( key ), physicalPageId );
+        return;
+    }
+
     pageSystem_.map( tile.pageId );
     memcpyHtoD( pageSystem_.page( tile.pageId ), pageBuffer.span(), stream );
 }
@@ -643,6 +663,12 @@ void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource
 
     pageSystem_.map( mipTail.pageId );
     memcpyHtoD( pageSystem_.page( mipTail.pageId ), pageBuffer.span(), stream );
+}
+
+uint32_t DemandTextureLoaderImpl::whiteBlackTileCount() const
+{
+    std::lock_guard lock( whiteBlack_.mutex );
+    return static_cast<uint32_t>( whiteBlack_.pages.size() );
 }
 
 Resource DemandTextureLoaderImpl::decodeResource( uint32_t resourceId ) const

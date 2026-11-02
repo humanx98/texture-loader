@@ -65,6 +65,9 @@ struct Options
 
     /// Number of CPU request-processing threads. Zero selects hardware concurrency.
     uint32_t maxThreads = 0;
+
+    /// Backs all white and all black tiles with one shared physical page per texel value.
+    bool coalesceWhiteBlackTiles = false;
 };
 
 class DemandTexture

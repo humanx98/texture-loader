@@ -35,6 +35,8 @@ add_executable(texture_loader_tests
     TicketTests.cpp
     ImageSourceAdapterTests.cpp
     VmmDeviceTextureInfoTests.cpp
+    VmmPageSystemTests.cpp
+    VmmWhiteBlackTileTests.cpp
 )
 
 target_include_directories(texture_loader_tests

@@ -34,14 +34,14 @@ PageSystem::PageSystem( uint32_t maxVirtualPages, uint32_t maxPhysicalPages )
 
 PageSystem::~PageSystem()
 {
+    for( const auto& [virtualPageId, physicalPageId] : virtualIdToPhysicalId_ )
+    {
+        DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
+        HIP_WARN( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
+    }
+
     for( PhysicalPage& physicalPage : physical_.pages )
     {
-        if( physicalPage.virtualPageId != INVALID_PAGE )
-        {
-            DeviceSpan<uint8_t> virtualPage = page( physicalPage.virtualPageId );
-            HIP_WARN( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
-        }
-
         if( physicalPage.handle )
             HIP_WARN( hipMemRelease( physicalPage.handle ) );
     }
@@ -50,7 +50,7 @@ PageSystem::~PageSystem()
         HIP_WARN( hipMemAddressFree( virtual_.addressSpace.ptr, virtual_.addressSpace.len ) );
 }
 
-void PageSystem::map( uint32_t pageId )
+uint32_t PageSystem::map( uint32_t pageId )
 {
     if( pageId >= virtual_.maxPages )
         throw std::out_of_range( "Virtual page id " + std::to_string( pageId ) + " is outside the reserved address space" );
@@ -59,8 +59,9 @@ void PageSystem::map( uint32_t pageId )
 
     processPendingEvictedPages();
 
-    if( virtualIdToPhysicalId_.find( pageId ) != virtualIdToPhysicalId_.end() )
-        return;
+    const auto mapping = virtualIdToPhysicalId_.find( pageId );
+    if( mapping != virtualIdToPhysicalId_.end() )
+        return mapping->second;
 
     uint32_t physicalPageId = INVALID_PAGE;
     if( !physical_.reusablePages.empty() )
@@ -81,10 +82,11 @@ void PageSystem::map( uint32_t pageId )
                 throw std::runtime_error( "Maximum demand physical page count exceeded" );
 
             physicalPageId = static_cast<uint32_t>( physical_.pages.size() );
-            physical_.pages.push_back( { nullptr, INVALID_PAGE } );
+            physical_.pages.push_back( {} );
         }
 
         HIP_CHECK( hipMemCreate( &physical_.pages.at( physicalPageId ).handle, pageBytes_, &allocationProp_, 0 ) );
+        physical_.allocatedCount++;
     }
 
     PhysicalPage&       physicalPage = physical_.pages.at( physicalPageId );
@@ -98,7 +100,51 @@ void PageSystem::map( uint32_t pageId )
     HIP_CHECK( hipMemSetAccess( virtualPage.ptr, virtualPage.len, &access, 1 ) );
 
     virtualIdToPhysicalId_[pageId] = physicalPageId;
-    physicalPage.virtualPageId     = pageId;
+    physicalPage.useCount++;
+    return physicalPageId;
+}
+
+void PageSystem::mapAlias( uint32_t pageId, uint32_t physicalPageId )
+{
+    if( pageId >= virtual_.maxPages )
+        throw std::out_of_range( "Virtual page id " + std::to_string( pageId ) + " is outside the reserved address space" );
+
+    std::lock_guard<std::mutex> lock( mutex_ );
+
+    processPendingEvictedPages();
+
+    if( virtualIdToPhysicalId_.find( pageId ) != virtualIdToPhysicalId_.end() )
+        return;
+
+    PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );
+    if( !physicalPage.handle || physicalPage.useCount == 0 )
+        throw std::logic_error( "Physical page " + std::to_string( physicalPageId ) + " is not in use and cannot be aliased" );
+
+    DeviceSpan<uint8_t> virtualPage = page( pageId );
+    HIP_CHECK( hipMemMap( virtualPage.ptr, virtualPage.len, 0, physicalPage.handle, 0 ) );
+
+    hipMemAccessDesc access{};
+    access.location.type = hipMemLocationTypeDevice;
+    access.location.id   = device_;
+    access.flags         = hipMemAccessFlagsProtReadWrite;
+    HIP_CHECK( hipMemSetAccess( virtualPage.ptr, virtualPage.len, &access, 1 ) );
+
+    virtualIdToPhysicalId_[pageId] = physicalPageId;
+    physicalPage.useCount++;
+}
+
+void PageSystem::retain( uint32_t physicalPageId )
+{
+    std::lock_guard<std::mutex> lock( mutex_ );
+
+    PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );
+    if( !physicalPage.handle || physicalPage.useCount == 0 )
+        throw std::logic_error( "Physical page " + std::to_string( physicalPageId ) + " is not in use and cannot be retained" );
+    if( physicalPage.retained )
+        return;
+
+    physicalPage.retained = true;
+    physicalPage.useCount++;
 }
 
 void PageSystem::enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, uint32_t reusablePageCount )
@@ -110,44 +156,76 @@ void PageSystem::enqueueEvictedPages( const HostSpan<EvictionCandidate>& pages, 
         virtual_.pendingEvictedPages.push_back( pages.ptr[i].pageId );
 }
 
+uint32_t PageSystem::physicalPageCount() const
+{
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return physical_.allocatedCount;
+}
+
+uint32_t PageSystem::mappedPageCount() const
+{
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return static_cast<uint32_t>( virtualIdToPhysicalId_.size() );
+}
+
+void PageSystem::invalidateDeviceTlb()
+{
+#ifdef __linux__
+    void* hostMemory = nullptr;
+    HIP_CHECK( hipHostMalloc( &hostMemory, 4096 ) );
+    HIP_CHECK( hipHostFree( hostMemory ) );
+#endif
+}
+
 void PageSystem::processPendingEvictedPages()
 {
-    if( !virtual_.pendingEvictedPages.empty() )
+    if( virtual_.pendingEvictedPages.empty() )
+        return;
+
+    const size_t requestedReusablePages = virtual_.pendingReusableEvictedPageCount;
+    const size_t availableReusablePages = physical_.reusablePages.size();
+    const size_t pagesToReuse =
+        virtual_.pendingReusableEvictedPageCount - std::min( requestedReusablePages, availableReusablePages );
+    size_t freedPages    = 0;
+    bool   unmappedPages = false;
+    for( const uint32_t virtualPageId : virtual_.pendingEvictedPages )
     {
-        const size_t requestedReusablePages = virtual_.pendingReusableEvictedPageCount;
-        const size_t availableReusablePages = physical_.reusablePages.size();
-        const size_t pagesToReuse =
-            virtual_.pendingReusableEvictedPageCount - std::min( requestedReusablePages, availableReusablePages );
-        for( size_t i = 0; i < virtual_.pendingEvictedPages.size(); i++ )
+        const auto mapping = virtualIdToPhysicalId_.find( virtualPageId );
+        if( mapping == virtualIdToPhysicalId_.end() )
+            continue;
+        const uint32_t physicalPageId = mapping->second;
+
+        const DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
+        HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
+        virtualIdToPhysicalId_.erase( mapping );
+        unmappedPages = true;
+
+        PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );
+        physicalPage.useCount--;
+        // Shared and retained pages stay allocated for their other users.
+        if( physicalPage.useCount > 0 )
+            continue;
+
+        if( freedPages < pagesToReuse )
         {
-            const uint32_t virtualPageId = virtual_.pendingEvictedPages.at( i );
-            const auto     mapping       = virtualIdToPhysicalId_.find( virtualPageId );
-            if( mapping == virtualIdToPhysicalId_.end() )
-                continue;
-            const uint32_t physicalPageId = mapping->second;
-
-            const DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
-            HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
-            virtualIdToPhysicalId_.erase( mapping );
-
-            PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );
-            physicalPage.virtualPageId = INVALID_PAGE;
-
-            if( i < pagesToReuse )
-            {
-                physical_.reusablePages.push_back( physicalPageId );
-            }
-            else
-            {
-                HIP_CHECK( hipMemRelease( physicalPage.handle ) );
-                physicalPage.handle = nullptr;
-                physical_.unallocatedPages.push_back( physicalPageId );
-            }
+            physical_.reusablePages.push_back( physicalPageId );
         }
-
-        virtual_.pendingReusableEvictedPageCount = 0;
-        virtual_.pendingEvictedPages.clear();
+        else
+        {
+            HIP_CHECK( hipMemRelease( physicalPage.handle ) );
+            physicalPage.handle = nullptr;
+            physical_.allocatedCount--;
+            physical_.unallocatedPages.push_back( physicalPageId );
+        }
+        freedPages++;
     }
+
+    virtual_.pendingReusableEvictedPageCount = 0;
+    virtual_.pendingEvictedPages.clear();
+
+    // The unmapped pages are mapped again, to other physical pages, before the device touches them next.
+    if( unmappedPages )
+        invalidateDeviceTlb();
 }
 
 }  // namespace hip_demand::vmm

@@ -9,6 +9,8 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <cassert>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -148,6 +150,9 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     void updateProcessedResources( hipStream_t stream );
     int  device() const { return pageSystem_.device(); }
 
+    uint32_t physicalPageCount() const { return pageSystem_.physicalPageCount(); }
+    uint32_t whiteBlackTileCount() const;
+
   private:
     struct PageRange
     {
@@ -222,6 +227,14 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
         HostSpan<uint32_t> resources;
         uint32_t           count = 0;
     } processed_{};
+
+    // The physical pages shared by the white and black tiles (Options::coalesceWhiteBlackTiles), by texel. They are
+    // retained in the page system, so they outlive the eviction of any page mapped to them.
+    struct
+    {
+        mutable std::mutex                        mutex;
+        std::unordered_map<std::string, uint32_t> pages;
+    } whiteBlack_{};
 };
 
 }  // namespace hip_demand::vmm
