@@ -168,6 +168,12 @@ uint32_t PageSystem::mappedPageCount() const
     return static_cast<uint32_t>( virtualIdToPhysicalId_.size() );
 }
 
+uint32_t PageSystem::unmappedPageCount() const
+{
+    std::lock_guard<std::mutex> lock( mutex_ );
+    return virtual_.unmappedCount;
+}
+
 void PageSystem::invalidateDeviceTlb()
 {
 #ifdef __linux__
@@ -198,6 +204,7 @@ void PageSystem::processPendingEvictedPages()
         const DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
         HIP_CHECK( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
         virtualIdToPhysicalId_.erase( mapping );
+        virtual_.unmappedCount++;
         unmappedPages = true;
 
         PhysicalPage& physicalPage = physical_.pages.at( physicalPageId );

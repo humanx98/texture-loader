@@ -144,6 +144,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
                                             uint32_t                                         numChannels ) override;
     void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext ) override;
     Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) override;
+    Statistics getStatistics() const override;
 
     void processRequestsCallback( Ticket ticket );
     void processRequest( hipStream_t stream, uint32_t resourceId );
@@ -173,6 +174,7 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
     void          processMipTail( hipStream_t stream, const Resource::MipTail& mipTail );
     void          processCascade( hipStream_t stream, const Resource::Cascade& cascade );
     void          assignLevelPages( DemandTextureImpl& texture, uint32_t firstLevel, uint32_t endLevel );
+    void          addTransferredBytes( size_t bytes );
 
     mutable std::mutex mutex_;
     Options            options_{};
@@ -235,6 +237,12 @@ class DemandTextureLoaderImpl : public DemandTextureLoader, NonCopyble
         mutable std::mutex                        mutex;
         std::unordered_map<std::string, uint32_t> pages;
     } whiteBlack_{};
+
+    struct
+    {
+        mutable std::mutex mutex;
+        size_t             bytesTransferredToDevice = 0;
+    } stats_{};
 };
 
 }  // namespace hip_demand::vmm

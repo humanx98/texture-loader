@@ -152,6 +152,7 @@ TEST_F( VmmPageSystemTest, EvictedPagesAreRemappedToOtherPhysicalPages )
     pages.map( 2 );
     pages.map( 3 );
     EXPECT_EQ( pages.physicalPageCount(), 2u );
+    EXPECT_EQ( pages.unmappedPageCount(), 2u );
     EXPECT_EQ( pageValue( pages.page( 2 ) ), 0xBB );
     EXPECT_EQ( pageValue( pages.page( 3 ) ), 0xAA );
 
@@ -160,6 +161,7 @@ TEST_F( VmmPageSystemTest, EvictedPagesAreRemappedToOtherPhysicalPages )
     evict( pages, { 3, 2 }, 2 );
     pages.map( 0 );
     pages.map( 1 );
+    EXPECT_EQ( pages.unmappedPageCount(), 4u );
     EXPECT_EQ( pageValue( pages.page( 0 ) ), 0xBB );
     EXPECT_EQ( pageValue( pages.page( 1 ) ), 0xAA );
     fillPage( pages.page( 0 ), 0x01 );

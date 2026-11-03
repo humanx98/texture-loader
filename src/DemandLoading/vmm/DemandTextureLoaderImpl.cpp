@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <set>
 
 #if defined( _WIN32 )
 #define NOMINMAX
@@ -365,6 +366,12 @@ void DemandTextureLoaderImpl::processRequestsCallback( Ticket ticket )
     requestProcessor_.submit( requestedResources_.ptr, requestCount, std::move( ticket ) );
 }
 
+void DemandTextureLoaderImpl::addTransferredBytes( size_t bytes )
+{
+    std::lock_guard lock( stats_.mutex );
+    stats_.bytesTransferredToDevice += bytes;
+}
+
 void DemandTextureLoaderImpl::releaseEvictedPages( uint32_t reusablePageCount )
 {
     const HostSpan<EvictionCandidate> candidates = eviction_.candidates.subspan( 0, eviction_.pendingUnmapCount );
@@ -633,12 +640,14 @@ void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::T
         const uint32_t physicalPageId = pageSystem_.map( tile.pageId );
         pageSystem_.retain( physicalPageId );
         memcpyHtoD( pageSystem_.page( tile.pageId ), pageBuffer.span(), stream );
+        addTransferredBytes( pageBuffer.span().sizeInBytes() );
         whiteBlack_.pages.emplace( std::move( key ), physicalPageId );
         return;
     }
 
     pageSystem_.map( tile.pageId );
     memcpyHtoD( pageSystem_.page( tile.pageId ), pageBuffer.span(), stream );
+    addTransferredBytes( pageBuffer.span().sizeInBytes() );
 }
 
 void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource::MipTail& mipTail )
@@ -663,6 +672,41 @@ void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource
 
     pageSystem_.map( mipTail.pageId );
     memcpyHtoD( pageSystem_.page( mipTail.pageId ), pageBuffer.span(), stream );
+    addTransferredBytes( pageBuffer.span().sizeInBytes() );
+}
+
+Statistics DemandTextureLoaderImpl::getStatistics() const
+{
+    std::lock_guard lock( mutex_ );
+
+    Statistics stats{};
+    {
+        std::lock_guard statsLock( stats_.mutex );
+        stats.bytesTransferredToDevice = stats_.bytesTransferredToDevice;
+    }
+    stats.numEvictions     = pageSystem_.unmappedPageCount();
+    stats.deviceMemoryUsed = static_cast<size_t>( pageSystem_.physicalPageCount() ) * pageSystem_.pageBytes()
+                             + deviceContext_.residenceBits.sizeInBytes() + deviceContext_.textureInfos.sizeInBytes()
+                             + deviceContext_.referenceBits.sizeInBytes() + deviceContext_.requestedResources.sizeInBytes()
+                             + deviceContext_.evictionCandidates.sizeInBytes() + deviceContext_.processedResources.sizeInBytes()
+                             + deviceContext_.lru.sizeInBytes() + deviceContext_.counters.sizeInBytes();
+
+    std::set<const ImageSource*> images;
+    for( const auto& texture : textures_ )
+    {
+        if( texture->isEmpty() )
+            continue;
+        stats.numTextures++;
+
+        const ImageSource* image = texture->image.get();
+        if( !images.insert( image ).second )
+            continue;
+        stats.numTilesRead += image->getNumTilesRead();
+        stats.numBytesRead += image->getNumBytesRead();
+        stats.readTime += image->getTotalReadTime();
+        stats.virtualTextureBytes += getTextureSizeInBytes( image->getInfo() );
+    }
+    return stats;
 }
 
 uint32_t DemandTextureLoaderImpl::whiteBlackTileCount() const

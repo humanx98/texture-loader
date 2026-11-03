@@ -18,7 +18,7 @@ inline bool whiteBlackTileKey( const uint8_t* page, size_t pageBytes, hipArray_F
 {
     const uint32_t channelBytes  = getBytesPerChannel( format );
     const uint32_t bytesPerTexel = channelBytes * numChannels;
-    if( numChannels > 4 || pageBytes < 2 * bytesPerTexel || pageBytes % bytesPerTexel != 0 )
+    if( !page || bytesPerTexel == 0 || numChannels > 4 || pageBytes < 2 * bytesPerTexel || pageBytes % bytesPerTexel != 0 )
         return false;
 
     // The page holds one texel exactly when it equals itself shifted by one texel.

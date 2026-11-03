@@ -70,6 +70,18 @@ struct Options
     bool coalesceWhiteBlackTiles = false;
 };
 
+struct Statistics
+{
+    size_t       numTilesRead             = 0;
+    size_t       numBytesRead             = 0;
+    double       readTime                 = 0.0;
+    size_t       numTextures              = 0;
+    size_t       virtualTextureBytes      = 0;
+    size_t       deviceMemoryUsed         = 0;
+    size_t       bytesTransferredToDevice = 0;
+    unsigned int numEvictions             = 0;
+};
+
 class DemandTexture
 {
   public:
@@ -91,6 +103,7 @@ class DemandTextureLoader
                                                     uint32_t numChannels = 1 ) = 0;
     virtual void   launchPrepare( hipStream_t stream, DeviceContext& deviceContext )         = 0;
     virtual Ticket processRequests( hipStream_t stream, const DeviceContext& deviceContext ) = 0;
+    virtual Statistics getStatistics() const                                               = 0;
 };
 
 std::unique_ptr<DemandTextureLoader> createDemandTextureLoader( const Options& options );

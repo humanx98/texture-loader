@@ -37,6 +37,7 @@ add_executable(texture_loader_tests
     VmmDeviceTextureInfoTests.cpp
     VmmPageSystemTests.cpp
     VmmWhiteBlackTileTests.cpp
+    VmmStatisticsTests.cpp
 )
 
 target_include_directories(texture_loader_tests

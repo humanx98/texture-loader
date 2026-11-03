@@ -55,6 +55,7 @@ class PageSystem : NonCopyble
     int                 device() const { return device_; }
     uint32_t physicalPageCount() const;
     uint32_t mappedPageCount() const;
+    uint32_t unmappedPageCount() const;
 
     /// Makes the device pick up changed page mappings. On Linux, ROCm's hipMemMap()/hipMemUnmap() do not invalidate
     /// the GPU TLB (the amdgpu kernel driver skips it, see ROCm/rocm-systems#13106), so a virtual page that is unmapped
@@ -89,6 +90,7 @@ class PageSystem : NonCopyble
     {
         uint32_t              maxPages;
         uint32_t              pendingReusableEvictedPageCount;
+        uint32_t              unmappedCount;
         std::vector<uint32_t> pendingEvictedPages;
         DeviceSpan<uint8_t>   addressSpace;
     } virtual_{};
