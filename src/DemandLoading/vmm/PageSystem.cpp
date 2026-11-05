@@ -174,6 +174,7 @@ uint32_t PageSystem::unmappedPageCount() const
     return virtual_.unmappedCount;
 }
 
+// TODO_BS: remove this workaround (and its calls) once ROCm/rocm-systems#13106 is fixed and hipMemUnmap() invalidates the GPU TLB itself.
 void PageSystem::invalidateDeviceTlb()
 {
 #ifdef __linux__
