@@ -207,9 +207,98 @@ TEST_F( VmmPageSystemTest, RemappedPagesShowTheirNewPhysicalPageAfterInvalidatio
     EXPECT_EQ( pageValue( page1 ), 0xAA );
 
     ASSERT_EQ( hipMemUnmap( va, 2 * pageBytes ), hipSuccess );
+    PageSystem::invalidateDeviceTlb();  // Or the next user of the address range reads these pages.
     ASSERT_EQ( hipMemRelease( a ), hipSuccess );
     ASSERT_EQ( hipMemRelease( b ), hipSuccess );
     ASSERT_EQ( hipMemAddressFree( va, 2 * pageBytes ), hipSuccess );
+}
+
+TEST_F( VmmPageSystemTest, PhysicalPagesAreLimited )
+{
+    PageSystem pages( 16, 2 );
+    pages.map( 0 );
+    pages.map( 1 );
+    EXPECT_THROW( pages.map( 2 ), std::runtime_error );
+    EXPECT_EQ( pages.physicalPageCount(), 2u );
+    EXPECT_EQ( pages.mappedPageCount(), 2u );
+
+    // An alias costs no physical page, and a released page makes room again.
+    pages.mapAlias( 2, pages.map( 0 ) );
+    EXPECT_EQ( pages.mappedPageCount(), 3u );
+    evict( pages, { 1 }, 0 );
+    EXPECT_NO_THROW( pages.map( 3 ) );
+    EXPECT_EQ( pages.physicalPageCount(), 2u );
+}
+
+TEST_F( VmmPageSystemTest, VirtualPagesOutsideTheAddressSpaceAreRejected )
+{
+    PageSystem pages( 16, 16 );
+    EXPECT_THROW( pages.map( 16 ), std::out_of_range );
+    EXPECT_THROW( pages.map( ~0u ), std::out_of_range );
+    const uint32_t physical = pages.map( 0 );
+    EXPECT_THROW( pages.mapAlias( 16, physical ), std::out_of_range );
+    EXPECT_EQ( pages.mappedPageCount(), 1u );
+    EXPECT_EQ( pages.page( 15 ).ptr, pages.virtualAddressSpace().ptr + 15 * pageBytes );
+}
+
+TEST_F( VmmPageSystemTest, PagesBeyondTheReusableCountAreReleased )
+{
+    PageSystem pages( 16, 16 );
+    for( uint32_t pageId = 0; pageId < 4; ++pageId )
+        pages.map( pageId );
+    ASSERT_EQ( pages.physicalPageCount(), 4u );
+
+    // One of the four is kept for reuse, the other three are released; the next mapping reuses it.
+    evict( pages, { 0, 1, 2, 3 }, 1 );
+    pages.map( 4 );
+    EXPECT_EQ( pages.physicalPageCount(), 1u );
+    EXPECT_EQ( pages.mappedPageCount(), 1u );
+    EXPECT_EQ( pages.unmappedPageCount(), 4u );
+
+    // Released pages get allocated again under their old ids.
+    const uint32_t reallocated = pages.map( 5 );
+    EXPECT_LT( reallocated, 4u );
+    EXPECT_EQ( pages.physicalPageCount(), 2u );
+    fillPage( pages.page( 5 ), 0x55 );
+    EXPECT_EQ( pageValue( pages.page( 5 ) ), 0x55 );
+
+    // Asking to reuse more pages than are evicted keeps them all.
+    evict( pages, { 4, 5 }, 8 );
+    pages.map( 6 );
+    pages.map( 7 );
+    EXPECT_EQ( pages.physicalPageCount(), 2u );
+    EXPECT_EQ( pages.unmappedPageCount(), 6u );
+}
+
+TEST_F( VmmPageSystemTest, EvictingAnUnmappedPageChangesNothing )
+{
+    PageSystem pages( 16, 16 );
+    pages.map( 0 );
+    evict( pages, { 5, 0, 5 }, 2 );
+    pages.map( 1 );
+    EXPECT_EQ( pages.physicalPageCount(), 1u );
+    EXPECT_EQ( pages.mappedPageCount(), 1u );
+    EXPECT_EQ( pages.unmappedPageCount(), 1u );
+
+    // Nothing was reserved for the pages that were not mapped.
+    pages.map( 2 );
+    EXPECT_EQ( pages.physicalPageCount(), 2u );
+}
+
+TEST_F( VmmPageSystemTest, RetainedPageIsReleasedWithTheSystem )
+{
+    // A page retained and never mapped again is freed by the destructor, not leaked: a second system of the same
+    // size can allocate its maximum afterwards.
+    {
+        PageSystem pages( 16, 4 );
+        pages.retain( pages.map( 0 ) );
+        evict( pages, { 0 }, 0 );
+        pages.map( 1 );
+        EXPECT_EQ( pages.physicalPageCount(), 2u );
+    }
+    PageSystem pages( 16, 4 );
+    for( uint32_t pageId = 0; pageId < 4; ++pageId )
+        EXPECT_NO_THROW( pages.map( pageId ) );
 }
 
 }  // namespace hip_demand::vmm::test

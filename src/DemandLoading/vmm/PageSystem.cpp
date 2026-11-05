@@ -39,6 +39,10 @@ PageSystem::~PageSystem()
         DeviceSpan<uint8_t> virtualPage = page( virtualPageId );
         HIP_WARN( hipMemUnmap( virtualPage.ptr, virtualPage.len ) );
     }
+    // The address space may be reserved again, by another page system, while the device still holds translations of
+    // these mappings.
+    if( !virtualIdToPhysicalId_.empty() )
+        invalidateDeviceTlb();
 
     for( PhysicalPage& physicalPage : physical_.pages )
     {

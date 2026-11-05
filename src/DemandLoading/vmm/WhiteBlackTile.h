@@ -26,7 +26,8 @@ inline bool whiteBlackTileKey( const uint8_t*  tile,
 {
     const uint32_t channelBytes  = getBytesPerChannel( format );
     const uint32_t bytesPerTexel = channelBytes * numChannels;
-    if( !tile || bytesPerTexel == 0 || numChannels > 4 )
+    if( !tile || bytesPerTexel == 0 || numChannels > 4 || visibleTileWidth == 0 || visibleTileHeight == 0
+        || visibleTileWidth > tileWidth )
         return false;
 
     // The first row holds one texel exactly when it equals itself shifted by one texel.
