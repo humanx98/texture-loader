@@ -13,17 +13,32 @@ namespace hip_demand::vmm {
 /// A white or black tile holds one texel throughout, whose color channels are all 0 or all 1 and whose alpha, when
 /// there is one, is 0 or 1: 0 and 1 of one and two channels, 000 and 111 of three, 0000, 0001, 1110 and 1111 of four,
 /// 1 is the value the sampler normalizes to 1.0: the largest value of an integer format. 1.0 of half and float.
-/// Returns whether the tile is one, and then its key: the texel's bytes.
-inline bool whiteBlackTileKey( const uint8_t* page, size_t pageBytes, hipArray_Format format, uint32_t numChannels, std::string& key )
+/// Looks at the width x height texels at the top left of a tile of tileWidth texels per row: the whole tile, or the
+/// part of an edge tile that lies inside its level. Returns whether they are one such texel, and then its key: the
+/// texel's bytes.
+inline bool whiteBlackTileKey( const uint8_t*  tile,
+                               uint32_t        tileWidth,
+                               uint32_t        visibleTileWidth,
+                               uint32_t        visibleTileHeight,
+                               hipArray_Format format,
+                               uint32_t        numChannels,
+                               std::string&    key )
 {
     const uint32_t channelBytes  = getBytesPerChannel( format );
     const uint32_t bytesPerTexel = channelBytes * numChannels;
-    if( !page || bytesPerTexel == 0 || numChannels > 4 || pageBytes < 2 * bytesPerTexel || pageBytes % bytesPerTexel != 0 )
+    if( !tile || bytesPerTexel == 0 || numChannels > 4 )
         return false;
 
-    // The page holds one texel exactly when it equals itself shifted by one texel.
-    if( std::memcmp( page, page + bytesPerTexel, pageBytes - bytesPerTexel ) != 0 )
+    // The first row holds one texel exactly when it equals itself shifted by one texel.
+    const size_t rowBytes = static_cast<size_t>( visibleTileWidth ) * bytesPerTexel;
+    const size_t pitch    = static_cast<size_t>( tileWidth ) * bytesPerTexel;
+    if( std::memcmp( tile, tile + bytesPerTexel, rowBytes - bytesPerTexel ) != 0 )
         return false;
+    for( uint32_t row = 1; row < visibleTileHeight; ++row )
+    {
+        if( std::memcmp( tile + row * pitch, tile, rowBytes ) != 0 )
+            return false;
+    }
 
     uint8_t one[4] = {};
     switch( format )
@@ -42,7 +57,7 @@ inline bool whiteBlackTileKey( const uint8_t* page, size_t pageBytes, hipArray_F
 
     // 0 or 1 for a channel of the texel, else -1.
     const auto channelValue = [&]( uint32_t channel ) {
-        const uint8_t* bytes = page + channel * channelBytes;
+        const uint8_t* bytes = tile + channel * channelBytes;
         const uint8_t  zero[4] = {};
         if( std::memcmp( bytes, zero, channelBytes ) == 0 )
             return 0;
@@ -62,7 +77,7 @@ inline bool whiteBlackTileKey( const uint8_t* page, size_t pageBytes, hipArray_F
     if( numChannels == 4 && channelValue( 3 ) < 0 )
         return false;
 
-    key.assign( reinterpret_cast<const char*>( page ), bytesPerTexel );
+    key.assign( reinterpret_cast<const char*>( tile ), bytesPerTexel );
     return true;
 }
 

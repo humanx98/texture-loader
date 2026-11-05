@@ -8,6 +8,7 @@
 #include <DemandLoading/VmmDemandTextureLoader.h>
 #include <DemandLoading/vmm/DemandTextureLoaderImpl.h>
 #include <ImageSource/ImageSource.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -15,17 +16,18 @@
 
 namespace hip_demand::vmm::test {
 
-// An in-memory single-channel 8-bit image whose tiles are all one value, or each a byte ramp when not uniform.
+// An in-memory 8-bit image whose tiles are all one value in every channel, or each a byte ramp when not uniform.
+// The part of a tile past the edge of its level is always a byte ramp, as an image source may leave anything there.
 class TestImage : public ImageSource
 {
   public:
-    TestImage( uint32_t width, uint32_t height, uint32_t numMipLevels, bool uniform, uint8_t value )
+    TestImage( uint32_t width, uint32_t height, uint32_t numMipLevels, bool uniform, uint8_t value, uint32_t numChannels = 1 )
         : uniform_( uniform )
         , value_( value )
     {
         info_.width        = width;
         info_.height       = height;
-        info_.numChannels  = 1;
+        info_.numChannels  = numChannels;
         info_.format       = HIP_AD_FORMAT_UNSIGNED_INT8;
         info_.numMipLevels = numMipLevels;
         info_.isTiled      = true;
@@ -46,7 +48,7 @@ class TestImage : public ImageSource
     {
         if( mipLevel >= info_.numMipLevels )
             return false;
-        fill( dest, static_cast<size_t>( width ) * height );
+        fill( dest, static_cast<size_t>( width ) * height * info_.numChannels );
         return true;
     }
 
@@ -54,7 +56,19 @@ class TestImage : public ImageSource
     {
         if( mipLevel >= info_.numMipLevels )
             return false;
-        fill( dest, static_cast<size_t>( tile.width ) * tile.height );
+        const size_t rowBytes = static_cast<size_t>( tile.width ) * info_.numChannels;
+        fill( dest, rowBytes * tile.height );
+        const uint32_t levelWidth  = std::max( info_.width >> mipLevel, 1u );
+        const uint32_t levelHeight = std::max( info_.height >> mipLevel, 1u );
+        const uint32_t visibleWidth  = std::min( tile.width, levelWidth - tile.x * tile.width );
+        const uint32_t visibleHeight = std::min( tile.height, levelHeight - tile.y * tile.height );
+        for( uint32_t row = 0; row < tile.height; ++row )
+        {
+            char*        line   = dest + row * rowBytes;
+            const size_t offset = row < visibleHeight ? visibleWidth * info_.numChannels : 0;
+            for( size_t i = offset; i < rowBytes; ++i )
+                line[i] = static_cast<char>( row + i );
+        }
         numTilesRead_++;
         return true;
     }
@@ -147,12 +161,25 @@ class VmmLoaderTest : public ::testing::Test
     // Loads every tile of the finest level and returns their page ids.
     std::vector<uint32_t> loadLevel0( const DeviceTextureInfo& info )
     {
+        return loadLevel0Tiles( info, []( uint32_t, uint32_t ) { return true; } );
+    }
+
+    // Loads the tiles of the finest level that the predicate accepts by their (x, y) and returns their page ids.
+    template <class Predicate>
+    std::vector<uint32_t> loadLevel0Tiles( const DeviceTextureInfo& info, Predicate accept )
+    {
         const DeviceMipLevel  mip = info.getMipLevel( 0 );
         std::vector<uint32_t> pageIds, resourceIds;
-        for( uint32_t page = 0; page < mip.pageCount(); ++page )
+        for( uint32_t y = 0; y < mip.tilesY; ++y )
         {
-            pageIds.push_back( mip.startPage + page );
-            resourceIds.push_back( context_.resourceTable.textureTiles.getResourceId( mip.startPage + page ) );
+            for( uint32_t x = 0; x < mip.tilesX; ++x )
+            {
+                if( !accept( x, y ) )
+                    continue;
+                const uint32_t pageId = mip.startPage + y * mip.tilesX + x;
+                pageIds.push_back( pageId );
+                resourceIds.push_back( context_.resourceTable.textureTiles.getResourceId( pageId ) );
+            }
         }
         requestResources( resourceIds );
         return pageIds;
@@ -166,10 +193,10 @@ class VmmLoaderTest : public ::testing::Test
         return ( word >> ( resourceId % 32 ) ) & 1u;
     }
 
-    // The value a page holds, or -1 when it holds more than one.
-    int pageValue( uint32_t pageId )
+    // The value the first bytes of a page hold (all of them by default), or -1 when they hold more than one.
+    int pageValue( uint32_t pageId, size_t bytes = 0 )
     {
-        std::vector<uint8_t> host( context_.pageSize );
+        std::vector<uint8_t> host( bytes ? bytes : context_.pageSize );
         if( hipMemcpy( host.data(), context_.pageMemory.ptr + pageId * context_.pageSize, host.size(), hipMemcpyDeviceToHost ) != hipSuccess )
             return -2;
         for( uint8_t byte : host )

@@ -49,6 +49,7 @@ class ImageSource
                                unsigned int expectedHeight,
                                hipStream_t  stream = 0 ) = 0;
 
+    /// Reads one tile of a mip level into dest, tile.width * tile.height texels in row-major order.
     virtual bool readTile( char* dest, unsigned int mipLevel, const Tile& tile, hipStream_t stream ) = 0;
 
     /// Read the mip levels from mipTailFirstLevel to numMipLevels - 1 into dest, packed one after another with no

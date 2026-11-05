@@ -605,49 +605,62 @@ void DemandTextureLoaderImpl::processCascade( hipStream_t stream, const Resource
     memcpyHtoD( deviceContext_.textureInfos.subspan( cascade.textureId, 1 ), upload.span(), stream );
 }
 
-void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::Tile& tile )
+void DemandTextureLoaderImpl::processTile( hipStream_t stream, const Resource::Tile& t )
 {
-    const DemandTextureImpl& texture = getTexture( tile.textureId );
+    const DemandTextureImpl& texture = getTexture( t.textureId );
     const DeviceTextureInfo  info    = textureInfo( texture );
 
-    Tile region{};
-    region.x      = tile.tileX;
-    region.y      = tile.tileY;
-    region.width  = info.tileWidth();
-    region.height = info.tileHeight();
-    assert( static_cast<size_t>( region.width ) * region.height * info.bytesPerTexel() <= pageSystem_.pageBytes() );
+    Tile tile{};
+    tile.x      = t.tileX;
+    tile.y      = t.tileY;
+    tile.width  = info.tileWidth();
+    tile.height = info.tileHeight();
+    // A tile of a texel that is not a power of two in size (rgb8, rgb16, rgb32f) leaves the end of its page unused.
+    const size_t tileBytes = static_cast<size_t>( tile.width ) * tile.height * info.bytesPerTexel();
+    assert( tileBytes <= pageSystem_.pageBytes() );
 
-    auto pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
-    if( !texture.image->readTile( reinterpret_cast<char*>( pageBuffer.span().ptr ), tile.mipLevel, region, stream ) )
+    auto                   pageBuffer = uploadPool_.acquire<uint8_t>( pageSystem_.pageBytes(), stream );
+    const HostSpan<uint8_t> tileSpan   = pageBuffer.span().subspan( 0, tileBytes );
+    if( !texture.image->readTile( reinterpret_cast<char*>( tileSpan.ptr ), t.mipLevel, tile, stream ) )
     {
-        throw std::runtime_error( "Failed to read texture tile for texture " + std::to_string( tile.textureId )
-                                  + ", mip " + std::to_string( tile.mipLevel ) + ", tile ("
-                                  + std::to_string( tile.tileX ) + ", " + std::to_string( tile.tileY ) + ")" );
+        throw std::runtime_error( "Failed to read texture tile for texture " + std::to_string( t.textureId )
+                                  + ", mip " + std::to_string( t.mipLevel ) + ", tile ("
+                                  + std::to_string( t.tileX ) + ", " + std::to_string( t.tileY ) + ")" );
     }
+
+    // A tile on the right or bottom edge of its level is cut by it.
+    const uint32_t visibleTileWidth  = std::min( tile.width, info.levelWidth( t.mipLevel ) - t.tileX * tile.width );
+    const uint32_t visibleTileHeight = std::min( tile.height, info.levelHeight( t.mipLevel ) - t.tileY * tile.height );
+    const bool     insideLevel   = visibleTileWidth == tile.width && visibleTileHeight == tile.height;
 
     std::string key;
     if( options_.coalesceWhiteBlackTiles
-        && whiteBlackTileKey( pageBuffer.span().ptr, pageBuffer.span().len, info.format(), info.numChannels(), key ) )
+        && whiteBlackTileKey( tileSpan.ptr, tile.width, visibleTileWidth, visibleTileHeight, info.format(), info.numChannels(), key ) )
     {
         std::lock_guard lock( whiteBlack_.mutex );
         const auto      shared = whiteBlack_.pages.find( key );
         if( shared != whiteBlack_.pages.end() )
         {
-            pageSystem_.mapAlias( tile.pageId, shared->second );
+            pageSystem_.mapAlias( t.pageId, shared->second );
             return;
         }
 
-        const uint32_t physicalPageId = pageSystem_.map( tile.pageId );
-        pageSystem_.retain( physicalPageId );
-        memcpyHtoD( pageSystem_.page( tile.pageId ), pageBuffer.span(), stream );
-        addTransferredBytes( pageBuffer.span().sizeInBytes() );
-        whiteBlack_.pages.emplace( std::move( key ), physicalPageId );
-        return;
+        // Only a tile inside its level starts a shared page: the page is read whole by the tiles that join it later.
+        // An edge tile that finds none gets a page of its own.
+        if( insideLevel )
+        {
+            const uint32_t physicalPageId = pageSystem_.map( t.pageId );
+            pageSystem_.retain( physicalPageId );
+            memcpyHtoD( pageSystem_.page( t.pageId ).subspan( 0, tileBytes ), tileSpan, stream );
+            addTransferredBytes( tileBytes );
+            whiteBlack_.pages.emplace( std::move( key ), physicalPageId );
+            return;
+        }
     }
 
-    pageSystem_.map( tile.pageId );
-    memcpyHtoD( pageSystem_.page( tile.pageId ), pageBuffer.span(), stream );
-    addTransferredBytes( pageBuffer.span().sizeInBytes() );
+    pageSystem_.map( t.pageId );
+    memcpyHtoD( pageSystem_.page( t.pageId ).subspan( 0, tileBytes ), tileSpan, stream );
+    addTransferredBytes( tileBytes );
 }
 
 void DemandTextureLoaderImpl::processMipTail( hipStream_t stream, const Resource::MipTail& mipTail )
